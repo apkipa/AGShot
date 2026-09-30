@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <system_error>
+#include <utility>
 
 #include <shlobj.h>
 
@@ -49,6 +51,35 @@ namespace agshot
             return result;
         }
 
+        // Reads a window dimension. "absent" and "present but unusable" must not
+        // be conflated: value_or() reports both as the fallback, which would make
+        // a corrupted setting look exactly like a deliberate one.
+        bool ReadWindowSize(const toml::table& window, std::string_view key,
+                            int& target, std::wstring& error)
+        {
+            const auto* node = window.get(key);
+            if (node == nullptr)
+            {
+                return true;    // absent: the default stands
+            }
+
+            const auto value = node->value_exact<int64_t>();
+            if (!value)
+            {
+                error = L"window." + FromUtf8(key) + L" must be an integer";
+                return false;
+            }
+            if (*value < kMinWindowSize || *value > kMaxWindowSize)
+            {
+                error = L"window." + FromUtf8(key) + L" must be between "
+                    + std::to_wstring(kMinWindowSize) + L" and "
+                    + std::to_wstring(kMaxWindowSize);
+                return false;
+            }
+
+            target = static_cast<int>(*value);
+            return true;
+        }
     }
 
     std::filesystem::path ConfigPath()
@@ -98,6 +129,11 @@ namespace agshot
         std::ostringstream buffer;
         buffer << file.rdbuf();
 
+        // Parsed into a local so that a file rejected half way through cannot
+        // leave some of its values behind: ok == false has to mean the defaults
+        // really are in force, or the warning the user reads would be a lie.
+        Config parsed;
+
         try
         {
             const auto table = toml::parse(buffer.str(), ToUtf8(path.wstring()));
@@ -114,7 +150,61 @@ namespace agshot
                     result.error = L"version must be an integer";
                     return result;
                 }
-                result.config.version = static_cast<int>(*value);
+                parsed.version = static_cast<int>(*value);
+            }
+
+            if (const auto* node = table.get("window"))
+            {
+                const auto* window = node->as_table();
+                if (window == nullptr)
+                {
+                    result.ok = false;
+                    result.error = L"window must be a table";
+                    return result;
+                }
+
+                if (!ReadWindowSize(*window, "width", parsed.windowWidth, result.error)
+                    || !ReadWindowSize(*window, "height", parsed.windowHeight, result.error))
+                {
+                    result.ok = false;
+                    return result;
+                }
+            }
+
+            if (const auto* node = table.get("screenshot"))
+            {
+                const auto* screenshot = node->as_table();
+                if (screenshot == nullptr)
+                {
+                    result.ok = false;
+                    result.error = L"screenshot must be a table";
+                    return result;
+                }
+
+                if (const auto* hotkey = screenshot->get("hotkey"))
+                {
+                    // Stored as text rather than as a key code, because this file
+                    // is meant to be written and read by hand.
+                    const auto text = hotkey->value_exact<std::string>();
+                    if (!text)
+                    {
+                        result.ok = false;
+                        result.error =
+                            L"screenshot.hotkey must be a string, such as \"F1\" or \"Ctrl+Shift+A\"";
+                        return result;
+                    }
+
+                    // Checked here, at load, rather than left for whatever
+                    // registers it later: a hotkey that cannot work is a
+                    // configuration mistake, and the file is where it is fixed.
+                    std::wstring reason;
+                    if (!ParseHotkey(FromUtf8(*text), parsed.screenshotHotkey, reason))
+                    {
+                        result.ok = false;
+                        result.error = L"screenshot.hotkey: " + reason;
+                        return result;
+                    }
+                }
             }
         }
         catch (const toml::parse_error& e)
@@ -141,9 +231,14 @@ namespace agshot
             return result;
         }
 
-        // Migration hook. With a single schema revision there is nothing to
-        // upgrade yet; each future bump adds a step here keyed on the version
-        // that was just read.
+        result.config = parsed;
+
+        // Migration hook. 1 -> 2 added [window] and 2 -> 3 added [screenshot];
+        // in both cases an absent key already means the default, so stamping the
+        // new version is the whole upgrade - which still matters, because the
+        // rewrite is how the new keys reach a file written before they existed.
+        // Each future bump adds a real step here, keyed on the version that was
+        // just read.
         if (result.config.version < kConfigVersion)
         {
             result.config.version = kConfigVersion;
@@ -163,15 +258,36 @@ namespace agshot
             std::filesystem::create_directories(path.parent_path());
         }
 
+        toml::table window;
+        window.insert("width", config.windowWidth);
+        window.insert("height", config.windowHeight);
+
+        toml::table screenshot;
+        screenshot.insert("hotkey", ToUtf8(FormatHotkey(config.screenshotHotkey)));
+
         toml::table table;
         table.insert("version", config.version);
+        table.insert("window", std::move(window));
+        table.insert("screenshot", std::move(screenshot));
+
+        // toml++ would rather write single-quoted literal strings. The file is
+        // meant to be read and edited by hand, and the comment above shows
+        // double quotes, so ask for those and keep the two consistent.
+        constexpr toml::format_flags kWriteFlags =
+            toml::toml_formatter::default_flags & ~toml::format_flags::allow_literal_strings;
+
+        toml::toml_formatter formatter{ table, kWriteFlags };
 
         std::ostringstream body;
-        body << table;
+        body << formatter;
 
         std::string text =
             "# AGShot configuration file.\n"
             "# Delete it to restore the defaults.\n"
+            "#\n"
+            "# AGShot watches this file, so changes apply while it is running.\n"
+            "#\n"
+            "# A hotkey is one key with optional modifiers: \"F1\", \"Ctrl+Shift+A\".\n"
             "\n";
         text += body.str();
 

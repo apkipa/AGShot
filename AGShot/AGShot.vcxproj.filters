@@ -24,7 +24,13 @@
     <ClInclude Include="src\core\config.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\config_watcher.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\core\error.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\hotkey.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\core\text.h">
@@ -44,7 +50,13 @@
     <ClCompile Include="src\core\config.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\core\config_watcher.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\core\error.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\hotkey.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\core\text.cpp">

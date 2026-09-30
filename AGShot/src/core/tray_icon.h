@@ -9,6 +9,8 @@ namespace agshot
     struct TrayCallbacks
     {
         void (*activate)() = nullptr;   // left click: surface the main window
+        void (*settings)() = nullptr;   // Settings chosen from the menu
+        void (*reload)() = nullptr;     // Reload settings chosen from the menu
         void (*exit)() = nullptr;       // Exit chosen from the menu
         void (*fatal)() = nullptr;      // unrecoverable failure in the tray window
     };

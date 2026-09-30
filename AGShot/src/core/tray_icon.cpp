@@ -103,6 +103,9 @@ namespace agshot
                     return;
                 }
 
+                AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_SETTINGS, L"Settings...") != 0);
+                AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_RELOAD, L"Reload settings") != 0);
+                AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_SEPARATOR, 0, nullptr) != 0);
                 AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_EXIT, L"Exit") != 0);
 
                 // Required so the menu dismisses when the user clicks elsewhere.
@@ -126,9 +129,33 @@ namespace agshot
                 // owning window processes one more message.
                 PostMessageW(g_window, WM_NULL, 0, 0);
 
-                if (command == IDM_EXIT && g_callbacks.exit != nullptr)
+                // TrackPopupMenu returns the chosen id rather than sending a
+                // command, so the dispatch is a switch rather than WM_COMMAND.
+                switch (command)
                 {
-                    g_callbacks.exit();
+                case IDM_SETTINGS:
+                    if (g_callbacks.settings != nullptr)
+                    {
+                        g_callbacks.settings();
+                    }
+                    break;
+
+                case IDM_RELOAD:
+                    if (g_callbacks.reload != nullptr)
+                    {
+                        g_callbacks.reload();
+                    }
+                    break;
+
+                case IDM_EXIT:
+                    if (g_callbacks.exit != nullptr)
+                    {
+                        g_callbacks.exit();
+                    }
+                    break;
+
+                default:
+                    break;
                 }
             }
             catch (...)

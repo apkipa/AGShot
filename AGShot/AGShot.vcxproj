@@ -111,11 +111,15 @@
     <ClInclude Include="resource.h" />
     <ClInclude Include="src\pch.h" />
     <ClInclude Include="src\core\config.h" />
+    <ClInclude Include="src\core\config_watcher.h" />
     <ClInclude Include="src\core\error.h" />
+    <ClInclude Include="src\core\hotkey.h" />
     <ClInclude Include="src\core\text.h" />
     <ClInclude Include="src\core\tray_icon.h" />
     <ClCompile Include="src\core\config.cpp" />
+    <ClCompile Include="src\core\config_watcher.cpp" />
     <ClCompile Include="src\core\error.cpp" />
+    <ClCompile Include="src\core\hotkey.cpp" />
     <ClCompile Include="src\core\text.cpp" />
     <ClCompile Include="src\core\tray_icon.cpp" />
     <ClCompile Include="src\main.cpp" />
