@@ -1,4 +1,8 @@
 #include "pch.h"
+#include "resource.h"
+#include "core/config.h"
+#include "core/error.h"
+#include "core/tray_icon.h"
 
 #include <d2d1_1.h>
 #include <d3d11.h>
@@ -37,24 +41,54 @@ namespace
     UINT g_width{};
     UINT g_height{};
 
-    void CheckWin32(BOOL ok)
+    // Set once a failure has been reported. Rendering stops and the app quits:
+    // a half-built composition tree cannot be recovered from.
+    bool g_fatal{};
+
+    // Icons owned by the process. The large one belongs to the main window; the
+    // small one is shared with the tray icon and must outlive it.
+    HICON g_mainIcon{};
+    HICON g_trayIcon{};
+
+    // What the tray icon asks of the main window. The tray itself, including its
+    // hidden owner window and its menu, lives in core/tray_icon.cpp.
+    void ActivateMainWindow()
     {
-        if (!ok)
+        if (g_hwnd == nullptr)
         {
-            check_hresult(HRESULT_FROM_WIN32(GetLastError()));
+            return;
         }
+        ShowWindow(g_hwnd, SW_SHOW);
+        ShowWindow(g_hwnd, SW_RESTORE);
+        // The shell only grants this to the foreground process some of the time;
+        // a refusal just means the window is raised without taking focus.
+        SetForegroundWindow(g_hwnd);
+    }
+
+    void ExitFromTray()
+    {
+        if (g_hwnd != nullptr)
+        {
+            DestroyWindow(g_hwnd);
+        }
+    }
+
+    void FatalFromTray()
+    {
+        g_fatal = true;
+        PostQuitMessage(1);
     }
 
     void CreateDeviceIndependentResources()
     {
-        check_hresult(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_d2dFactory.put()));
+        AGSHOT_CHECK_HR(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_d2dFactory.put()));
 
-        check_hresult(DWriteCreateFactory(
+        AGSHOT_CHECK_HR(DWriteCreateFactory(
             DWRITE_FACTORY_TYPE_SHARED,
             __uuidof(IDWriteFactory),
             reinterpret_cast<IUnknown**>(g_dwriteFactory.put_void())));
 
-        check_hresult(g_dwriteFactory->CreateTextFormat(
+        AGSHOT_CHECK_HR(g_dwriteFactory->CreateTextFormat(
             L"Segoe UI",
             nullptr,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
@@ -65,8 +99,8 @@ namespace
             g_textFormat.put()));
 
         // Centre the greeting inside whatever layout rect Render() hands over.
-        check_hresult(g_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER));
-        check_hresult(g_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER));
+        AGSHOT_CHECK_HR(g_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER));
+        AGSHOT_CHECK_HR(g_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER));
     }
 
     void CreateD3DDevice()
@@ -96,24 +130,24 @@ namespace
                 break;
             }
         }
-        check_hresult(hr);
+        AGSHOT_CHECK_HR(hr);
 
-        check_hresult(device->QueryInterface(__uuidof(IDXGIDevice), g_dxgiDevice.put_void()));
+        AGSHOT_CHECK_HR(device->QueryInterface(__uuidof(IDXGIDevice), g_dxgiDevice.put_void()));
     }
 
     void CreateDeviceResources()
     {
         CreateD3DDevice();
 
-        check_hresult(g_d2dFactory->CreateDevice(g_dxgiDevice.get(), g_d2dDevice.put()));
-        check_hresult(g_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, g_d2dContext.put()));
-        check_hresult(g_d2dContext->CreateSolidColorBrush(
+        AGSHOT_CHECK_HR(g_d2dFactory->CreateDevice(g_dxgiDevice.get(), g_d2dDevice.put()));
+        AGSHOT_CHECK_HR(g_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, g_d2dContext.put()));
+        AGSHOT_CHECK_HR(g_d2dContext->CreateSolidColorBrush(
             D2D1::ColorF(0.94f, 0.94f, 0.96f), g_textBrush.put()));
 
-        check_hresult(DCompositionCreateDevice(
+        AGSHOT_CHECK_HR(DCompositionCreateDevice(
             g_dxgiDevice.get(), __uuidof(IDCompositionDevice), g_dcompDevice.put_void()));
-        check_hresult(g_dcompDevice->CreateTargetForHwnd(g_hwnd, TRUE, g_dcompTarget.put()));
-        check_hresult(g_dcompDevice->CreateVisual(g_dcompVisual.put()));
+        AGSHOT_CHECK_HR(g_dcompDevice->CreateTargetForHwnd(g_hwnd, TRUE, g_dcompTarget.put()));
+        AGSHOT_CHECK_HR(g_dcompDevice->CreateVisual(g_dcompVisual.put()));
     }
 
     // Creates the DirectComposition virtual surface on first use, then resizes it in
@@ -123,21 +157,21 @@ namespace
     {
         if (!g_virtualSurface)
         {
-            check_hresult(g_dcompDevice->CreateVirtualSurface(
+            AGSHOT_CHECK_HR(g_dcompDevice->CreateVirtualSurface(
                 g_width,
                 g_height,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
                 DXGI_ALPHA_MODE_PREMULTIPLIED,
                 g_virtualSurface.put()));
 
-            check_hresult(g_dcompVisual->SetContent(g_virtualSurface.get()));
+            AGSHOT_CHECK_HR(g_dcompVisual->SetContent(g_virtualSurface.get()));
         }
         else
         {
-            check_hresult(g_virtualSurface->Resize(g_width, g_height));
+            AGSHOT_CHECK_HR(g_virtualSurface->Resize(g_width, g_height));
         }
 
-        check_hresult(g_dcompDevice->Commit());
+        AGSHOT_CHECK_HR(g_dcompDevice->Commit());
     }
 
     void Render()
@@ -152,7 +186,7 @@ namespace
 
         com_ptr<IDXGISurface> updateSurface;
         POINT updateOffset{};
-        check_hresult(g_virtualSurface->BeginDraw(
+        AGSHOT_CHECK_HR(g_virtualSurface->BeginDraw(
             &update, __uuidof(IDXGISurface), updateSurface.put_void(), &updateOffset));
 
         // Everything below is in DIPs; scale converts surface pixels to DIPs.
@@ -169,7 +203,7 @@ namespace
             fDpi);
 
         com_ptr<ID2D1Bitmap1> tile;
-        check_hresult(g_d2dContext->CreateBitmapFromDxgiSurface(updateSurface.get(), &props, tile.put()));
+        AGSHOT_CHECK_HR(g_d2dContext->CreateBitmapFromDxgiSurface(updateSurface.get(), &props, tile.put()));
         g_d2dContext->SetTarget(tile.get());
 
         const D2D1_RECT_F surfaceRect = D2D1::RectF(
@@ -200,19 +234,20 @@ namespace
             g_textBrush.get());
 
         g_d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
-        check_hresult(g_d2dContext->EndDraw());
+        AGSHOT_CHECK_HR(g_d2dContext->EndDraw());
 
         // D2D has to let go of the tile before DirectComposition can complete the update.
         g_d2dContext->SetTarget(nullptr);
         tile = nullptr;
 
-        check_hresult(g_virtualSurface->EndDraw());
+        AGSHOT_CHECK_HR(g_virtualSurface->EndDraw());
 
         // Surface updates only become visible once the composition tree is committed.
-        check_hresult(g_dcompDevice->Commit());
+        AGSHOT_CHECK_HR(g_dcompDevice->Commit());
     }
 
-    LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+
+    LRESULT HandleMessage(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
     {
         switch (message)
         {
@@ -234,14 +269,22 @@ namespace
             // The process is Per-Monitor V2 aware (see AGShot.exe.manifest), so the
             // system supplies a DPI-appropriate size and position for the new monitor.
             const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
-            SetWindowPos(
-                hwnd,
-                nullptr,
-                suggested->left,
-                suggested->top,
-                suggested->right - suggested->left,
-                suggested->bottom - suggested->top,
-                SWP_NOZORDER | SWP_NOACTIVATE);
+            if (!SetWindowPos(
+                    hwnd,
+                    nullptr,
+                    suggested->left,
+                    suggested->top,
+                    suggested->right - suggested->left,
+                    suggested->bottom - suggested->top,
+                    SWP_NOZORDER | SWP_NOACTIVATE))
+            {
+                // The window keeps its old size, which is wrong on the new monitor
+                // but perfectly recoverable by dragging it. Worth saying so; not
+                // worth terminating over.
+                agshot::ShowWarning(
+                    agshot::DescribeWin32(L"SetWindowPos", GetLastError(), __FILEW__, __LINE__),
+                    L"AGShot could not resize itself for the new display scaling.");
+            }
             return 0;
         }
 
@@ -273,13 +316,71 @@ namespace
 
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
+
+    // DispatchMessageW has no handler above it, so an exception escaping a
+    // message handler would not unwind: the CRT would call abort() and the user
+    // would get a runtime dialog saying nothing useful. Catch it here instead.
+    LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+    {
+        if (g_fatal)
+        {
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+
+        try
+        {
+            return HandleMessage(hwnd, message, wparam, lparam);
+        }
+        catch (...)
+        {
+            // Report once only: the dialog pumps messages, so a failing repaint
+            // would otherwise stack up one dialog per paint.
+            if (!g_fatal)
+            {
+                g_fatal = true;
+                agshot::ReportCurrentException(__FILEW__, __LINE__);
+                PostQuitMessage(1);
+            }
+            return 0;
+        }
+    }
 }
 
-int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
+int RunApp(HINSTANCE instance, int showCommand)
 {
     EnableMouseInPointer(true);
 
     init_apartment(apartment_type::single_threaded);
+
+    // Settings live outside the build output so they survive a rebuild. The
+    // first run writes the file out; later runs read whatever is there.
+    const auto configPath = agshot::ConfigPath();
+    const auto config = agshot::LoadConfig(configPath);
+
+    // Shown at the bottom of every report, so it is obvious which file was in play.
+    agshot::SetDiagnosticContext(L"Config: " + configPath.wstring());
+
+    if (!config.exists || config.migrated)
+    {
+        try
+        {
+            agshot::SaveConfig(config.config, configPath);
+        }
+        catch (const std::exception& e)
+        {
+            // Not fatal, but settings silently failing to save is exactly the
+            // kind of thing that wastes an afternoon.
+            auto warning = agshot::DescribeException(e, __FILEW__, __LINE__);
+            warning.detail = configPath.wstring() + L"\n\n" + warning.detail;
+            agshot::ShowWarning(std::move(warning), L"AGShot could not save its settings file.");
+        }
+    }
+    else if (!config.ok)
+    {
+        agshot::ShowWarning(
+            agshot::Failure{ {}, configPath.wstring() + L"\n" + config.error },
+            L"AGShot could not read its settings file, so it is using the defaults.");
+    }
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -288,8 +389,21 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
     wc.hInstance = instance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;
+    // Take the exact size the shell asks for out of the multi-size .ico, so the
+    // taskbar and title bar get crisp pixels instead of a rescaled 32px frame.
+    g_mainIcon = static_cast<HICON>(LoadImageW(
+        instance, MAKEINTRESOURCEW(IDI_AGSHOT), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0));
+    AGSHOT_CHECK_WIN32(g_mainIcon != nullptr);
+    wc.hIcon = g_mainIcon;
+    // The small size is shared with the tray, so load it once and keep it.
+    g_trayIcon = static_cast<HICON>(LoadImageW(
+        instance, MAKEINTRESOURCEW(IDI_AGSHOT), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+    AGSHOT_CHECK_WIN32(g_trayIcon != nullptr);
+    wc.hIconSm = g_trayIcon;
     wc.lpszClassName = kWindowClass;
-    CheckWin32(RegisterClassExW(&wc) != 0);
+    AGSHOT_CHECK_WIN32(RegisterClassExW(&wc) != 0);
 
     // Size the window so its client area is kClientWidth x kClientHeight at the
     // primary monitor DPI, then centre it on the work area.
@@ -299,10 +413,10 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
     const DWORD style = WS_OVERLAPPEDWINDOW;
     const DWORD exStyle = WS_EX_NOREDIRECTIONBITMAP;
 
-    CheckWin32(AdjustWindowRectExForDpi(&rc, style, FALSE, exStyle, dpi));
+    AGSHOT_CHECK_WIN32(AdjustWindowRectExForDpi(&rc, style, FALSE, exStyle, dpi));
 
     RECT workArea{};
-    CheckWin32(SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0));
+    AGSHOT_CHECK_WIN32(SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0));
 
     const int width = rc.right - rc.left;
     const int height = rc.bottom - rc.top;
@@ -312,24 +426,34 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
     g_hwnd = CreateWindowExW(
         exStyle, kWindowClass, kWindowTitle, style,
         x, y, width, height, nullptr, nullptr, instance, nullptr);
-    CheckWin32(g_hwnd != nullptr);
+    AGSHOT_CHECK_WIN32(g_hwnd != nullptr);
 
     CreateDeviceIndependentResources();
     CreateDeviceResources();
 
     RECT client{};
-    CheckWin32(GetClientRect(g_hwnd, &client));
+    AGSHOT_CHECK_WIN32(GetClientRect(g_hwnd, &client));
     g_width = static_cast<UINT>(client.right - client.left);
     g_height = static_cast<UINT>(client.bottom - client.top);
     CreateSizeDependentResources();
 
     // The virtual surface is the visual's content; show the composed result.
-    check_hresult(g_dcompTarget->SetRoot(g_dcompVisual.get()));
-    check_hresult(g_dcompDevice->Commit());
+    AGSHOT_CHECK_HR(g_dcompTarget->SetRoot(g_dcompVisual.get()));
+    AGSHOT_CHECK_HR(g_dcompDevice->Commit());
     Render();
 
     ShowWindow(g_hwnd, showCommand == 0 ? SW_SHOWDEFAULT : showCommand);
-    CheckWin32(UpdateWindow(g_hwnd));
+    AGSHOT_CHECK_WIN32(UpdateWindow(g_hwnd));
+
+    const agshot::TrayCallbacks trayCallbacks{ ActivateMainWindow, ExitFromTray, FatalFromTray };
+    if (!agshot::StartTrayIcon(instance, g_trayIcon, trayCallbacks))
+    {
+        // Not fatal: the window still works, but say so rather than leaving the
+        // user wondering why the icon never showed up.
+        agshot::ShowWarning(
+            agshot::DescribeWin32(L"StartTrayIcon", GetLastError(), __FILEW__, __LINE__),
+            L"AGShot could not add its notification-area icon.");
+    }
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
@@ -338,5 +462,33 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
         DispatchMessageW(&msg);
     }
 
+    // The loop can also end through the fatal path, where WM_DESTROY never ran.
+    agshot::StopTrayIcon();
+    if (g_trayIcon != nullptr)
+    {
+        DestroyIcon(g_trayIcon);
+        g_trayIcon = nullptr;
+    }
+    if (g_mainIcon != nullptr)
+    {
+        DestroyIcon(g_mainIcon);
+        g_mainIcon = nullptr;
+    }
+
     return static_cast<int>(msg.wParam);
+}
+
+int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
+{
+    // The one place that catches everything escaping startup or the message
+    // loop, so no failure can leave a silently dead process behind.
+    try
+    {
+        return RunApp(instance, showCommand);
+    }
+    catch (...)
+    {
+        agshot::ReportCurrentException(__FILEW__, __LINE__);
+        return 1;
+    }
 }

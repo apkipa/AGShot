@@ -30,6 +30,12 @@ Generated Files/
 # ---- Certificates ----
 *_TemporaryKey.pfx
 
+# ---- vcpkg (manifest mode installs here) ----
+/vcpkg_installed/
+
+# ---- Scratch ----
+/.work/
+
 # ---- OS ----
 Thumbs.db
 Desktop.ini
