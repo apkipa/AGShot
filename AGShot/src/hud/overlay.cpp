@@ -286,6 +286,8 @@ namespace agshot
         m_visual = nullptr;
         m_target = nullptr;
         m_composition = nullptr;
+        m_magnifierLayer = nullptr;
+        m_copyIconGeometry = nullptr;
         m_roundStroke = nullptr;
         m_textFormat = nullptr;
         m_magnifierTextFormat = nullptr;
@@ -330,7 +332,7 @@ namespace agshot
             DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
-            Scaled(18.0f * 96.0f / m_dpi),
+            Scaled(MeasuredPixels(18.0f)),
             L"en-US",
             m_magnifierTextFormat.put()));
 
@@ -340,6 +342,71 @@ namespace agshot
             D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
             D2D1_LINE_JOIN_ROUND, 1.0f, D2D1_DASH_STYLE_SOLID, 0.0f);
         AGSHOT_CHECK_HR(m_d2dFactory->CreateStrokeStyle(properties, nullptr, 0, m_roundStroke.put()));
+        CreateCopyIconGeometry();
+    }
+
+    void Overlay::CreateCopyIconGeometry()
+    {
+        constexpr float size = 18.0f;
+        constexpr float radius = 2.0f;
+        constexpr float curve = radius * 0.55228475f;
+        constexpr float backRight = size * 0.62f;
+        constexpr float backBottom = size * 0.72f;
+        constexpr float frontLeft = size * 0.30f;
+        constexpr float frontTop = size * 0.28f;
+
+        AGSHOT_CHECK_HR(m_d2dFactory->CreatePathGeometry(m_copyIconGeometry.put()));
+        winrt::com_ptr<ID2D1GeometrySink> sink;
+        AGSHOT_CHECK_HR(m_copyIconGeometry->Open(sink.put()));
+
+        sink->BeginFigure(D2D1::Point2F(radius, 0.0f), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink->AddLine(D2D1::Point2F(backRight - radius, 0.0f));
+        sink->AddBezier(D2D1::BezierSegment(
+            D2D1::Point2F(backRight - radius + curve, 0.0f),
+            D2D1::Point2F(backRight, radius - curve),
+            D2D1::Point2F(backRight, radius)));
+        sink->AddLine(D2D1::Point2F(backRight, frontTop));
+        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+
+        sink->BeginFigure(D2D1::Point2F(radius, 0.0f), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink->AddBezier(D2D1::BezierSegment(
+            D2D1::Point2F(radius - curve, 0.0f),
+            D2D1::Point2F(0.0f, radius - curve),
+            D2D1::Point2F(0.0f, radius)));
+        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+
+        sink->BeginFigure(D2D1::Point2F(0.0f, radius), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink->AddLine(D2D1::Point2F(0.0f, backBottom - radius));
+        sink->AddBezier(D2D1::BezierSegment(
+            D2D1::Point2F(0.0f, backBottom - radius + curve),
+            D2D1::Point2F(radius - curve, backBottom),
+            D2D1::Point2F(radius, backBottom)));
+        sink->AddLine(D2D1::Point2F(frontLeft, backBottom));
+        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+
+        sink->BeginFigure(D2D1::Point2F(frontLeft + radius, frontTop), D2D1_FIGURE_BEGIN_HOLLOW);
+        sink->AddLine(D2D1::Point2F(size - radius, frontTop));
+        sink->AddBezier(D2D1::BezierSegment(
+            D2D1::Point2F(size - radius + curve, frontTop),
+            D2D1::Point2F(size, frontTop + radius - curve),
+            D2D1::Point2F(size, frontTop + radius)));
+        sink->AddLine(D2D1::Point2F(size, size - radius));
+        sink->AddBezier(D2D1::BezierSegment(
+            D2D1::Point2F(size, size - radius + curve),
+            D2D1::Point2F(size - radius + curve, size),
+            D2D1::Point2F(size - radius, size)));
+        sink->AddLine(D2D1::Point2F(frontLeft + radius, size));
+        sink->AddBezier(D2D1::BezierSegment(
+            D2D1::Point2F(frontLeft + radius - curve, size),
+            D2D1::Point2F(frontLeft, size - radius + curve),
+            D2D1::Point2F(frontLeft, size - radius)));
+        sink->AddLine(D2D1::Point2F(frontLeft, frontTop + radius));
+        sink->AddBezier(D2D1::BezierSegment(
+            D2D1::Point2F(frontLeft, frontTop + radius - curve),
+            D2D1::Point2F(frontLeft + radius - curve, frontTop),
+            D2D1::Point2F(frontLeft + radius, frontTop)));
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        AGSHOT_CHECK_HR(sink->Close());
     }
 
     void Overlay::CreateDeviceResources()
@@ -378,6 +445,7 @@ namespace agshot
 
         AGSHOT_CHECK_HR(m_d2dFactory->CreateDevice(m_dxgiDevice.get(), m_d2dDevice.put()));
         AGSHOT_CHECK_HR(m_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, m_d2dContext.put()));
+        AGSHOT_CHECK_HR(m_d2dContext->CreateLayer(nullptr, m_magnifierLayer.put()));
 
         AGSHOT_CHECK_HR(DCompositionCreateDevice(
             m_dxgiDevice.get(), __uuidof(IDCompositionDevice), m_composition.put_void()));
@@ -433,6 +501,12 @@ namespace agshot
     float Overlay::Scaled(float value) const noexcept
     {
         return value * static_cast<float>(m_dpi) / 96.0f;
+    }
+
+    float Overlay::MeasuredPixels(float pixels) const noexcept
+    {
+        const float logicalSize = pixels * 96.0f / static_cast<float>(m_dpi);
+        return Scaled(logicalSize);
     }
 
     RECT Overlay::ClientBounds() const noexcept
@@ -579,6 +653,7 @@ namespace agshot
 
         // The whole ladder is rebuilt here, on the move, so that the wheel can
         // then walk it without another round of cross-process calls.
+        // TODO: Consider resetting m_depth when the pointer moves to a different candidate.
         const POINT screen{ point.x + m_bounds.left, point.y + m_bounds.top };
         if (m_picker.Ladder(screen, m_ladder, expansionBudget) < 0)
         {
@@ -772,9 +847,10 @@ namespace agshot
 
     void Overlay::Settle()
     {
-        m_toolbarVisible = true;
-        LayoutToolbar(m_toolbar, m_selection, ClientBounds(), m_dpi);
-        m_toolbar.hovered = HitTestToolbar(m_toolbar, m_pointer);
+        m_toolbarVisible = LayoutToolbar(m_toolbar, m_selection, ClientBounds(), m_dpi);
+        m_toolbar.hovered = m_toolbarVisible
+            ? HitTestToolbar(m_toolbar, m_pointer)
+            : ToolbarButton::None;
     }
 
     void Overlay::OnMouseMove(POINT point)
@@ -828,6 +904,11 @@ namespace agshot
             m_hasSelection = true;
             break;
 
+        case DragMode::ToolbarMove:
+            DragToolbar(m_toolbar, m_toolbarDragStart, m_toolbarDragOrigin, point, ClientBounds());
+            m_toolbar.hovered = ToolbarButton::None;
+            break;
+
         default:
             if (m_smart)
             {
@@ -849,13 +930,24 @@ namespace agshot
 
         if (m_toolbarVisible)
         {
-            const ToolbarButton button = HitTestToolbar(m_toolbar, point);
-            if (button != ToolbarButton::None)
+            switch (HitTestToolbarTarget(m_toolbar, point))
             {
-                // Acted on when the button is released, so that a press which
-                // slides off can still be abandoned.
-                m_pressedButton = button;
+            case ToolbarHitTarget::Copy:
+                m_pressedButton = ToolbarButton::Copy;
                 return;
+            case ToolbarHitTarget::Cancel:
+                m_pressedButton = ToolbarButton::Cancel;
+                return;
+            case ToolbarHitTarget::Handle:
+                m_dragMode = DragMode::ToolbarMove;
+                m_toolbarDragOrigin = point;
+                m_toolbarDragStart = m_toolbar;
+                m_toolbar.hovered = ToolbarButton::None;
+                return;
+            case ToolbarHitTarget::Panel:
+                return;
+            case ToolbarHitTarget::None:
+                break;
             }
         }
 
@@ -890,6 +982,8 @@ namespace agshot
             m_dragPart = part;
             m_dragOrigin = point;
             m_dragStart = m_selection;
+            m_toolbarVisible = false;
+            m_toolbar.hovered = ToolbarButton::None;
             return;
         }
 
@@ -902,6 +996,7 @@ namespace agshot
 
     void Overlay::OnLeftButtonUp(POINT point)
     {
+        m_pointer = point;
         if (GetCapture() == m_window)
         {
             ReleaseCapture();
@@ -916,6 +1011,14 @@ namespace agshot
             {
                 Invoke(pressed);
             }
+            return;
+        }
+
+        if (m_dragMode == DragMode::ToolbarMove)
+        {
+            m_dragMode = DragMode::None;
+            UpdateHover(point);
+            RequestRender();
             return;
         }
 
@@ -963,22 +1066,60 @@ namespace agshot
 
     void Overlay::OnWheel(POINT point, int delta)
     {
-        // Only while nothing has been committed: once the user has drawn or
-        // confirmed a rectangle, the wheel is not a way to change it.
-        if (!m_smart)
+        const RECT bounds = ClientBounds();
+        if (delta == 0 || !PtInRect(&bounds, point))
         {
             return;
         }
 
-        // Level 0 is the innermost element under the pointer, which is what a
-        // person means by "this thing"; each notch up widens the suggestion
-        // towards the whole window, and down narrows it back.
+        if (!m_smart)
+        {
+            if (!m_hasSelection || m_dragMode != DragMode::None
+                || (m_toolbarVisible
+                    && HitTestToolbarTarget(m_toolbar, point) != ToolbarHitTarget::None))
+            {
+                return;
+            }
+
+            RECT adjusted = m_selection;
+            if (delta > 0)
+            {
+                adjusted.left = std::max(bounds.left, adjusted.left - 1);
+                adjusted.top = std::max(bounds.top, adjusted.top - 1);
+                adjusted.right = std::min(bounds.right, adjusted.right + 1);
+                adjusted.bottom = std::min(bounds.bottom, adjusted.bottom + 1);
+            }
+            else
+            {
+                if (adjusted.right - adjusted.left <= 2
+                    || adjusted.bottom - adjusted.top <= 2)
+                {
+                    return;
+                }
+                ++adjusted.left;
+                ++adjusted.top;
+                --adjusted.right;
+                --adjusted.bottom;
+            }
+
+            if (EqualRect(&adjusted, &m_selection))
+            {
+                return;
+            }
+            m_selection = adjusted;
+            m_displaySelection = adjusted;
+            Settle();
+            RequestRender();
+            return;
+        }
+
+        // Each wheel message is one step; magnitude is intentionally ignored.
+        // Level 0 is the innermost element under the pointer; up widens the
+        // suggestion and down narrows it.
         const int previousDepth = m_depth;
         m_depth += delta < 0 ? 1 : -1;
         m_depth = std::clamp(m_depth, -8, 0);
 
-        // A wheel notch explicitly asks for a deeper cached hit path. Ordinary
-        // mouse movement keeps the smaller initial expansion budget.
         const POINT screen{ point.x + m_bounds.left, point.y + m_bounds.top };
         if (m_picker.Ladder(screen, m_ladder, 6) < 0)
         {
@@ -1096,7 +1237,10 @@ namespace agshot
             DrawToolbar();
             DrawTooltip();
         }
-        if (!m_toolbarVisible || (m_hasSelection && PtInRect(&m_selection, m_pointer)))
+        const bool pointerOverToolbar = m_toolbarVisible
+            && HitTestToolbarTarget(m_toolbar, m_pointer) != ToolbarHitTarget::None;
+        if (!pointerOverToolbar
+            && (!m_toolbarVisible || (m_hasSelection && PtInRect(&m_selection, m_pointer))))
         {
             DrawPixelMagnifier();
         }
@@ -1187,22 +1331,60 @@ namespace agshot
         const float width = metrics.width + padding * 2.0f;
         const float height = metrics.height + padding;
 
-        float x = static_cast<float>(selection.left);
-        float y = static_cast<float>(selection.top) - height - Scaled(3);
-        if (y < 0.0f)
+        const float gap = Scaled(3);
+        const float centeredX = std::clamp(
+            static_cast<float>(selection.left), 0.0f,
+            std::max(0.0f, static_cast<float>(m_width) - width));
+        const float centeredY = std::clamp(
+            (static_cast<float>(selection.top + selection.bottom) - height) * 0.5f, 0.0f,
+            std::max(0.0f, static_cast<float>(m_height) - height));
+        const D2D1_RECT_F candidates[] =
         {
-            y = static_cast<float>(selection.top) + Scaled(3);
-        }
-        if (x + width > static_cast<float>(m_width))
+            D2D1::RectF(centeredX, static_cast<float>(selection.top) - gap - height,
+                        centeredX + width, static_cast<float>(selection.top) - gap),
+            D2D1::RectF(centeredX, static_cast<float>(selection.bottom) + gap,
+                        centeredX + width, static_cast<float>(selection.bottom) + gap + height),
+            D2D1::RectF(static_cast<float>(selection.right) + gap, centeredY,
+                        static_cast<float>(selection.right) + gap + width, centeredY + height),
+            D2D1::RectF(static_cast<float>(selection.left) - gap - width, centeredY,
+                        static_cast<float>(selection.left) - gap, centeredY + height),
+        };
+
+        D2D1_RECT_F box{};
+        bool found = false;
+        for (const D2D1_RECT_F& candidate : candidates)
         {
-            x = static_cast<float>(m_width) - width;
+            if (candidate.left < 0.0f || candidate.top < 0.0f
+                || candidate.right > static_cast<float>(m_width)
+                || candidate.bottom > static_cast<float>(m_height))
+            {
+                continue;
+            }
+            if (candidate.right <= selection.left || candidate.left >= selection.right
+                || candidate.bottom <= selection.top || candidate.top >= selection.bottom)
+            {
+                box = candidate;
+                found = true;
+                break;
+            }
         }
-        x = std::max(x, 0.0f);
+        if (!found)
+        {
+            const float maxX = std::max(0.0f, static_cast<float>(m_width) - width);
+            const float maxY = std::max(0.0f, static_cast<float>(m_height) - height);
+            box = D2D1::RectF(
+                std::clamp(static_cast<float>(selection.left), 0.0f, maxX),
+                std::clamp(static_cast<float>(selection.top) - gap - height, 0.0f, maxY),
+                0.0f, 0.0f);
+            box.right = box.left + width;
+            box.bottom = box.top + height;
+        }
 
-        const RECT box{ static_cast<LONG>(x), static_cast<LONG>(y),
-                        static_cast<LONG>(x + width), static_cast<LONG>(y + height) };
+        const float x = box.left;
+        const float y = box.top;
 
-        m_d2dContext->FillRoundedRectangle(ToRoundedRect(box, Scaled(4)), m_panel.get());
+        m_d2dContext->FillRoundedRectangle(
+            D2D1::RoundedRect(box, Scaled(4), Scaled(4)), m_panel.get());
         m_d2dContext->DrawTextLayout(
             D2D1::Point2F(x + padding, y + padding * 0.5f), layout.get(), m_icon.get());
     }
@@ -1215,22 +1397,49 @@ namespace agshot
         }
 
         constexpr int sampleCells = 11;
-        const auto measuredPixels = [this](float pixels)
-        {
-            const float dip = pixels * 96.0f / static_cast<float>(m_dpi);
-            return Scaled(dip);
-        };
-        const float cell = measuredPixels(18.0f);
+        const float cell = MeasuredPixels(18.0f);
         const float previewSize = sampleCells * cell;
-        const float cardWidth = measuredPixels(210.0f);
-        const float cardHeight = measuredPixels(291.0f);
-        const float gap = measuredPixels(16.0f);
-        const float margin = measuredPixels(6.0f);
+        const float cardWidth = MeasuredPixels(210.0f);
+        const float cardHeight = MeasuredPixels(291.0f);
+        const float gap = MeasuredPixels(16.0f);
+        const float margin = MeasuredPixels(6.0f);
 
-        const int pointerX = static_cast<int>(m_pointer.x);
-        const int pointerY = static_cast<int>(m_pointer.y);
-        const int sampleX = std::clamp(pointerX, 0, m_image.width() - 1);
-        const int sampleY = std::clamp(pointerY, 0, m_image.height() - 1);
+        POINT samplePoint = m_pointer;
+        if (m_dragMode == DragMode::MoveOrResize)
+        {
+            switch (m_dragPart)
+            {
+            case SelectionPart::Left:
+            case SelectionPart::TopLeft:
+            case SelectionPart::BottomLeft:
+                samplePoint.x = m_selection.left;
+                break;
+            case SelectionPart::Right:
+            case SelectionPart::TopRight:
+            case SelectionPart::BottomRight:
+                samplePoint.x = m_selection.right - 1;
+                break;
+            default:
+                break;
+            }
+            switch (m_dragPart)
+            {
+            case SelectionPart::Top:
+            case SelectionPart::TopLeft:
+            case SelectionPart::TopRight:
+                samplePoint.y = m_selection.top;
+                break;
+            case SelectionPart::Bottom:
+            case SelectionPart::BottomLeft:
+            case SelectionPart::BottomRight:
+                samplePoint.y = m_selection.bottom - 1;
+                break;
+            default:
+                break;
+            }
+        }
+        const int sampleX = std::clamp(static_cast<int>(samplePoint.x), 0, m_image.width() - 1);
+        const int sampleY = std::clamp(static_cast<int>(samplePoint.y), 0, m_image.height() - 1);
         const int sourceLeft = std::clamp(sampleX - sampleCells / 2, 0,
             std::max(0, m_image.width() - sampleCells));
         const int sourceTop = std::clamp(sampleY - sampleCells / 2, 0,
@@ -1260,22 +1469,46 @@ namespace agshot
 
         const RECT card{ static_cast<LONG>(x), static_cast<LONG>(y),
                          static_cast<LONG>(x + cardWidth), static_cast<LONG>(y + cardHeight) };
+        struct LayerPop
+        {
+            ID2D1DeviceContext* context{};
+            ~LayerPop()
+            {
+                if (context != nullptr)
+                {
+                    context->PopLayer();
+                }
+            }
+        } layerPop;
+        if (m_dragMode == DragMode::NewRectangle || m_dragMode == DragMode::MoveOrResize)
+        {
+            const float layerExtent = MeasuredPixels(8.0f);
+            const D2D1_RECT_F layerBounds = D2D1::RectF(
+                x - layerExtent, y - layerExtent,
+                x + cardWidth + layerExtent, y + cardHeight + layerExtent);
+            const auto layer = D2D1::LayerParameters(
+                layerBounds, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                D2D1::IdentityMatrix(), 0.55f);
+            m_d2dContext->PushLayer(layer, m_magnifierLayer.get());
+            layerPop.context = m_d2dContext.get();
+        }
+
         for (int spread = 6; spread >= 1; --spread)
         {
-            const float extent = measuredPixels(static_cast<float>(spread));
+            const float extent = MeasuredPixels(static_cast<float>(spread));
             const D2D1_RECT_F shadowBounds = D2D1::RectF(
-                x - extent, y - extent + measuredPixels(2.0f),
-                x + cardWidth + extent, y + cardHeight + extent + measuredPixels(2.0f));
+                x - extent, y - extent + MeasuredPixels(2.0f),
+                x + cardWidth + extent, y + cardHeight + extent + MeasuredPixels(2.0f));
             const float opacity = 0.015f * static_cast<float>(7 - spread);
             m_shadow->SetColor(D2D1::ColorF(0.0f, 0.0f, 0.0f, opacity));
             m_d2dContext->FillRoundedRectangle(
-                D2D1::RoundedRect(shadowBounds, measuredPixels(7.0f) + extent,
-                                  measuredPixels(7.0f) + extent), m_shadow.get());
+                D2D1::RoundedRect(shadowBounds, MeasuredPixels(7.0f) + extent,
+                                  MeasuredPixels(7.0f) + extent), m_shadow.get());
         }
         m_shadow->SetColor(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.1f));
-        m_d2dContext->FillRoundedRectangle(ToRoundedRect(card, measuredPixels(7.0f)), m_handleFill.get());
+        m_d2dContext->FillRoundedRectangle(ToRoundedRect(card, MeasuredPixels(7.0f)), m_handleFill.get());
         m_d2dContext->DrawRoundedRectangle(
-            ToRoundedRect(card, measuredPixels(7.0f)), m_panelEdge.get(), measuredPixels(1.0f));
+            ToRoundedRect(card, MeasuredPixels(7.0f)), m_panelEdge.get(), MeasuredPixels(1.0f));
 
         const float previewLeft = x + (cardWidth - previewSize) * 0.5f;
         const float previewTop = y + margin;
@@ -1292,15 +1525,15 @@ namespace agshot
         const RECT selectedCell{ static_cast<LONG>(selectedLeft), static_cast<LONG>(selectedTop),
                                  static_cast<LONG>(selectedLeft + cell), static_cast<LONG>(selectedTop + cell) };
         m_d2dContext->DrawRectangle(
-            ToRectF(selectedCell), m_handleFill.get(), measuredPixels(2.0f));
+            ToRectF(selectedCell), m_handleFill.get(), MeasuredPixels(2.0f));
         RECT inner = selectedCell;
         InflateRect(&inner, -1, -1);
         m_d2dContext->DrawRectangle(
-            ToRectF(inner), m_handleEdge.get(), measuredPixels(1.0f));
+            ToRectF(inner), m_handleEdge.get(), MeasuredPixels(1.0f));
 
         wchar_t coordinates[64]{};
         swprintf_s(coordinates, L"X: %d Y: %d",
-                   m_pointer.x + m_bounds.left, m_pointer.y + m_bounds.top);
+                   samplePoint.x + m_bounds.left, samplePoint.y + m_bounds.top);
         wchar_t hex[16]{};
         swprintf_s(hex, L"%02X%02X%02X", red, green, blue);
 
@@ -1317,20 +1550,20 @@ namespace agshot
                                          layout.get(), brush);
         };
 
-        const float coordinatesTop = previewTop + previewSize + measuredPixels(3.0f);
+        const float coordinatesTop = previewTop + previewSize + MeasuredPixels(3.0f);
         drawCenteredText(coordinates, D2D1::RectF(
             x + margin, coordinatesTop, x + cardWidth - margin,
-            coordinatesTop + measuredPixels(34.0f)),
+            coordinatesTop + MeasuredPixels(34.0f)),
             m_handleEdge.get());
 
-        const float swatchInset = measuredPixels(5.0f);
-        const float swatchTop = coordinatesTop + measuredPixels(42.0f);
+        const float swatchInset = MeasuredPixels(5.0f);
+        const float swatchTop = coordinatesTop + MeasuredPixels(42.0f);
         const RECT swatch{ static_cast<LONG>(x + swatchInset), static_cast<LONG>(swatchTop),
                            static_cast<LONG>(x + cardWidth - swatchInset),
-                           static_cast<LONG>(y + cardHeight - measuredPixels(6.0f)) };
+                           static_cast<LONG>(y + cardHeight - MeasuredPixels(6.0f)) };
         m_accent->SetColor(D2D1::ColorF(red / 255.0f, green / 255.0f, blue / 255.0f));
         m_d2dContext->FillRoundedRectangle(
-            ToRoundedRect(swatch, measuredPixels(5.0f)), m_accent.get());
+            ToRoundedRect(swatch, MeasuredPixels(5.0f)), m_accent.get());
         drawCenteredText(hex, ToRectF(swatch), luminance > 0.58f ? m_handleEdge.get() : m_icon.get());
         m_accent->SetColor(D2D1::ColorF(0.18f, 0.49f, 0.94f, 1.0f));
     }
@@ -1341,6 +1574,21 @@ namespace agshot
 
         m_d2dContext->FillRoundedRectangle(ToRoundedRect(m_toolbar.panel, radius), m_panel.get());
         m_d2dContext->DrawRoundedRectangle(ToRoundedRect(m_toolbar.panel, radius), m_panelEdge.get(), 1.0f);
+
+        const float gripX = static_cast<float>(m_toolbar.handle.left + m_toolbar.handle.right) * 0.5f;
+        const float gripY = static_cast<float>(m_toolbar.handle.top + m_toolbar.handle.bottom) * 0.5f;
+        const float dotRadius = Scaled(1.25f);
+        for (int row = -1; row <= 1; ++row)
+        {
+            for (int column = -1; column <= 1; column += 2)
+            {
+                const D2D1_POINT_2F center{
+                    gripX + Scaled(static_cast<float>(column * 3)),
+                    gripY + Scaled(static_cast<float>(row * 4)) };
+                m_d2dContext->FillEllipse(
+                    D2D1::Ellipse(center, dotRadius, dotRadius), m_icon.get());
+            }
+        }
 
         const bool copyHovered = m_toolbar.hovered == ToolbarButton::Copy;
         const bool cancelHovered = m_toolbar.hovered == ToolbarButton::Cancel;
@@ -1357,29 +1605,25 @@ namespace agshot
         }
 
         const int inset = MulDiv(kIconInset, m_dpi, 96);
-        DrawIconCopy(Inset(m_toolbar.copy, inset), copyHovered ? m_hover.get() : m_panel.get());
+        DrawIconCopy(Inset(m_toolbar.copy, inset));
         DrawIconCancel(Inset(m_toolbar.cancel, inset));
     }
 
-    void Overlay::DrawIconCopy(const RECT& box, ID2D1SolidColorBrush* background)
+    void Overlay::DrawIconCopy(const RECT& box)
     {
-        const float stroke = Scaled(kIconStroke);
-        const float radius = Scaled(2);
-        const int width = box.right - box.left;
-        const int height = box.bottom - box.top;
-
-        // Two sheets. The front one is filled with the button's own colour so that
-        // it punches a hole in the back one rather than showing it through.
-        const RECT back{ box.left, box.top,
-                         box.left + MulDiv(width, 62, 100),
-                         box.top + MulDiv(height, 72, 100) };
-        const RECT front{ box.left + MulDiv(width, 30, 100),
-                          box.top + MulDiv(height, 28, 100),
-                          box.right, box.bottom };
-
-        m_d2dContext->DrawRoundedRectangle(ToRoundedRect(back, radius), m_icon.get(), stroke);
-        m_d2dContext->FillRoundedRectangle(ToRoundedRect(front, radius), background);
-        m_d2dContext->DrawRoundedRectangle(ToRoundedRect(front, radius), m_icon.get(), stroke);
+        D2D1_MATRIX_3X2_F original{};
+        m_d2dContext->GetTransform(&original);
+        const float scaleX = static_cast<float>(box.right - box.left) / 18.0f;
+        const float scaleY = static_cast<float>(box.bottom - box.top) / 18.0f;
+        const D2D1_MATRIX_3X2_F iconTransform =
+            D2D1::Matrix3x2F::Scale(scaleX, scaleY)
+            * D2D1::Matrix3x2F::Translation(
+                static_cast<float>(box.left), static_cast<float>(box.top))
+            * original;
+        m_d2dContext->SetTransform(iconTransform);
+        m_d2dContext->DrawGeometry(
+            m_copyIconGeometry.get(), m_icon.get(), static_cast<float>(kIconStroke), m_roundStroke.get());
+        m_d2dContext->SetTransform(original);
     }
 
     void Overlay::DrawIconCancel(const RECT& box)
@@ -1477,7 +1721,7 @@ namespace agshot
                 AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextFormat(
                     L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
                     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                    Scaled(18.0f * 96.0f / m_dpi), L"en-US",
+                    Scaled(MeasuredPixels(18.0f)), L"en-US",
                     m_magnifierTextFormat.put()));
             }
             if (m_toolbarVisible)
@@ -1578,13 +1822,27 @@ namespace agshot
         case WM_SETCURSOR:
         {
             LPCWSTR shape = IDC_CROSS;
+            const ToolbarHitTarget toolbarTarget = m_toolbarVisible
+                ? HitTestToolbarTarget(m_toolbar, m_pointer)
+                : ToolbarHitTarget::None;
+
             if (m_dragMode == DragMode::MoveOrResize)
             {
                 shape = CursorForPart(m_dragPart);
             }
-            else if (m_toolbarVisible && HitTestToolbar(m_toolbar, m_pointer) != ToolbarButton::None)
+            else if (m_dragMode == DragMode::ToolbarMove
+                || toolbarTarget == ToolbarHitTarget::Handle)
+            {
+                shape = IDC_SIZEALL;
+            }
+            else if (toolbarTarget == ToolbarHitTarget::Copy
+                || toolbarTarget == ToolbarHitTarget::Cancel)
             {
                 shape = IDC_HAND;
+            }
+            else if (toolbarTarget == ToolbarHitTarget::Panel)
+            {
+                shape = IDC_ARROW;
             }
             else if (!m_smart && m_hasSelection)
             {

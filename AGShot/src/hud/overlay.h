@@ -64,9 +64,11 @@ namespace agshot
             None,
             NewRectangle,     // pulling a fresh rectangle out of empty space
             MoveOrResize,     // moving or resizing the one already there
+            ToolbarMove,       // dragging the toolbar by its left handle
         };
 
         void CreateDeviceIndependentResources();
+        void CreateCopyIconGeometry();
         void CreateDeviceResources();
         void CreateSizeDependentResources();
 
@@ -104,11 +106,12 @@ namespace agshot
         void DrawToolbar();
         void DrawTooltip();
         void DrawPixelMagnifier();
-        void DrawIconCopy(const RECT& box, ID2D1SolidColorBrush* background);
+        void DrawIconCopy(const RECT& box);
         void DrawIconCancel(const RECT& box);
 
         float Scaled(int value) const noexcept;
         float Scaled(float value) const noexcept;
+        float MeasuredPixels(float pixels) const noexcept;
 
         HWND m_window{};
         HINSTANCE m_instance{};
@@ -130,6 +133,8 @@ namespace agshot
         winrt::com_ptr<IDWriteTextFormat> m_textFormat;
         winrt::com_ptr<IDWriteTextFormat> m_magnifierTextFormat;
         winrt::com_ptr<ID2D1StrokeStyle> m_roundStroke;
+        winrt::com_ptr<ID2D1PathGeometry> m_copyIconGeometry;
+        winrt::com_ptr<ID2D1Layer> m_magnifierLayer;
         winrt::com_ptr<IDCompositionDevice> m_composition;
         winrt::com_ptr<IDCompositionTarget> m_target;
         winrt::com_ptr<IDCompositionVisual> m_visual;
@@ -170,6 +175,8 @@ namespace agshot
         POINT m_pointer{};
 
         Toolbar m_toolbar{};
+        Toolbar m_toolbarDragStart{};
+        POINT m_toolbarDragOrigin{};
         bool m_toolbarVisible{};
 
         DragMode m_dragMode{ DragMode::None };
