@@ -1870,6 +1870,23 @@ namespace agshot
                 Invoke(ToolbarButton::Copy);
                 return 0;
             }
+            if (wparam == VK_LEFT || wparam == VK_UP
+                || wparam == VK_RIGHT || wparam == VK_DOWN)
+            {
+                POINT cursor{};
+                if (GetCursorPos(&cursor))
+                {
+                    switch (wparam)
+                    {
+                    case VK_LEFT:  --cursor.x; break;
+                    case VK_UP:    --cursor.y; break;
+                    case VK_RIGHT: ++cursor.x; break;
+                    case VK_DOWN:  ++cursor.y; break;
+                    }
+                    SetCursorPos(cursor.x, cursor.y);
+                }
+                return 0;
+            }
             break;
 
         case WM_DESTROY:
