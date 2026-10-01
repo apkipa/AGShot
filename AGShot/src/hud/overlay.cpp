@@ -10,7 +10,10 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 
 namespace agshot
 {
@@ -45,6 +48,101 @@ namespace agshot
         // UIA is a cross-process call. The pointer moves far more often than a
         // suggestion can usefully change, so the call is throttled.
         constexpr ULONGLONG kQueryIntervalMs = 30;
+        constexpr ULONGLONG kSelectionAnimationMs = 101;
+
+        LONGLONG PerformanceCounterFrequency() noexcept
+        {
+            static const LONGLONG frequency = []
+            {
+                LARGE_INTEGER value{};
+                QueryPerformanceFrequency(&value);
+                return value.QuadPart;
+            }();
+            return frequency;
+        }
+        constexpr UINT kSelectionAnimationFrameMessage = WM_APP + 0x4A;
+        constexpr DWORD kCompositorClockTimeoutMs = 50;
+        constexpr DWORD kClockRetryDelayMs = 50;
+
+        using WaitForCompositorClockFn = DWORD(WINAPI*)(UINT, const HANDLE*, DWORD);
+
+        WaitForCompositorClockFn CompositorClockWaiter() noexcept
+        {
+            static const auto wait = reinterpret_cast<WaitForCompositorClockFn>(
+                GetProcAddress(GetModuleHandleW(L"dcomp.dll"), "DCompositionWaitForCompositorClock"));
+            return wait;
+        }
+
+        class CompositorClockService
+        {
+        public:
+            winrt::event_token Add(winrt::delegate<void()> callback)
+            {
+                winrt::event_token token{};
+                {
+                    std::lock_guard lock(m_waitMutex);
+                    token = m_clockTick.add(callback);
+                }
+                m_wake.notify_one();
+                return token;
+            }
+
+            void Remove(winrt::event_token token)
+            {
+                {
+                    std::lock_guard lock(m_waitMutex);
+                    m_clockTick.remove(token);
+                }
+                m_wake.notify_one();
+            }
+
+        private:
+            CompositorClockService()
+            {
+                std::thread([this] { Run(); }).detach();
+            }
+
+            void Run() noexcept
+            {
+                const auto waitForClock = CompositorClockWaiter();
+                for (;;)
+                {
+                    {
+                        std::unique_lock lock(m_waitMutex);
+                        m_wake.wait(lock, [this] { return static_cast<bool>(m_clockTick); });
+                    }
+
+                    if (waitForClock == nullptr)
+                    {
+                        Sleep(16);
+                        m_clockTick();
+                        continue;
+                    }
+
+                    const DWORD status = waitForClock(0, nullptr, kCompositorClockTimeoutMs);
+                    if (status == ERROR_SUCCESS)
+                    {
+                        m_clockTick();
+                    }
+                    else if (status != WAIT_TIMEOUT)
+                    {
+                        Sleep(kClockRetryDelayMs);
+                    }
+                }
+            }
+
+            std::mutex m_waitMutex;
+            std::condition_variable m_wake;
+            winrt::event<winrt::delegate<void()>> m_clockTick;
+
+            friend CompositorClockService& GlobalCompositorClock();
+        };
+
+        CompositorClockService& GlobalCompositorClock()
+        {
+            static auto* service = new CompositorClockService();
+            return *service;
+        }
 
         RECT VirtualScreen() noexcept
         {
@@ -80,6 +178,12 @@ namespace agshot
         // There is one overlay, and the window procedure has to reach it.
         Overlay* g_overlay{};
 
+        struct FlagReset
+        {
+            bool& flag;
+            ~FlagReset() { flag = false; }
+        };
+
         LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
         {
             if (g_overlay == nullptr)
@@ -112,12 +216,8 @@ namespace agshot
     bool Overlay::Create(HINSTANCE instance)
     {
         m_instance = instance;
-        m_dpi = static_cast<int>(GetDpiForSystem());
-        if (m_dpi <= 0)
-        {
-            m_dpi = 96;
-        }
-        m_handleSize = MulDiv(kHandleSize, m_dpi, 96);
+        m_dpi = 96;
+        m_handleSize = kHandleSize;
 
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
@@ -147,6 +247,13 @@ namespace agshot
             return false;
         }
 
+        m_dpi = static_cast<int>(GetDpiForWindow(m_window));
+        if (m_dpi <= 0)
+        {
+            m_dpi = 96;
+        }
+        m_handleSize = MulDiv(kHandleSize, m_dpi, 96);
+
         CreateDeviceIndependentResources();
         CreateDeviceResources();
 
@@ -163,6 +270,8 @@ namespace agshot
 
     void Overlay::Destroy() noexcept
     {
+        StopSelectionAnimation();
+        StopAnimationClock();
         if (m_window != nullptr)
         {
             DestroyWindow(m_window);
@@ -179,6 +288,7 @@ namespace agshot
         m_composition = nullptr;
         m_roundStroke = nullptr;
         m_textFormat = nullptr;
+        m_magnifierTextFormat = nullptr;
         m_dwriteFactory = nullptr;
         m_icon = nullptr;
         m_tooltip = nullptr;
@@ -188,6 +298,7 @@ namespace agshot
         m_handleEdge = nullptr;
         m_handleFill = nullptr;
         m_accent = nullptr;
+        m_shadow = nullptr;
         m_dim = nullptr;
         m_d2dContext = nullptr;
         m_d2dDevice = nullptr;
@@ -213,6 +324,15 @@ namespace agshot
             Scaled(kTextSize),
             L"en-US",
             m_textFormat.put()));
+        AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextFormat(
+            L"Segoe UI",
+            nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            Scaled(18.0f * 96.0f / m_dpi),
+            L"en-US",
+            m_magnifierTextFormat.put()));
 
         // Round caps, so the cross of the cancel button reads as a drawn mark
         // rather than four clipped ends.
@@ -270,6 +390,7 @@ namespace agshot
         };
 
         brush(0.0f, 0.0f, 0.0f, 0.45f, m_dim);          // everything outside the selection
+        brush(0.0f, 0.0f, 0.0f, 0.1f, m_shadow);        // magnifier card drop shadow
         brush(0.18f, 0.49f, 0.94f, 1.0f, m_accent);      // the selection border
         brush(1.0f, 1.0f, 1.0f, 1.0f, m_handleFill);
         brush(0.10f, 0.10f, 0.12f, 1.0f, m_handleEdge);
@@ -309,6 +430,11 @@ namespace agshot
         return static_cast<float>(MulDiv(value, m_dpi, 96));
     }
 
+    float Overlay::Scaled(float value) const noexcept
+    {
+        return value * static_cast<float>(m_dpi) / 96.0f;
+    }
+
     RECT Overlay::ClientBounds() const noexcept
     {
         return RECT{ 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
@@ -316,7 +442,7 @@ namespace agshot
 
     void Overlay::Begin()
     {
-        if (m_window == nullptr)
+        if (m_window == nullptr || m_beginning)
         {
             return;
         }
@@ -328,6 +454,9 @@ namespace agshot
         {
             return;
         }
+
+        m_beginning = true;
+        const FlagReset resetBeginning{ m_beginning };
 
         m_previousForeground = GetForegroundWindow();
         if (m_previousForeground == m_window)
@@ -353,6 +482,9 @@ namespace agshot
         m_picker.Freeze(m_window);
         m_ladder.clear();
         m_lastQuery = 0;
+        StopSelectionAnimation();
+        StopAnimationClock();
+        ClearSurface();
 
         // Taken while the overlay is still hidden, so what it holds is the
         // desktop rather than the previous capture.
@@ -373,6 +505,11 @@ namespace agshot
                 m_background.put()));
         }
 
+        m_selection = RECT{};
+        m_displaySelection = RECT{};
+        m_animationFrom = RECT{};
+        m_animationTo = RECT{};
+        m_animationStart = 0;
         m_hasSelection = false;
         m_smart = true;
         m_depth = 0;
@@ -384,14 +521,8 @@ namespace agshot
         m_toolbar.hovered = ToolbarButton::None;
         m_trackingLeave = false;
 
-        // Activating is deliberate: the overlay needs the keyboard for Escape and
-        // Return, and the mouse for everything else.
-        SetWindowPos(m_window, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-        SetForegroundWindow(m_window);
-        SetFocus(m_window);
-
-        // Suggest something straight away rather than waiting for the first move.
+        // Resolve and draw the initial suggestion while hidden so the previous
+        // capture cannot flash when the overlay is shown.
         POINT cursor{};
         if (GetCursorPos(&cursor))
         {
@@ -399,8 +530,14 @@ namespace agshot
             m_pointer = cursor;
             RefreshSuggestion(cursor, 6);
         }
-
         Render();
+
+        // Activating is deliberate: the overlay needs the keyboard for Escape and
+        // Return, and the mouse for everything else.
+        SetWindowPos(m_window, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetForegroundWindow(m_window);
+        SetFocus(m_window);
     }
 
     void Overlay::Cancel() noexcept
@@ -410,6 +547,8 @@ namespace agshot
             return;
         }
 
+        StopSelectionAnimation();
+        StopAnimationClock();
         ShowWindow(m_window, SW_HIDE);
 
         m_hasSelection = false;
@@ -441,7 +580,10 @@ namespace agshot
         // The whole ladder is rebuilt here, on the move, so that the wheel can
         // then walk it without another round of cross-process calls.
         const POINT screen{ point.x + m_bounds.left, point.y + m_bounds.top };
-        m_picker.Ladder(screen, m_ladder, expansionBudget);
+        if (m_picker.Ladder(screen, m_ladder, expansionBudget) < 0)
+        {
+            return;
+        }
         ApplyLadderLevel();
     }
 
@@ -449,6 +591,7 @@ namespace agshot
     {
         if (m_ladder.empty())
         {
+            StopSelectionAnimation();
             m_hasSelection = false;
             return;
         }
@@ -468,12 +611,151 @@ namespace agshot
         RECT clipped{};
         if (IntersectRect(&clipped, &local, &bounds) && !IsEmptyRect(clipped))
         {
+            StartSelectionAnimation(clipped);
             m_selection = clipped;
             m_hasSelection = true;
             return;
         }
 
+        StopSelectionAnimation();
         m_hasSelection = false;
+    }
+
+    void Overlay::StartSelectionAnimation(const RECT& target)
+    {
+        if (!m_smart || !m_hasSelection)
+        {
+            StopSelectionAnimation();
+            m_displaySelection = target;
+            return;
+        }
+
+        if (EqualRect(&m_displaySelection, &target))
+        {
+            StopSelectionAnimation();
+            return;
+        }
+
+        const bool wasAnimating = m_animatingSelection;
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        m_animationFrom = m_displaySelection;
+        m_animationTo = target;
+        m_animationStart = now.QuadPart;
+        m_animatingSelection = true;
+        if (!wasAnimating && !StartAnimationClock())
+        {
+            m_displaySelection = target;
+            StopSelectionAnimation();
+        }
+    }
+
+    void Overlay::RequestRender()
+    {
+        if (m_window == nullptr || !IsWindowVisible(m_window))
+        {
+            Render();
+            return;
+        }
+        if (!m_animationFrameSignal && !StartAnimationClock())
+        {
+            Render();
+        }
+    }
+
+    bool Overlay::StartAnimationClock() noexcept
+    {
+        if (m_animationFrameSignal)
+        {
+            return true;
+        }
+
+        try
+        {
+            auto signal = std::make_shared<AnimationFrameSignal>();
+            signal->window = m_window;
+            m_animationFrameSignal = signal;
+            m_animationClockToken = GlobalCompositorClock().Add(winrt::delegate<void()>{ [signal]()
+            {
+                std::lock_guard lock(signal->mutex);
+                if (!signal->active || signal->posted)
+                {
+                    return;
+                }
+
+                signal->posted = true;
+                if (!PostMessageW(signal->window, kSelectionAnimationFrameMessage, 0, 0))
+                {
+                    signal->posted = false;
+                }
+            } });
+            return true;
+        }
+        catch (...)
+        {
+            m_animationFrameSignal.reset();
+            return false;
+        }
+    }
+
+    bool Overlay::AdvanceSelectionAnimation(LONGLONG now) noexcept
+    {
+        const LONGLONG elapsed = std::max<LONGLONG>(0, now - m_animationStart);
+        const double duration = static_cast<double>(PerformanceCounterFrequency())
+            * static_cast<double>(kSelectionAnimationMs) / 1000.0;
+        const float linear = static_cast<float>(std::min(1.0, elapsed / duration));
+        const float eased = 1.0f - (1.0f - linear) * (1.0f - linear);
+        const auto interpolate = [eased](LONG from, LONG to)
+        {
+            return static_cast<LONG>(from + (to - from) * eased);
+        };
+
+        m_displaySelection = RECT{
+            interpolate(m_animationFrom.left, m_animationTo.left),
+            interpolate(m_animationFrom.top, m_animationTo.top),
+            interpolate(m_animationFrom.right, m_animationTo.right),
+            interpolate(m_animationFrom.bottom, m_animationTo.bottom) };
+
+        if (linear >= 1.0f)
+        {
+            m_displaySelection = m_animationTo;
+            m_animatingSelection = false;
+            return false;
+        }
+        return true;
+    }
+
+    void Overlay::StopAnimationClock() noexcept
+    {
+        if (m_animationFrameSignal)
+        {
+            {
+                std::lock_guard lock(m_animationFrameSignal->mutex);
+                m_animationFrameSignal->active = false;
+            }
+            GlobalCompositorClock().Remove(m_animationClockToken);
+            m_animationClockToken = {};
+            m_animationFrameSignal.reset();
+        }
+
+        if (m_window != nullptr)
+        {
+            MSG pending{};
+            while (PeekMessageW(&pending, m_window,
+                                kSelectionAnimationFrameMessage,
+                                kSelectionAnimationFrameMessage, PM_REMOVE))
+            {
+            }
+        }
+    }
+
+    void Overlay::StopSelectionAnimation() noexcept
+    {
+        if (m_animatingSelection)
+        {
+            m_animatingSelection = false;
+            StopAnimationClock();
+        }
     }
 
     void Overlay::UpdateHover(POINT point)
@@ -558,7 +840,7 @@ namespace agshot
             break;
         }
 
-        Render();
+        RequestRender();
     }
 
     void Overlay::OnLeftButtonDown(POINT point)
@@ -581,6 +863,8 @@ namespace agshot
         // this set would let the next mouse move quietly replace a rectangle the
         // user had just drawn with whatever happens to be under the cursor.
         const bool wasFollowing = m_smart;
+        StopSelectionAnimation();
+        m_displaySelection = m_selection;
         m_smart = false;
         m_depth = 0;
 
@@ -652,7 +936,7 @@ namespace agshot
             m_smart = false;
             m_depth = 0;
             Settle();
-            Render();
+            RequestRender();
             return;
         }
 
@@ -668,13 +952,13 @@ namespace agshot
                 m_smart = true;
                 m_depth = 0;
                 RefreshSuggestion(point);
-                Render();
+                RequestRender();
                 return;
             }
         }
 
         Settle();
-        Render();
+        RequestRender();
     }
 
     void Overlay::OnWheel(POINT point, int delta)
@@ -689,16 +973,21 @@ namespace agshot
         // Level 0 is the innermost element under the pointer, which is what a
         // person means by "this thing"; each notch up widens the suggestion
         // towards the whole window, and down narrows it back.
+        const int previousDepth = m_depth;
         m_depth += delta < 0 ? 1 : -1;
         m_depth = std::clamp(m_depth, -8, 0);
 
         // A wheel notch explicitly asks for a deeper cached hit path. Ordinary
         // mouse movement keeps the smaller initial expansion budget.
         const POINT screen{ point.x + m_bounds.left, point.y + m_bounds.top };
-        m_picker.Ladder(screen, m_ladder, 6);
+        if (m_picker.Ladder(screen, m_ladder, 6) < 0)
+        {
+            m_depth = previousDepth;
+            return;
+        }
         m_lastQuery = GetTickCount64();
         ApplyLadderLevel();
-        Render();
+        RequestRender();
     }
 
     void Overlay::Invoke(ToolbarButton button)
@@ -734,6 +1023,17 @@ namespace agshot
         }
 
         Cancel();
+    }
+
+    void Overlay::ClearSurface()
+    {
+        if (!m_surface || m_width == 0 || m_height == 0)
+        {
+            return;
+        }
+
+        AGSHOT_CHECK_HR(m_surface->Trim(nullptr, 0));
+        AGSHOT_CHECK_HR(m_composition->Commit());
     }
 
     void Overlay::Render()
@@ -796,6 +1096,10 @@ namespace agshot
             DrawToolbar();
             DrawTooltip();
         }
+        if (!m_toolbarVisible || (m_hasSelection && PtInRect(&m_selection, m_pointer)))
+        {
+            DrawPixelMagnifier();
+        }
 
         m_d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
         AGSHOT_CHECK_HR(m_d2dContext->EndDraw());
@@ -821,7 +1125,7 @@ namespace agshot
 
         // Four rectangles around the selection rather than one with a hole cut in
         // it: cheaper than a mask layer and just as exact.
-        const RECT& s = m_selection;
+        const RECT& s = m_smart ? m_displaySelection : m_selection;
         const float left = static_cast<float>(s.left);
         const float top = static_cast<float>(s.top);
         const float right = static_cast<float>(s.right);
@@ -839,7 +1143,8 @@ namespace agshot
 
         // Inset by half the stroke so that the border sits inside the selection
         // rather than straddling it and covering a line of the picture.
-        RECT border = m_selection;
+        const RECT& selection = m_smart ? m_displaySelection : m_selection;
+        RECT border = selection;
         const int half = static_cast<int>(stroke / 2.0f);
         InflateRect(&border, -half, -half);
 
@@ -847,7 +1152,7 @@ namespace agshot
 
         if (!m_smart)
         {
-            for (const RECT& handle : HandleRects(m_selection, m_handleSize))
+            for (const RECT& handle : HandleRects(selection, m_handleSize))
             {
                 const D2D1_RECT_F box = ToRectF(handle);
                 m_d2dContext->FillRectangle(box, m_handleFill.get());
@@ -861,9 +1166,10 @@ namespace agshot
     void Overlay::DrawSizeLabel()
     {
         wchar_t text[64]{};
+        const RECT& selection = m_smart ? m_displaySelection : m_selection;
         swprintf_s(text, L"%d x %d",
-                   m_selection.right - m_selection.left,
-                   m_selection.bottom - m_selection.top);
+                   selection.right - selection.left,
+                   selection.bottom - selection.top);
 
         winrt::com_ptr<IDWriteTextLayout> layout;
         AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextLayout(
@@ -881,11 +1187,11 @@ namespace agshot
         const float width = metrics.width + padding * 2.0f;
         const float height = metrics.height + padding;
 
-        float x = static_cast<float>(m_selection.left);
-        float y = static_cast<float>(m_selection.top) - height - Scaled(3);
+        float x = static_cast<float>(selection.left);
+        float y = static_cast<float>(selection.top) - height - Scaled(3);
         if (y < 0.0f)
         {
-            y = static_cast<float>(m_selection.top) + Scaled(3);
+            y = static_cast<float>(selection.top) + Scaled(3);
         }
         if (x + width > static_cast<float>(m_width))
         {
@@ -899,6 +1205,134 @@ namespace agshot
         m_d2dContext->FillRoundedRectangle(ToRoundedRect(box, Scaled(4)), m_panel.get());
         m_d2dContext->DrawTextLayout(
             D2D1::Point2F(x + padding, y + padding * 0.5f), layout.get(), m_icon.get());
+    }
+
+    void Overlay::DrawPixelMagnifier()
+    {
+        if (!m_background || m_image.empty())
+        {
+            return;
+        }
+
+        constexpr int sampleCells = 11;
+        const auto measuredPixels = [this](float pixels)
+        {
+            const float dip = pixels * 96.0f / static_cast<float>(m_dpi);
+            return Scaled(dip);
+        };
+        const float cell = measuredPixels(18.0f);
+        const float previewSize = sampleCells * cell;
+        const float cardWidth = measuredPixels(210.0f);
+        const float cardHeight = measuredPixels(291.0f);
+        const float gap = measuredPixels(16.0f);
+        const float margin = measuredPixels(6.0f);
+
+        const int pointerX = static_cast<int>(m_pointer.x);
+        const int pointerY = static_cast<int>(m_pointer.y);
+        const int sampleX = std::clamp(pointerX, 0, m_image.width() - 1);
+        const int sampleY = std::clamp(pointerY, 0, m_image.height() - 1);
+        const int sourceLeft = std::clamp(sampleX - sampleCells / 2, 0,
+            std::max(0, m_image.width() - sampleCells));
+        const int sourceTop = std::clamp(sampleY - sampleCells / 2, 0,
+            std::max(0, m_image.height() - sampleCells));
+        const int selectedX = std::clamp(sampleX - sourceLeft, 0, sampleCells - 1);
+        const int selectedY = std::clamp(sampleY - sourceTop, 0, sampleCells - 1);
+
+        const auto* pixels = static_cast<const BYTE*>(m_image.pixels());
+        const BYTE* color = pixels + sampleY * m_image.stride() + sampleX * 4;
+        const BYTE blue = color[0];
+        const BYTE green = color[1];
+        const BYTE red = color[2];
+        const float luminance = (red * 0.299f + green * 0.587f + blue * 0.114f) / 255.0f;
+
+        float x = static_cast<float>(m_pointer.x) + gap;
+        float y = static_cast<float>(m_pointer.y) + gap;
+        if (x + cardWidth > static_cast<float>(m_width))
+        {
+            x = static_cast<float>(m_pointer.x) - gap - cardWidth;
+        }
+        if (y + cardHeight > static_cast<float>(m_height))
+        {
+            y = static_cast<float>(m_pointer.y) - gap - cardHeight;
+        }
+        x = std::clamp(x, 0.0f, std::max(0.0f, static_cast<float>(m_width) - cardWidth));
+        y = std::clamp(y, 0.0f, std::max(0.0f, static_cast<float>(m_height) - cardHeight));
+
+        const RECT card{ static_cast<LONG>(x), static_cast<LONG>(y),
+                         static_cast<LONG>(x + cardWidth), static_cast<LONG>(y + cardHeight) };
+        for (int spread = 6; spread >= 1; --spread)
+        {
+            const float extent = measuredPixels(static_cast<float>(spread));
+            const D2D1_RECT_F shadowBounds = D2D1::RectF(
+                x - extent, y - extent + measuredPixels(2.0f),
+                x + cardWidth + extent, y + cardHeight + extent + measuredPixels(2.0f));
+            const float opacity = 0.015f * static_cast<float>(7 - spread);
+            m_shadow->SetColor(D2D1::ColorF(0.0f, 0.0f, 0.0f, opacity));
+            m_d2dContext->FillRoundedRectangle(
+                D2D1::RoundedRect(shadowBounds, measuredPixels(7.0f) + extent,
+                                  measuredPixels(7.0f) + extent), m_shadow.get());
+        }
+        m_shadow->SetColor(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.1f));
+        m_d2dContext->FillRoundedRectangle(ToRoundedRect(card, measuredPixels(7.0f)), m_handleFill.get());
+        m_d2dContext->DrawRoundedRectangle(
+            ToRoundedRect(card, measuredPixels(7.0f)), m_panelEdge.get(), measuredPixels(1.0f));
+
+        const float previewLeft = x + (cardWidth - previewSize) * 0.5f;
+        const float previewTop = y + margin;
+        const D2D1_RECT_F destination = D2D1::RectF(
+            previewLeft, previewTop, previewLeft + previewSize, previewTop + previewSize);
+        const D2D1_RECT_F source = D2D1::RectF(
+            static_cast<float>(sourceLeft), static_cast<float>(sourceTop),
+            static_cast<float>(sourceLeft + sampleCells), static_cast<float>(sourceTop + sampleCells));
+        m_d2dContext->DrawBitmap(m_background.get(), &destination, 1.0f,
+            D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &source);
+
+        const float selectedLeft = previewLeft + selectedX * cell;
+        const float selectedTop = previewTop + selectedY * cell;
+        const RECT selectedCell{ static_cast<LONG>(selectedLeft), static_cast<LONG>(selectedTop),
+                                 static_cast<LONG>(selectedLeft + cell), static_cast<LONG>(selectedTop + cell) };
+        m_d2dContext->DrawRectangle(
+            ToRectF(selectedCell), m_handleFill.get(), measuredPixels(2.0f));
+        RECT inner = selectedCell;
+        InflateRect(&inner, -1, -1);
+        m_d2dContext->DrawRectangle(
+            ToRectF(inner), m_handleEdge.get(), measuredPixels(1.0f));
+
+        wchar_t coordinates[64]{};
+        swprintf_s(coordinates, L"X: %d Y: %d",
+                   m_pointer.x + m_bounds.left, m_pointer.y + m_bounds.top);
+        wchar_t hex[16]{};
+        swprintf_s(hex, L"%02X%02X%02X", red, green, blue);
+
+        const auto drawCenteredText = [this](const wchar_t* text, const D2D1_RECT_F& bounds,
+                                              ID2D1SolidColorBrush* brush)
+        {
+            winrt::com_ptr<IDWriteTextLayout> layout;
+            AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextLayout(
+                text, static_cast<UINT32>(wcslen(text)), m_magnifierTextFormat.get(),
+                bounds.right - bounds.left, bounds.bottom - bounds.top, layout.put()));
+            AGSHOT_CHECK_HR(layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER));
+            AGSHOT_CHECK_HR(layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER));
+            m_d2dContext->DrawTextLayout(D2D1::Point2F(bounds.left, bounds.top),
+                                         layout.get(), brush);
+        };
+
+        const float coordinatesTop = previewTop + previewSize + measuredPixels(3.0f);
+        drawCenteredText(coordinates, D2D1::RectF(
+            x + margin, coordinatesTop, x + cardWidth - margin,
+            coordinatesTop + measuredPixels(34.0f)),
+            m_handleEdge.get());
+
+        const float swatchInset = measuredPixels(5.0f);
+        const float swatchTop = coordinatesTop + measuredPixels(42.0f);
+        const RECT swatch{ static_cast<LONG>(x + swatchInset), static_cast<LONG>(swatchTop),
+                           static_cast<LONG>(x + cardWidth - swatchInset),
+                           static_cast<LONG>(y + cardHeight - measuredPixels(6.0f)) };
+        m_accent->SetColor(D2D1::ColorF(red / 255.0f, green / 255.0f, blue / 255.0f));
+        m_d2dContext->FillRoundedRectangle(
+            ToRoundedRect(swatch, measuredPixels(5.0f)), m_accent.get());
+        drawCenteredText(hex, ToRectF(swatch), luminance > 0.58f ? m_handleEdge.get() : m_icon.get());
+        m_accent->SetColor(D2D1::ColorF(0.18f, 0.49f, 0.94f, 1.0f));
     }
 
     void Overlay::DrawToolbar()
@@ -1022,6 +1456,37 @@ namespace agshot
     {
         switch (message)
         {
+        case WM_DPICHANGED:
+            m_dpi = HIWORD(wparam);
+            if (m_dpi <= 0)
+            {
+                m_dpi = 96;
+            }
+            m_handleSize = MulDiv(kHandleSize, m_dpi, 96);
+            if (m_textFormat)
+            {
+                m_textFormat = nullptr;
+                AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextFormat(
+                    L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                    Scaled(kTextSize), L"en-US", m_textFormat.put()));
+            }
+            if (m_magnifierTextFormat)
+            {
+                m_magnifierTextFormat = nullptr;
+                AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextFormat(
+                    L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                    Scaled(18.0f * 96.0f / m_dpi), L"en-US",
+                    m_magnifierTextFormat.put()));
+            }
+            if (m_toolbarVisible)
+            {
+                Settle();
+            }
+            RequestRender();
+            return 0;
+
         case WM_SIZE:
             if (wparam != SIZE_MINIMIZED)
             {
@@ -1030,17 +1495,38 @@ namespace agshot
                 if (m_d2dContext && m_width > 0 && m_height > 0)
                 {
                     CreateSizeDependentResources();
-                    Render();
+                    RequestRender();
                 }
             }
             return 0;
+
+        case kSelectionAnimationFrameMessage:
+        {
+            if (m_animationFrameSignal)
+            {
+                std::lock_guard lock(m_animationFrameSignal->mutex);
+                m_animationFrameSignal->posted = false;
+            }
+            if (m_animatingSelection)
+            {
+                LARGE_INTEGER now{};
+                QueryPerformanceCounter(&now);
+                AdvanceSelectionAnimation(now.QuadPart);
+            }
+            Render();
+            if (!m_animatingSelection)
+            {
+                StopAnimationClock();
+            }
+            return 0;
+        }
 
         case WM_PAINT:
         {
             PAINTSTRUCT ps{};
             BeginPaint(hwnd, &ps);
             EndPaint(hwnd, &ps);
-            Render();
+            RequestRender();
             return 0;
         }
 
@@ -1086,7 +1572,7 @@ namespace agshot
         case WM_MOUSELEAVE:
             m_trackingLeave = false;
             m_toolbar.hovered = ToolbarButton::None;
-            Render();
+            RequestRender();
             return 0;
 
         case WM_SETCURSOR:
@@ -1116,6 +1602,12 @@ namespace agshot
                 return 0;
             }
             if (wparam == VK_RETURN && !m_smart && m_hasSelection)
+            {
+                Invoke(ToolbarButton::Copy);
+                return 0;
+            }
+            if (wparam == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)
+                && !m_smart && m_hasSelection)
             {
                 Invoke(ToolbarButton::Copy);
                 return 0;

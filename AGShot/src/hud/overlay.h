@@ -13,6 +13,8 @@
 
 #include <winrt/base.h>
 
+#include <memory>
+#include <mutex>
 #include <vector>
 
 namespace agshot
@@ -68,6 +70,14 @@ namespace agshot
         void CreateDeviceResources();
         void CreateSizeDependentResources();
 
+        struct AnimationFrameSignal
+        {
+            std::mutex mutex;
+            HWND window{};
+            bool active{ true };
+            bool posted{};
+        };
+
         RECT ClientBounds() const noexcept;
 
         void OnMouseMove(POINT point);
@@ -77,19 +87,28 @@ namespace agshot
 
         void RefreshSuggestion(POINT point, int expansionBudget = 2);
         void ApplyLadderLevel();
+        void RequestRender();
+        void StartSelectionAnimation(const RECT& target);
+        bool StartAnimationClock() noexcept;
+        bool AdvanceSelectionAnimation(LONGLONG now) noexcept;
+        void StopAnimationClock() noexcept;
+        void StopSelectionAnimation() noexcept;
         void UpdateHover(POINT point);
         void Settle();
         void Invoke(ToolbarButton button);
 
+        void ClearSurface();
         void DrawDim();
         void DrawSelection();
         void DrawSizeLabel();
         void DrawToolbar();
         void DrawTooltip();
+        void DrawPixelMagnifier();
         void DrawIconCopy(const RECT& box, ID2D1SolidColorBrush* background);
         void DrawIconCancel(const RECT& box);
 
         float Scaled(int value) const noexcept;
+        float Scaled(float value) const noexcept;
 
         HWND m_window{};
         HINSTANCE m_instance{};
@@ -109,6 +128,7 @@ namespace agshot
         winrt::com_ptr<ID2D1DeviceContext> m_d2dContext;
         winrt::com_ptr<IDWriteFactory> m_dwriteFactory;
         winrt::com_ptr<IDWriteTextFormat> m_textFormat;
+        winrt::com_ptr<IDWriteTextFormat> m_magnifierTextFormat;
         winrt::com_ptr<ID2D1StrokeStyle> m_roundStroke;
         winrt::com_ptr<IDCompositionDevice> m_composition;
         winrt::com_ptr<IDCompositionTarget> m_target;
@@ -116,6 +136,7 @@ namespace agshot
         winrt::com_ptr<IDCompositionVirtualSurface> m_surface;
 
         winrt::com_ptr<ID2D1SolidColorBrush> m_dim;
+        winrt::com_ptr<ID2D1SolidColorBrush> m_shadow;
         winrt::com_ptr<ID2D1SolidColorBrush> m_accent;
         winrt::com_ptr<ID2D1SolidColorBrush> m_handleFill;
         winrt::com_ptr<ID2D1SolidColorBrush> m_handleEdge;
@@ -128,7 +149,15 @@ namespace agshot
         // The rectangle on show: either the user's, or the suggestion under the
         // pointer while "m_smart" is still true.
         RECT m_selection{};
+        RECT m_displaySelection{};
+        RECT m_animationFrom{};
+        RECT m_animationTo{};
+        LONGLONG m_animationStart{};
         bool m_hasSelection{};
+        bool m_animatingSelection{};
+        bool m_beginning{};
+        winrt::event_token m_animationClockToken{};
+        std::shared_ptr<AnimationFrameSignal> m_animationFrameSignal;
 
         // True while the selection is still following the pointer, which is what
         // "smart selection" means: nothing has been committed yet.

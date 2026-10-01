@@ -20,6 +20,12 @@ namespace agshot
         constexpr std::size_t kMaxTotalNodes = 16384;
         constexpr std::size_t kMaxLadderRects = 12;
 
+        struct FlagReset
+        {
+            bool& flag;
+            ~FlagReset() { flag = false; }
+        };
+
         struct ChildNode
         {
             winrt::com_ptr<IUIAutomationElement> element;
@@ -150,6 +156,7 @@ namespace agshot
         winrt::com_ptr<IUIAutomationCondition> controlView;
         std::vector<WindowSnapshot> windows;
         std::size_t totalNodes{};
+        bool querying{};
     };
 
     ElementPicker::ElementPicker() : m_impl(std::make_unique<Impl>())
@@ -203,7 +210,14 @@ namespace agshot
 
     int ElementPicker::Ladder(POINT point, std::vector<RECT>& ladder, int expansionBudget)
     {
+        if (m_impl->querying)
+        {
+            return -1;
+        }
+
         ladder.clear();
+        m_impl->querying = true;
+        const FlagReset resetQuery{ m_impl->querying };
         // EnumWindows preserved front-to-back order. Pick exactly one window before
         // asking UIA anything, so a covered application's element can never win.
         WindowSnapshot* window = nullptr;
@@ -300,9 +314,12 @@ namespace agshot
 
                                 BOOL offscreen = FALSE;
                                 RECT childBounds{};
+                                RECT clippedBounds{};
                                 if (FAILED(child->get_CachedIsOffscreen(&offscreen)) || offscreen
                                     || FAILED(child->get_CachedBoundingRectangle(&childBounds))
-                                    || IsRectEmpty(&childBounds))
+                                    || IsRectEmpty(&childBounds)
+                                    || !IntersectRect(&clippedBounds, &childBounds, &window->bounds)
+                                    || IsRectEmpty(&clippedBounds))
                                 {
                                     continue;
                                 }
@@ -312,7 +329,7 @@ namespace agshot
                                 const std::size_t index = window->nodes.size();
                                 ChildNode childNode;
                                 childNode.element = std::move(child);
-                                childNode.bounds = childBounds;
+                                childNode.bounds = clippedBounds;
                                 childNode.parent = current;
                                 childNode.structural = controlType == UIA_PaneControlTypeId
                                     || controlType == UIA_GroupControlTypeId;

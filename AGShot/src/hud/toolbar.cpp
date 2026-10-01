@@ -81,7 +81,7 @@ namespace agshot
         switch (button)
         {
         case ToolbarButton::Copy:
-            return L"Copy to clipboard";
+            return L"Copy to clipboard (Ctrl+C)";
         case ToolbarButton::Cancel:
             return L"Cancel";
         default:

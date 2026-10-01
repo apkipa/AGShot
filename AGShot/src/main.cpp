@@ -20,6 +20,8 @@ namespace
 
     constexpr UINT kConfigChangedMessage = WM_APP + 1;
     constexpr UINT kConfigWatchLostMessage = WM_APP + 2;
+    constexpr UINT kWakeExistingMessage = WM_APP + 3;
+    constexpr wchar_t kSingleInstanceMutexName[] = L"Local\\AGShot.SingleInstance";
 
     // Names the capture combination in WM_HOTKEY. AGShot registers exactly one,
     // so the number only has to be distinct within this window.
@@ -213,6 +215,10 @@ namespace
     {
         switch (message)
         {
+        case kWakeExistingMessage:
+            g_overlay.Begin();
+            return 0;
+
         case kConfigChangedMessage:
             ReloadConfig(false);
             return 0;
@@ -276,6 +282,29 @@ namespace
             }
             return 0;
         }
+    }
+
+    bool WakeExistingInstance()
+    {
+        for (int attempt = 0; attempt < 150; ++attempt)
+        {
+            const HWND hwnd = FindWindowExW(HWND_MESSAGE, nullptr, kMessageClass, nullptr);
+            if (hwnd != nullptr)
+            {
+                DWORD processId{};
+                GetWindowThreadProcessId(hwnd, &processId);
+                if (processId != 0)
+                {
+                    AllowSetForegroundWindow(processId);
+                }
+                if (PostMessageW(hwnd, kWakeExistingMessage, 0, 0))
+                {
+                    return true;
+                }
+            }
+            Sleep(20);
+        }
+        return false;
     }
 }
 
@@ -404,15 +433,34 @@ int RunApp(HINSTANCE instance, int showCommand)
 
 int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
 {
+    SetLastError(ERROR_SUCCESS);
+    HANDLE singleInstance = CreateMutexW(nullptr, FALSE, kSingleInstanceMutexName);
+    if (singleInstance == nullptr)
+    {
+        MessageBoxW(nullptr, L"AGShot could not check whether another instance is running.",
+                    L"AGShot", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        WakeExistingInstance();
+        CloseHandle(singleInstance);
+        return 0;
+    }
+
+    int result = 1;
     // The one place that catches everything escaping startup or the message
     // loop, so no failure can leave a silently dead process behind.
     try
     {
-        return RunApp(instance, showCommand);
+        result = RunApp(instance, showCommand);
     }
     catch (...)
     {
         agshot::ReportCurrentException(__FILEW__, __LINE__);
-        return 1;
     }
+
+    CloseHandle(singleInstance);
+    return result;
 }
