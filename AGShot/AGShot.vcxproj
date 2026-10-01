@@ -72,7 +72,7 @@
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>
       <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>_CONSOLE;WIN32_LEAN_AND_MEAN;WINRT_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_CONSOLE;WIN32_LEAN_AND_MEAN;WINRT_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <AdditionalOptions>%(AdditionalOptions) /permissive- /bigobj</AdditionalOptions>
       <LanguageStandard>stdcpplatest</LanguageStandard>
@@ -81,18 +81,18 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateWindowsMetadata>false</GenerateWindowsMetadata>
-      <AdditionalDependencies>d2d1.lib;d3d11.lib;dcomp.lib;dwrite.lib;dxgi.lib;shell32.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d2d1.lib;d3d11.lib;dcomp.lib;dwrite.lib;dxgi.lib;shell32.lib;comctl32.lib;ole32.lib;gdi32.lib;dwmapi.lib;uiautomationcore.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Platform)'=='Win32'">
     <ClCompile>
-      <PreprocessorDefinitions>WIN32;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
@@ -100,7 +100,7 @@
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -116,12 +116,22 @@
     <ClInclude Include="src\core\hotkey.h" />
     <ClInclude Include="src\core\text.h" />
     <ClInclude Include="src\core\tray_icon.h" />
+    <ClInclude Include="src\core\screen_capture.h" />
+    <ClInclude Include="src\core\ui_element.h" />
+    <ClInclude Include="src\hud\overlay.h" />
+    <ClInclude Include="src\hud\selection.h" />
+    <ClInclude Include="src\hud\toolbar.h" />
     <ClCompile Include="src\core\config.cpp" />
     <ClCompile Include="src\core\config_watcher.cpp" />
     <ClCompile Include="src\core\error.cpp" />
     <ClCompile Include="src\core\hotkey.cpp" />
     <ClCompile Include="src\core\text.cpp" />
     <ClCompile Include="src\core\tray_icon.cpp" />
+    <ClCompile Include="src\core\screen_capture.cpp" />
+    <ClCompile Include="src\core\ui_element.cpp" />
+    <ClCompile Include="src\hud\overlay.cpp" />
+    <ClCompile Include="src\hud\selection.cpp" />
+    <ClCompile Include="src\hud\toolbar.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
