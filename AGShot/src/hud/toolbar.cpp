@@ -13,6 +13,8 @@ namespace agshot
         constexpr int kHandleWidth = 18;
         constexpr int kPadding = 4;
         constexpr int kGap = 2;
+        constexpr int kGroupGap = 6;
+        constexpr int kDividerWidth = 1;
         constexpr int kMargin = 8;
     }
 
@@ -21,10 +23,12 @@ namespace agshot
         const int button = MulDiv(kButtonSize, dpi, 96);
         const int padding = MulDiv(kPadding, dpi, 96);
         const int gap = MulDiv(kGap, dpi, 96);
+        const int groupGap = MulDiv(kGroupGap, dpi, 96);
+        const int dividerWidth = std::max(1, MulDiv(kDividerWidth, dpi, 96));
         const int margin = MulDiv(kMargin, dpi, 96);
 
         const int handle = MulDiv(kHandleWidth, dpi, 96);
-        const int width = handle + button * 2 + gap + padding * 2;
+        const int width = handle + button * 4 + gap + groupGap * 3 + dividerWidth + padding * 2;
         const int height = button + padding * 2;
 
         // RECT holds LONG, which is not int, and the standard algorithms will not
@@ -40,14 +44,13 @@ namespace agshot
 
         const int maxX = std::max(boundsLeft, boundsRight - width);
         const int maxY = std::max(boundsTop, boundsBottom - height);
-        const int centeredX = std::clamp(
-            selectionLeft + ((selectionRight - selectionLeft) - width) / 2, boundsLeft, maxX);
+        const int rightAlignedX = std::clamp(selectionRight - width, boundsLeft, maxX);
         const int centeredY = std::clamp(
             selectionTop + ((selectionBottom - selectionTop) - height) / 2, boundsTop, maxY);
         const RECT candidates[] =
         {
-            { centeredX, selectionBottom + margin, centeredX + width, selectionBottom + margin + height },
-            { centeredX, selectionTop - margin - height, centeredX + width, selectionTop - margin },
+            { rightAlignedX, selectionBottom + margin, rightAlignedX + width, selectionBottom + margin + height },
+            { rightAlignedX, selectionTop - margin - height, rightAlignedX + width, selectionTop - margin },
             { selectionRight + margin, centeredY, selectionRight + margin + width, centeredY + height },
             { selectionLeft - margin - width, centeredY, selectionLeft - margin, centeredY + height },
         };
@@ -76,7 +79,7 @@ namespace agshot
         }
         if (!found)
         {
-            x = centeredX;
+            x = rightAlignedX;
             y = std::clamp(selectionBottom + margin, boundsTop, maxY);
             if (y + height > boundsBottom)
             {
@@ -85,17 +88,35 @@ namespace agshot
         }
 
         toolbar.panel = RECT{ x, y, x + width, y + height };
-        toolbar.handle = RECT{ x + padding, y + padding,
-                               x + padding + handle, y + padding + button };
-        toolbar.copy = RECT{ x + padding + handle, y + padding,
-                             x + padding + handle + button, y + padding + button };
-        toolbar.cancel = RECT{ x + padding + handle + button + gap, y + padding,
-                               x + padding + handle + button * 2 + gap, y + padding + button };
+        const int handleLeft = x + padding;
+        toolbar.handle = RECT{ handleLeft, y + padding,
+                               handleLeft + handle, y + padding + button };
+        const int modesLeft = handleLeft + handle + groupGap;
+        toolbar.editSelection = RECT{ modesLeft, y + padding,
+                                      modesLeft + button, y + padding + button };
+        toolbar.textRecognition = RECT{ modesLeft + button, y + padding,
+                                        modesLeft + button * 2, y + padding + button };
+        const int dividerLeft = modesLeft + button * 2 + groupGap;
+        toolbar.divider = RECT{ dividerLeft, y + padding + MulDiv(7, dpi, 96),
+                                dividerLeft + dividerWidth, y + padding + button - MulDiv(7, dpi, 96) };
+        const int actionsLeft = dividerLeft + dividerWidth + groupGap;
+        toolbar.cancel = RECT{ actionsLeft, y + padding,
+                               actionsLeft + button, y + padding + button };
+        toolbar.copy = RECT{ actionsLeft + button + gap, y + padding,
+                             actionsLeft + button * 2 + gap, y + padding + button };
         return true;
     }
 
     ToolbarButton HitTestToolbar(const Toolbar& toolbar, POINT point) noexcept
     {
+        if (PtInRect(&toolbar.editSelection, point))
+        {
+            return ToolbarButton::EditSelection;
+        }
+        if (PtInRect(&toolbar.textRecognition, point))
+        {
+            return ToolbarButton::TextRecognition;
+        }
         if (PtInRect(&toolbar.copy, point))
         {
             return ToolbarButton::Copy;
@@ -111,6 +132,10 @@ namespace agshot
     {
         switch (HitTestToolbar(toolbar, point))
         {
+        case ToolbarButton::EditSelection:
+            return ToolbarHitTarget::EditSelection;
+        case ToolbarButton::TextRecognition:
+            return ToolbarHitTarget::TextRecognition;
         case ToolbarButton::Copy:
             return ToolbarHitTarget::Copy;
         case ToolbarButton::Cancel:
@@ -152,10 +177,16 @@ namespace agshot
 
         toolbar.panel = start.panel;
         toolbar.handle = start.handle;
+        toolbar.editSelection = start.editSelection;
+        toolbar.textRecognition = start.textRecognition;
+        toolbar.divider = start.divider;
         toolbar.copy = start.copy;
         toolbar.cancel = start.cancel;
         OffsetRect(&toolbar.panel, dx, dy);
         OffsetRect(&toolbar.handle, dx, dy);
+        OffsetRect(&toolbar.editSelection, dx, dy);
+        OffsetRect(&toolbar.textRecognition, dx, dy);
+        OffsetRect(&toolbar.divider, dx, dy);
         OffsetRect(&toolbar.copy, dx, dy);
         OffsetRect(&toolbar.cancel, dx, dy);
     }
@@ -164,6 +195,10 @@ namespace agshot
     {
         switch (button)
         {
+        case ToolbarButton::EditSelection:
+            return L"Edit selection";
+        case ToolbarButton::TextRecognition:
+            return L"Recognize text";
         case ToolbarButton::Copy:
             return L"Copy to clipboard (Ctrl+C)";
         case ToolbarButton::Cancel:

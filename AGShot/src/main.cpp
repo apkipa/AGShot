@@ -6,8 +6,11 @@
 #include "core/tray_icon.h"
 #include "hud/overlay.h"
 
+#include <cstdio>
 #include <memory>
 #include <new>
+
+#include <shellapi.h>
 
 using namespace winrt;
 
@@ -433,6 +436,32 @@ int RunApp(HINSTANCE instance, int showCommand)
 
 int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
 {
+#ifdef AGSHOT_TOOLBAR_PROOF
+    {
+        (void)instance;
+        (void)showCommand;
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        const wchar_t* path = argc > 2 ? argv[2] : L"toolbar.bmp";
+        const int dpi = argc > 1 ? _wtoi(argv[1]) : 144;
+        const bool text = argc > 3 && _wtoi(argv[3]) != 0;
+        const float probe = argc > 4 ? static_cast<float>(_wtof(argv[4])) : 0.0f;
+        try
+        {
+            agshot::Overlay overlay;
+            const bool ok = overlay.ExportToolbarProof(path, dpi, text, probe);
+            LocalFree(argv);
+            return ok ? 0 : 1;
+        }
+        catch (const agshot::Error& error)
+        {
+            std::wprintf(L"FAIL %ls | %ls\n", error.failure().what.c_str(),
+                         error.failure().detail.c_str());
+            LocalFree(argv);
+            return 1;
+        }
+    }
+#else
     SetLastError(ERROR_SUCCESS);
     HANDLE singleInstance = CreateMutexW(nullptr, FALSE, kSingleInstanceMutexName);
     if (singleInstance == nullptr)
@@ -463,4 +492,5 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
 
     CloseHandle(singleInstance);
     return result;
+#endif
 }

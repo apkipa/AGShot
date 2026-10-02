@@ -3,6 +3,7 @@
 #include "hud/overlay.h"
 
 #include "core/error.h"
+#include "hud/toolbar_icon.h"
 #include "core/screen_capture.h"
 
 #include <d3d11.h>
@@ -10,8 +11,10 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <thread>
 
@@ -38,12 +41,34 @@ namespace agshot
         constexpr int kTooltipPadding = 8;
         constexpr int kTooltipGap = 6;
         constexpr int kIconInset = 7;
-        constexpr int kIconStroke = 2;
         constexpr int kButtonRadius = 4;
+
+        // One stroke weight for every icon in the toolbar, so the row reads as a
+        // single set. It is a ceiling as much as a choice: the text-recognition
+        // mark's three bars are only 5.38 reference units apart, and a heavier
+        // stroke closes that gap until the bars merge into one block.
+        constexpr float kIconStroke = 1.8f;
+
+        // The size every mark is matched to, measured across the ink rather than
+        // across the geometry. The marks are different shapes (a square, brackets
+        // and bars, an X, two overlapping squares), so matching their centre lines
+        // leaves them looking different sizes; each is laid out so that the
+        // painted extent comes out this wide.
+        constexpr float kIconInk = 16.0f;
+
+        // The text-recognition scrollbar. At 3 DIP its track was barely three
+        // pixels wide at 1x and read as a hairline rather than something you
+        // could grab, so it is laid out as a pill of this width instead.
+        constexpr int kOcrScrollWidth = 6;
+        constexpr int kOcrScrollInset = 5;
+        // Room the text leaves free on the right so it cannot run under the bar.
+        constexpr int kOcrScrollGutter = 10;
 
         // A drag that never reaches this size is a click that wobbled, not a
         // selection, and goes back to following the pointer.
         constexpr int kMinimumDrag = 3;
+        constexpr UINT_PTR kOcrSelectionTimer = 0xA651;
+        constexpr UINT kOcrSelectionTimerMs = 30;
 
         // UIA is a cross-process call. The pointer moves far more often than a
         // suggestion can usefully change, so the call is throttled.
@@ -272,6 +297,7 @@ namespace agshot
     {
         StopSelectionAnimation();
         StopAnimationClock();
+        StopOcrSelection();
         if (m_window != nullptr)
         {
             DestroyWindow(m_window);
@@ -288,12 +314,17 @@ namespace agshot
         m_composition = nullptr;
         m_magnifierLayer = nullptr;
         m_copyIconGeometry = nullptr;
+        m_copyLocalStroke = 0.0f;
         m_roundStroke = nullptr;
+        m_flatStroke = nullptr;
         m_textFormat = nullptr;
         m_magnifierTextFormat = nullptr;
         m_dwriteFactory = nullptr;
         m_icon = nullptr;
+        m_cancel = nullptr;
         m_tooltip = nullptr;
+        m_textScrollThumb = nullptr;
+        m_textScrollTrack = nullptr;
         m_hover = nullptr;
         m_panelEdge = nullptr;
         m_panel = nullptr;
@@ -342,10 +373,18 @@ namespace agshot
             D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
             D2D1_LINE_JOIN_ROUND, 1.0f, D2D1_DASH_STYLE_SOLID, 0.0f);
         AGSHOT_CHECK_HR(m_d2dFactory->CreateStrokeStyle(properties, nullptr, 0, m_roundStroke.put()));
-        CreateCopyIconGeometry();
+
+        // The text-recognition mark is traced from a reference image. Its bars
+        // stop square - a round cap would add half a stroke to every end - while
+        // its bracket corners are rounded, so it needs its own style.
+        const D2D1_STROKE_STYLE_PROPERTIES tracedProperties = D2D1::StrokeStyleProperties(
+            D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
+            D2D1_LINE_JOIN_ROUND, 1.0f, D2D1_DASH_STYLE_SOLID, 0.0f);
+        AGSHOT_CHECK_HR(m_d2dFactory->CreateStrokeStyle(
+            tracedProperties, nullptr, 0, m_flatStroke.put()));
     }
 
-    void Overlay::CreateCopyIconGeometry()
+    void Overlay::CreateCopyIconGeometry(float localStroke)
     {
         constexpr float size = 18.0f;
         constexpr float radius = 2.0f;
@@ -355,58 +394,92 @@ namespace agshot
         constexpr float frontLeft = size * 0.30f;
         constexpr float frontTop = size * 0.28f;
 
-        AGSHOT_CHECK_HR(m_d2dFactory->CreatePathGeometry(m_copyIconGeometry.put()));
-        winrt::com_ptr<ID2D1GeometrySink> sink;
-        AGSHOT_CHECK_HR(m_copyIconGeometry->Open(sink.put()));
-
-        sink->BeginFigure(D2D1::Point2F(radius, 0.0f), D2D1_FIGURE_BEGIN_HOLLOW);
-        sink->AddLine(D2D1::Point2F(backRight - radius, 0.0f));
-        sink->AddBezier(D2D1::BezierSegment(
+        // The back square, as a single open path whose ends stop on the front
+        // square's centre line, where the merge below hides them.
+        winrt::com_ptr<ID2D1PathGeometry> back;
+        AGSHOT_CHECK_HR(m_d2dFactory->CreatePathGeometry(back.put()));
+        winrt::com_ptr<ID2D1GeometrySink> backSink;
+        AGSHOT_CHECK_HR(back->Open(backSink.put()));
+        backSink->SetFillMode(D2D1_FILL_MODE_WINDING);
+        backSink->BeginFigure(D2D1::Point2F(frontLeft, backBottom), D2D1_FIGURE_BEGIN_HOLLOW);
+        backSink->AddLine(D2D1::Point2F(radius, backBottom));
+        backSink->AddBezier(D2D1::BezierSegment(
+            D2D1::Point2F(radius - curve, backBottom),
+            D2D1::Point2F(0.0f, backBottom - radius + curve),
+            D2D1::Point2F(0.0f, backBottom - radius)));
+        backSink->AddLine(D2D1::Point2F(0.0f, radius));
+        backSink->AddBezier(D2D1::BezierSegment(
+            D2D1::Point2F(0.0f, radius - curve),
+            D2D1::Point2F(radius - curve, 0.0f),
+            D2D1::Point2F(radius, 0.0f)));
+        backSink->AddLine(D2D1::Point2F(backRight - radius, 0.0f));
+        backSink->AddBezier(D2D1::BezierSegment(
             D2D1::Point2F(backRight - radius + curve, 0.0f),
             D2D1::Point2F(backRight, radius - curve),
             D2D1::Point2F(backRight, radius)));
-        sink->AddLine(D2D1::Point2F(backRight, frontTop));
-        sink->EndFigure(D2D1_FIGURE_END_OPEN);
+        backSink->AddLine(D2D1::Point2F(backRight, frontTop));
+        backSink->EndFigure(D2D1_FIGURE_END_OPEN);
+        AGSHOT_CHECK_HR(backSink->Close());
 
-        sink->BeginFigure(D2D1::Point2F(radius, 0.0f), D2D1_FIGURE_BEGIN_HOLLOW);
-        sink->AddBezier(D2D1::BezierSegment(
-            D2D1::Point2F(radius - curve, 0.0f),
-            D2D1::Point2F(0.0f, radius - curve),
-            D2D1::Point2F(0.0f, radius)));
-        sink->EndFigure(D2D1_FIGURE_END_OPEN);
-
-        sink->BeginFigure(D2D1::Point2F(0.0f, radius), D2D1_FIGURE_BEGIN_HOLLOW);
-        sink->AddLine(D2D1::Point2F(0.0f, backBottom - radius));
-        sink->AddBezier(D2D1::BezierSegment(
-            D2D1::Point2F(0.0f, backBottom - radius + curve),
-            D2D1::Point2F(radius - curve, backBottom),
-            D2D1::Point2F(radius, backBottom)));
-        sink->AddLine(D2D1::Point2F(frontLeft, backBottom));
-        sink->EndFigure(D2D1_FIGURE_END_OPEN);
-
-        sink->BeginFigure(D2D1::Point2F(frontLeft + radius, frontTop), D2D1_FIGURE_BEGIN_HOLLOW);
-        sink->AddLine(D2D1::Point2F(size - radius, frontTop));
-        sink->AddBezier(D2D1::BezierSegment(
+        // The front square, closed.
+        winrt::com_ptr<ID2D1PathGeometry> front;
+        AGSHOT_CHECK_HR(m_d2dFactory->CreatePathGeometry(front.put()));
+        winrt::com_ptr<ID2D1GeometrySink> frontSink;
+        AGSHOT_CHECK_HR(front->Open(frontSink.put()));
+        frontSink->SetFillMode(D2D1_FILL_MODE_WINDING);
+        frontSink->BeginFigure(D2D1::Point2F(frontLeft + radius, frontTop), D2D1_FIGURE_BEGIN_HOLLOW);
+        frontSink->AddLine(D2D1::Point2F(size - radius, frontTop));
+        frontSink->AddBezier(D2D1::BezierSegment(
             D2D1::Point2F(size - radius + curve, frontTop),
             D2D1::Point2F(size, frontTop + radius - curve),
             D2D1::Point2F(size, frontTop + radius)));
-        sink->AddLine(D2D1::Point2F(size, size - radius));
-        sink->AddBezier(D2D1::BezierSegment(
+        frontSink->AddLine(D2D1::Point2F(size, size - radius));
+        frontSink->AddBezier(D2D1::BezierSegment(
             D2D1::Point2F(size, size - radius + curve),
             D2D1::Point2F(size - radius + curve, size),
             D2D1::Point2F(size - radius, size)));
-        sink->AddLine(D2D1::Point2F(frontLeft + radius, size));
-        sink->AddBezier(D2D1::BezierSegment(
+        frontSink->AddLine(D2D1::Point2F(frontLeft + radius, size));
+        frontSink->AddBezier(D2D1::BezierSegment(
             D2D1::Point2F(frontLeft + radius - curve, size),
             D2D1::Point2F(frontLeft, size - radius + curve),
             D2D1::Point2F(frontLeft, size - radius)));
-        sink->AddLine(D2D1::Point2F(frontLeft, frontTop + radius));
-        sink->AddBezier(D2D1::BezierSegment(
+        frontSink->AddLine(D2D1::Point2F(frontLeft, frontTop + radius));
+        frontSink->AddBezier(D2D1::BezierSegment(
             D2D1::Point2F(frontLeft, frontTop + radius - curve),
             D2D1::Point2F(frontLeft + radius - curve, frontTop),
             D2D1::Point2F(frontLeft + radius, frontTop)));
-        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        frontSink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        AGSHOT_CHECK_HR(frontSink->Close());
+
+        // Turn both outlines into the area their stroke would cover, then merge
+        // the two areas into one geometry. Stroking the outlines separately
+        // paints the junction twice, and the second pass composites over the
+        // first one's antialiased edge, which leaves a pale seam there. A single
+        // merged area is filled in one pass, so the junction stays solid.
+        const auto widen = [&](ID2D1Geometry* source, winrt::com_ptr<ID2D1PathGeometry>& out)
+        {
+            AGSHOT_CHECK_HR(m_d2dFactory->CreatePathGeometry(out.put()));
+            winrt::com_ptr<ID2D1GeometrySink> sink;
+            AGSHOT_CHECK_HR(out->Open(sink.put()));
+            sink->SetFillMode(D2D1_FILL_MODE_WINDING);
+            AGSHOT_CHECK_HR(source->Widen(localStroke, m_roundStroke.get(), nullptr, sink.get()));
+            AGSHOT_CHECK_HR(sink->Close());
+        };
+
+        winrt::com_ptr<ID2D1PathGeometry> backArea;
+        winrt::com_ptr<ID2D1PathGeometry> frontArea;
+        widen(back.get(), backArea);
+        widen(front.get(), frontArea);
+
+        AGSHOT_CHECK_HR(m_d2dFactory->CreatePathGeometry(m_copyIconGeometry.put()));
+        winrt::com_ptr<ID2D1GeometrySink> sink;
+        AGSHOT_CHECK_HR(m_copyIconGeometry->Open(sink.put()));
+        sink->SetFillMode(D2D1_FILL_MODE_WINDING);
+        AGSHOT_CHECK_HR(backArea->CombineWithGeometry(
+            frontArea.get(), D2D1_COMBINE_MODE_UNION, nullptr, sink.get()));
         AGSHOT_CHECK_HR(sink->Close());
+
+        m_copyLocalStroke = localStroke;
     }
 
     void Overlay::CreateDeviceResources()
@@ -466,7 +539,10 @@ namespace agshot
         brush(1.0f, 1.0f, 1.0f, 0.14f, m_panelEdge);
         brush(1.0f, 1.0f, 1.0f, 0.13f, m_hover);
         brush(0.96f, 0.97f, 0.99f, 1.0f, m_icon);
+        brush(0.94f, 0.35f, 0.35f, 1.0f, m_cancel);    // the one destructive mark
         brush(0.06f, 0.06f, 0.08f, 0.97f, m_tooltip);
+        brush(0.90f, 0.91f, 0.93f, 1.0f, m_textScrollTrack);
+        brush(0.48f, 0.51f, 0.56f, 1.0f, m_textScrollThumb);
     }
 
     void Overlay::CreateSizeDependentResources()
@@ -474,6 +550,15 @@ namespace agshot
         if (m_width == 0 || m_height == 0)
         {
             return;
+        }
+
+        // The copy mark's hidden ends are pulled back by half a stroke, so its
+        // geometry has to be rebuilt whenever the DPI changes the stroke.
+        const float localStroke =
+            Scaled(kIconStroke) * 18.0f / (std::max(1.0f, Scaled(kIconInk)) - Scaled(kIconStroke));
+        if (m_copyLocalStroke != localStroke)
+        {
+            CreateCopyIconGeometry(localStroke);
         }
 
         if (!m_surface)
@@ -586,6 +671,14 @@ namespace agshot
         m_animationStart = 0;
         m_hasSelection = false;
         m_smart = true;
+        m_mode = OperationMode::EditSelection;
+        m_ocrText.clear();
+        m_ocrCacheValid = false;
+        m_ocrCaret = 0;
+        m_ocrAnchor = 0;
+        m_ocrSelecting = false;
+        m_ocrScrollDragging = false;
+        m_ocrScrollY = 0.0f;
         m_depth = 0;
         m_dragMode = DragMode::None;
         m_dragPart = SelectionPart::None;
@@ -623,6 +716,7 @@ namespace agshot
 
         StopSelectionAnimation();
         StopAnimationClock();
+        StopOcrSelection();
         ShowWindow(m_window, SW_HIDE);
 
         m_hasSelection = false;
@@ -833,6 +927,32 @@ namespace agshot
         }
     }
 
+    Overlay::HitTarget Overlay::HitTest(POINT point) const noexcept
+    {
+        if (m_toolbarVisible)
+        {
+            const ToolbarHitTarget target = HitTestToolbarTarget(m_toolbar, point);
+            if (target == ToolbarHitTarget::Handle) return HitTarget::ToolbarHandle;
+            if (target == ToolbarHitTarget::Panel) return HitTarget::ToolbarPanel;
+            if (target != ToolbarHitTarget::None) return HitTarget::ToolbarButton;
+        }
+
+        if (!m_hasSelection || !PtInRect(&m_selection, point))
+        {
+            return HitTarget::Canvas;
+        }
+        if (m_mode == OperationMode::TextRecognition)
+        {
+            const RECT track = OcrScrollTrack();
+            return PtInRect(&track, point) ? HitTarget::OcrScrollbar : HitTarget::OcrText;
+        }
+        if (!m_smart && HitTestSelection(m_selection, point, m_handleSize) != SelectionPart::None)
+        {
+            return HitTarget::SelectionHandle;
+        }
+        return HitTarget::Selection;
+    }
+
     void Overlay::UpdateHover(POINT point)
     {
         const ToolbarButton button = m_toolbarVisible
@@ -853,6 +973,77 @@ namespace agshot
             : ToolbarButton::None;
     }
 
+    void Overlay::ShowOcrContextMenu(POINT point)
+    {
+        const HitTarget target = HitTest(point);
+        if (target == HitTarget::ToolbarPanel || target == HitTarget::ToolbarHandle
+            || target == HitTarget::ToolbarButton || target == HitTarget::OcrScrollbar)
+        {
+            return;
+        }
+        if (target != HitTarget::OcrText)
+        {
+            Cancel();
+            return;
+        }
+
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) return;
+        AppendMenuW(menu, MF_STRING, 1, L"Copy");
+        AppendMenuW(menu, MF_STRING, 2, L"Select all");
+        SetForegroundWindow(m_window);
+        POINT screen = point;
+        ClientToScreen(m_window, &screen);
+        const int command = TrackPopupMenu(
+            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+            screen.x, screen.y, 0, m_window, nullptr);
+        PostMessageW(m_window, WM_NULL, 0, 0);
+        DestroyMenu(menu);
+        if (command == 1)
+        {
+            CopyOcrText(false);
+        }
+        else if (command == 2)
+        {
+            m_ocrAnchor = 0;
+            m_ocrCaret = m_ocrText.size();
+            EnsureOcrCaretVisible();
+            RequestRender();
+        }
+    }
+
+    void Overlay::UpdateOcrSelection(POINT point)
+    {
+        m_ocrSelectionPoint = point;
+        const RECT box = OcrTextBox();
+        const LONG inset = static_cast<LONG>(Scaled(9));
+        const LONG top = box.top + inset;
+        const LONG bottom = box.bottom - inset;
+        const LONG left = box.left + inset;
+        const LONG right = box.right - inset - static_cast<LONG>(Scaled(kOcrScrollGutter));
+        const LONG clampedY = std::clamp(point.y, top, std::max(top, bottom - 1));
+        const LONG clampedX = std::clamp(point.x, left, std::max(left, right));
+
+        if (point.y < top || point.y >= bottom)
+        {
+            const float distance = static_cast<float>(point.y < top ? top - point.y : point.y - bottom + 1);
+            const float step = std::max(Scaled(1), distance * 0.22f);
+            m_ocrScrollY = std::clamp(
+                m_ocrScrollY + (point.y < top ? -step : step), 0.0f, OcrScrollMaximum());
+        }
+        m_ocrCaret = OcrPositionFromPoint(POINT{ clampedX, clampedY });
+        RequestRender();
+    }
+
+    void Overlay::StopOcrSelection() noexcept
+    {
+        m_ocrSelecting = false;
+        if (m_window != nullptr)
+        {
+            KillTimer(m_window, kOcrSelectionTimer);
+        }
+    }
+
     void Overlay::OnMouseMove(POINT point)
     {
         m_pointer = point;
@@ -867,6 +1058,28 @@ namespace agshot
             {
                 m_trackingLeave = true;
             }
+        }
+
+        if (m_ocrScrollDragging)
+        {
+            const RECT track = OcrScrollTrack();
+            const RECT thumb = OcrScrollThumb();
+            const float travel = static_cast<float>(track.bottom - track.top)
+                - static_cast<float>(thumb.bottom - thumb.top);
+            if (travel > 0.0f)
+            {
+                const float maximum = OcrScrollMaximum();
+                const float pointerDelta = static_cast<float>(point.y - m_ocrScrollDragOrigin.y);
+                m_ocrScrollY = std::clamp(
+                    m_ocrScrollDragStart + pointerDelta * maximum / travel, 0.0f, maximum);
+            }
+            RequestRender();
+            return;
+        }
+        if (m_ocrSelecting)
+        {
+            UpdateOcrSelection(point);
+            return;
         }
 
         switch (m_dragMode)
@@ -927,11 +1140,19 @@ namespace agshot
     void Overlay::OnLeftButtonDown(POINT point)
     {
         SetCapture(m_window);
+        const HitTarget hit = HitTest(point);
 
-        if (m_toolbarVisible)
+        if (hit == HitTarget::ToolbarButton || hit == HitTarget::ToolbarHandle
+            || hit == HitTarget::ToolbarPanel)
         {
             switch (HitTestToolbarTarget(m_toolbar, point))
             {
+            case ToolbarHitTarget::EditSelection:
+                m_pressedButton = ToolbarButton::EditSelection;
+                return;
+            case ToolbarHitTarget::TextRecognition:
+                m_pressedButton = ToolbarButton::TextRecognition;
+                return;
             case ToolbarHitTarget::Copy:
                 m_pressedButton = ToolbarButton::Copy;
                 return;
@@ -949,6 +1170,45 @@ namespace agshot
             case ToolbarHitTarget::None:
                 break;
             }
+        }
+
+        if (m_mode == OperationMode::TextRecognition)
+        {
+            if (hit == HitTarget::OcrText || hit == HitTarget::OcrScrollbar)
+            {
+                SetFocus(m_window);
+                const float scrollMaximum = OcrScrollMaximum();
+                const RECT scrollTrack = OcrScrollTrack();
+                if (scrollMaximum > 0.0f && PtInRect(&scrollTrack, point))
+                {
+                    const RECT scrollThumb = OcrScrollThumb();
+                    if (PtInRect(&scrollThumb, point))
+                    {
+                        m_ocrScrollDragging = true;
+                        m_ocrScrollDragOrigin = point;
+                        m_ocrScrollDragStart = m_ocrScrollY;
+                    }
+                    else
+                    {
+                        const RECT box = OcrTextBox();
+                        const float page = std::max(1.0f,
+                            static_cast<float>(box.bottom - box.top) - Scaled(27));
+                        m_ocrScrollY = std::clamp(
+                            m_ocrScrollY + (point.y < scrollThumb.top ? -page : page),
+                            0.0f, scrollMaximum);
+                        RequestRender();
+                    }
+                    return;
+                }
+                m_ocrCaret = OcrPositionFromPoint(point);
+                m_ocrAnchor = m_ocrCaret;
+                EnsureOcrCaretVisible();
+                m_ocrSelecting = true;
+                m_ocrSelectionPoint = point;
+                SetTimer(m_window, kOcrSelectionTimer, kOcrSelectionTimerMs, nullptr);
+                RequestRender();
+            }
+            return;
         }
 
         // From here on the pointer is the user's, not the suggestion's. Leaving
@@ -1000,6 +1260,20 @@ namespace agshot
         if (GetCapture() == m_window)
         {
             ReleaseCapture();
+        }
+
+        if (m_ocrScrollDragging)
+        {
+            m_ocrScrollDragging = false;
+            RequestRender();
+            return;
+        }
+        if (m_ocrSelecting)
+        {
+            UpdateOcrSelection(point);
+            StopOcrSelection();
+            RequestRender();
+            return;
         }
 
         if (m_pressedButton != ToolbarButton::None)
@@ -1072,6 +1346,26 @@ namespace agshot
             return;
         }
 
+        if (m_mode == OperationMode::TextRecognition)
+        {
+            const HitTarget hit = HitTest(point);
+            if (hit == HitTarget::OcrText || hit == HitTarget::OcrScrollbar)
+            {
+                UINT lines = 3;
+                SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+                const RECT box = OcrTextBox();
+                const float page = std::max(1.0f, static_cast<float>(box.bottom - box.top)
+                    - Scaled(18));
+                const float lineHeight = Scaled(static_cast<float>(kTextSize + 3));
+                const float amount = lines == WHEEL_PAGESCROLL
+                    ? page * static_cast<float>(delta) / WHEEL_DELTA
+                    : lineHeight * static_cast<float>(lines) * static_cast<float>(delta) / WHEEL_DELTA;
+                m_ocrScrollY = std::clamp(m_ocrScrollY - amount, 0.0f, OcrScrollMaximum());
+                RequestRender();
+            }
+            return;
+        }
+
         if (!m_smart)
         {
             if (!m_hasSelection || m_dragMode != DragMode::None
@@ -1138,9 +1432,27 @@ namespace agshot
             Cancel();
             return;
         }
-
+        if (button == ToolbarButton::EditSelection)
+        {
+            m_mode = OperationMode::EditSelection;
+            m_ocrSelecting = false;
+            m_ocrScrollDragging = false;
+            SetFocus(m_window);
+            RequestRender();
+            return;
+        }
+        if (button == ToolbarButton::TextRecognition)
+        {
+            EnterTextRecognitionMode();
+            return;
+        }
         if (button != ToolbarButton::Copy)
         {
+            return;
+        }
+        if (m_mode == OperationMode::TextRecognition)
+        {
+            CopyOcrText(true);
             return;
         }
 
@@ -1166,6 +1478,264 @@ namespace agshot
         Cancel();
     }
 
+    void Overlay::EnterTextRecognitionMode()
+    {
+        if (!m_hasSelection)
+        {
+            return;
+        }
+
+        if (!m_ocrCacheValid || !EqualRect(&m_ocrCacheSelection, &m_selection))
+        {
+            m_ocrText = L"AGShot text recognition preview\r\n\r\nThis is mock OCR content for the selected area. Select part of this text with the mouse or keyboard, then copy it.\r\n\r\nThe recognized text stays cached while the selection remains unchanged.";
+            m_ocrCacheSelection = m_selection;
+            m_ocrCacheValid = true;
+            m_ocrCaret = 0;
+            m_ocrAnchor = 0;
+            m_ocrScrollY = 0.0f;
+        }
+
+        m_mode = OperationMode::TextRecognition;
+        m_smart = false;
+        m_ocrSelecting = false;
+        m_ocrScrollDragging = false;
+        SetFocus(m_window);
+        RequestRender();
+    }
+
+    void Overlay::CopyOcrText(bool closeAfterCopy)
+    {
+        const std::size_t first = std::min(m_ocrAnchor, m_ocrCaret);
+        const std::size_t last = std::max(m_ocrAnchor, m_ocrCaret);
+        const std::wstring text = first == last
+            ? m_ocrText
+            : m_ocrText.substr(first, last - first);
+
+        if (!text.empty() && OpenClipboard(m_window))
+        {
+            if (EmptyClipboard())
+            {
+                const SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
+                HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+                if (memory != nullptr)
+                {
+                    void* destination = GlobalLock(memory);
+                    if (destination != nullptr)
+                    {
+                        std::memcpy(destination, text.c_str(), bytes);
+                        GlobalUnlock(memory);
+                        if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr)
+                        {
+                            GlobalFree(memory);
+                        }
+                    }
+                    else
+                    {
+                        GlobalFree(memory);
+                    }
+                }
+            }
+            CloseClipboard();
+        }
+
+        if (closeAfterCopy)
+        {
+            Cancel();
+        }
+    }
+
+    // TODO(editbox): the text-recognition box is a hand-rolled edit control.
+    // Layout, hit testing, caret placement, selection painting, scrolling and
+    // keyboard navigation are all maintained in this file. Evaluate building it
+    // on ITextServices (the RichEdit text services object) instead, which would
+    // supply the editing surface, caret, selection, scrolling, IME and
+    // accessibility, and would own its own mouse and keyboard input rather than
+    // routing everything through this window's message handlers.
+    RECT Overlay::OcrTextBox() const noexcept
+    {
+        return m_selection;
+    }
+
+    RECT Overlay::OcrScrollTrack() const noexcept
+    {
+        const RECT box = OcrTextBox();
+        const LONG width = box.right - box.left;
+        const LONG height = box.bottom - box.top;
+        const LONG verticalInset = std::min<LONG>(MulDiv(9, m_dpi, 96),
+            std::max<LONG>(0, (height - 1) / 2));
+        const LONG right = box.right - std::min<LONG>(MulDiv(kOcrScrollInset, m_dpi, 96),
+            std::max<LONG>(0, width - 1));
+        const LONG left = std::max(box.left, right - MulDiv(kOcrScrollWidth, m_dpi, 96));
+        return RECT{ left, box.top + verticalInset, right, box.bottom - verticalInset };
+    }
+
+    RECT Overlay::OcrScrollThumb() const
+    {
+        const float maximum = OcrScrollMaximum();
+        if (maximum <= 0.0f)
+        {
+            return RECT{};
+        }
+
+        const RECT track = OcrScrollTrack();
+        const float trackHeight = static_cast<float>(track.bottom - track.top);
+        const float viewportHeight = std::max(1.0f, trackHeight);
+        const float contentHeight = viewportHeight + maximum;
+        const float thumbHeight = std::min(trackHeight, std::max(Scaled(18),
+            trackHeight * viewportHeight / contentHeight));
+        const float thumbTop = track.top + (trackHeight - thumbHeight)
+            * m_ocrScrollY / maximum;
+        return RECT{ track.left, static_cast<LONG>(thumbTop), track.right,
+                     static_cast<LONG>(thumbTop + thumbHeight) };
+    }
+
+    winrt::com_ptr<IDWriteTextLayout> Overlay::CreateOcrTextLayout() const
+    {
+        const RECT box = OcrTextBox();
+        const float padding = Scaled(9);
+        const float width = std::max(1.0f, static_cast<float>(box.right - box.left)
+            - padding * 2.0f - Scaled(kOcrScrollGutter));
+        winrt::com_ptr<IDWriteTextLayout> layout;
+        AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextLayout(
+            m_ocrText.c_str(), static_cast<UINT32>(m_ocrText.size()),
+            m_textFormat.get(), width, 100000.0f, layout.put()));
+        AGSHOT_CHECK_HR(layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP));
+        return layout;
+    }
+
+    std::size_t Overlay::OcrPositionFromPoint(POINT point) const
+    {
+        if (m_ocrText.empty())
+        {
+            return 0;
+        }
+
+        const RECT box = OcrTextBox();
+        const float padding = Scaled(9);
+        const LONG textLeft = box.left + static_cast<LONG>(padding);
+        const LONG textRight = box.right - static_cast<LONG>(padding + Scaled(kOcrScrollGutter));
+        const LONG textTop = box.top + static_cast<LONG>(padding);
+        const LONG textBottom = box.bottom - static_cast<LONG>(padding);
+        const float x = std::max(0.0f, static_cast<float>(
+            std::clamp(point.x, textLeft, std::max(textLeft, textRight)) - box.left) - padding);
+        const float y = std::max(0.0f, static_cast<float>(
+            std::clamp(point.y, textTop, std::max(textTop, textBottom - 1)) - box.top)
+            - padding + m_ocrScrollY);
+        auto layout = CreateOcrTextLayout();
+        BOOL trailing = FALSE;
+        BOOL inside = FALSE;
+        DWRITE_HIT_TEST_METRICS metrics{};
+        if (SUCCEEDED(layout->HitTestPoint(x, y, &trailing, &inside, &metrics)))
+        {
+            const std::size_t position = metrics.textPosition + (trailing ? metrics.length : 0);
+            return std::min(position, m_ocrText.size());
+        }
+        return m_ocrText.size();
+    }
+
+    float Overlay::OcrScrollMaximum() const
+    {
+        if (m_ocrText.empty())
+        {
+            return 0.0f;
+        }
+        auto layout = CreateOcrTextLayout();
+        DWRITE_TEXT_METRICS metrics{};
+        AGSHOT_CHECK_HR(layout->GetMetrics(&metrics));
+        const RECT box = OcrTextBox();
+        const float viewportHeight = std::max(1.0f,
+            static_cast<float>(box.bottom - box.top) - Scaled(18));
+        return std::max(0.0f, metrics.height - viewportHeight);
+    }
+
+    void Overlay::EnsureOcrCaretVisible()
+    {
+        auto layout = CreateOcrTextLayout();
+        FLOAT x = 0.0f;
+        FLOAT y = 0.0f;
+        DWRITE_HIT_TEST_METRICS caret{};
+        if (FAILED(layout->HitTestTextPosition(static_cast<UINT32>(m_ocrCaret), FALSE,
+                                                &x, &y, &caret)))
+        {
+            return;
+        }
+
+        const RECT box = OcrTextBox();
+        const float viewportHeight = std::max(1.0f,
+            static_cast<float>(box.bottom - box.top) - Scaled(18));
+        if (y < m_ocrScrollY)
+        {
+            m_ocrScrollY = y;
+        }
+        else if (y + caret.height > m_ocrScrollY + viewportHeight)
+        {
+            m_ocrScrollY = y + caret.height - viewportHeight;
+        }
+        m_ocrScrollY = std::clamp(m_ocrScrollY, 0.0f, OcrScrollMaximum());
+    }
+
+    void Overlay::MoveOcrCaret(WPARAM key)
+    {
+        const std::size_t length = m_ocrText.size();
+        const bool extend = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        std::size_t next = m_ocrCaret;
+        if (key == VK_LEFT || key == VK_RIGHT)
+        {
+            if (!extend && m_ocrAnchor != m_ocrCaret)
+            {
+                next = key == VK_LEFT ? std::min(m_ocrAnchor, m_ocrCaret)
+                                      : std::max(m_ocrAnchor, m_ocrCaret);
+            }
+            else if (key == VK_LEFT && next > 0)
+            {
+                --next;
+            }
+            else if (key == VK_RIGHT && next < length)
+            {
+                ++next;
+            }
+        }
+        else if (key == VK_HOME || key == VK_END)
+        {
+            const std::size_t lineStart = m_ocrText.rfind(L'\n', next == 0 ? 0 : next - 1);
+            const std::size_t lineEnd = m_ocrText.find(L'\n', next);
+            next = key == VK_HOME
+                ? (lineStart == std::wstring::npos ? 0 : lineStart + 1)
+                : (lineEnd == std::wstring::npos ? length : lineEnd);
+        }
+        else if (key == VK_UP || key == VK_DOWN)
+        {
+            auto layout = CreateOcrTextLayout();
+            FLOAT x = 0.0f;
+            FLOAT y = 0.0f;
+            DWRITE_HIT_TEST_METRICS caret{};
+            if (SUCCEEDED(layout->HitTestTextPosition(static_cast<UINT32>(m_ocrCaret), FALSE,
+                                                       &x, &y, &caret)))
+            {
+                const float targetY = y + (key == VK_UP ? -caret.height : caret.height);
+                if (targetY >= 0.0f)
+                {
+                    BOOL trailing = FALSE;
+                    BOOL inside = FALSE;
+                    DWRITE_HIT_TEST_METRICS target{};
+                    if (SUCCEEDED(layout->HitTestPoint(x, targetY, &trailing, &inside, &target)))
+                    {
+                        next = std::min<std::size_t>(
+                            target.textPosition + (trailing ? target.length : 0), length);
+                    }
+                }
+            }
+        }
+
+        m_ocrCaret = next;
+        if (!extend)
+        {
+            m_ocrAnchor = next;
+        }
+        EnsureOcrCaretVisible();
+        RequestRender();
+    }
+
     void Overlay::ClearSurface()
     {
         if (!m_surface || m_width == 0 || m_height == 0)
@@ -1176,6 +1746,7 @@ namespace agshot
         AGSHOT_CHECK_HR(m_surface->Trim(nullptr, 0));
         AGSHOT_CHECK_HR(m_composition->Commit());
     }
+
 
     void Overlay::Render()
     {
@@ -1230,7 +1801,14 @@ namespace agshot
         DrawDim();
         if (m_hasSelection)
         {
-            DrawSelection();
+            if (m_mode == OperationMode::TextRecognition)
+            {
+                DrawTextRecognition();
+            }
+            else
+            {
+                DrawSelection();
+            }
         }
         if (m_toolbarVisible)
         {
@@ -1239,7 +1817,7 @@ namespace agshot
         }
         const bool pointerOverToolbar = m_toolbarVisible
             && HitTestToolbarTarget(m_toolbar, m_pointer) != ToolbarHitTarget::None;
-        if (!pointerOverToolbar
+        if (m_mode == OperationMode::EditSelection && !pointerOverToolbar
             && (!m_toolbarVisible || (m_hasSelection && PtInRect(&m_selection, m_pointer))))
         {
             DrawPixelMagnifier();
@@ -1305,6 +1883,76 @@ namespace agshot
         }
 
         DrawSizeLabel();
+    }
+
+    void Overlay::DrawTextRecognition()
+    {
+        const RECT box = OcrTextBox();
+        m_d2dContext->FillRectangle(ToRectF(box), m_handleFill.get());
+        m_d2dContext->DrawRectangle(ToRectF(box), m_handleEdge.get(), Scaled(1));
+
+        const float padding = Scaled(9);
+        // The render target works a DIP per pixel, so a fractional scroll offset
+        // would land the text on half pixels and make it shimmer as it moves.
+        // Snapping the origin to whole pixels keeps every glyph on the grid; the
+        // scroll position itself stays fractional so the motion is still smooth.
+        const D2D1_POINT_2F origin{
+            std::round(box.left + padding),
+            std::round(box.top + padding - m_ocrScrollY) };
+        const D2D1_RECT_F clip = D2D1::RectF(
+            static_cast<float>(box.left), static_cast<float>(box.top),
+            static_cast<float>(box.right), static_cast<float>(box.bottom));
+        m_d2dContext->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        auto layout = CreateOcrTextLayout();
+
+        const std::size_t first = std::min(m_ocrAnchor, m_ocrCaret);
+        const std::size_t last = std::max(m_ocrAnchor, m_ocrCaret);
+        if (last > first)
+        {
+            std::vector<DWRITE_HIT_TEST_METRICS> metrics(m_ocrText.size() + 1);
+            UINT32 count = 0;
+            if (SUCCEEDED(layout->HitTestTextRange(
+                    static_cast<UINT32>(first), static_cast<UINT32>(last - first),
+                    origin.x, origin.y, metrics.data(), static_cast<UINT32>(metrics.size()), &count)))
+            {
+                for (UINT32 i = 0; i < count; ++i)
+                {
+                    const auto& item = metrics[i];
+                    m_d2dContext->FillRectangle(
+                        D2D1::RectF(item.left, item.top, item.left + item.width, item.top + item.height),
+                        m_accent.get());
+                }
+            }
+            DWRITE_TEXT_RANGE range{ static_cast<UINT32>(first), static_cast<UINT32>(last - first) };
+            AGSHOT_CHECK_HR(layout->SetDrawingEffect(m_handleFill.get(), range));
+        }
+        m_d2dContext->DrawTextLayout(origin, layout.get(), m_handleEdge.get());
+
+        FLOAT caretX = 0.0f;
+        FLOAT caretY = 0.0f;
+        DWRITE_HIT_TEST_METRICS caret{};
+        if (SUCCEEDED(layout->HitTestTextPosition(
+                static_cast<UINT32>(m_ocrCaret), FALSE, &caretX, &caretY, &caret)))
+        {
+            // Snapped like the text, so the caret stays a crisp single column
+            // rather than being blurred across two by a fractional origin.
+            const float caretLeft = std::round(origin.x + caretX);
+            const D2D1_POINT_2F top{ caretLeft, std::round(origin.y + caretY) };
+            const D2D1_POINT_2F bottom{ caretLeft, top.y + std::max(1.0f, std::round(caret.height)) };
+            m_d2dContext->DrawLine(top, bottom, m_accent.get(), Scaled(1));
+        }
+        m_d2dContext->PopAxisAlignedClip();
+
+        if (OcrScrollMaximum() > 0.0f)
+        {
+            const RECT track = OcrScrollTrack();
+            const RECT thumb = OcrScrollThumb();
+            const float radius = Scaled(kOcrScrollWidth) * 0.5f;
+            m_d2dContext->FillRoundedRectangle(
+                ToRoundedRect(track, radius), m_textScrollTrack.get());
+            m_d2dContext->FillRoundedRectangle(
+                ToRoundedRect(thumb, radius), m_textScrollThumb.get());
+        }
     }
 
     void Overlay::DrawSizeLabel()
@@ -1590,9 +2238,29 @@ namespace agshot
             }
         }
 
+        const bool editActive = m_mode == OperationMode::EditSelection;
+        const bool textActive = m_mode == OperationMode::TextRecognition;
+        const auto modeButton = [this](const RECT& rect, bool active, bool hovered)
+        {
+            if (active)
+            {
+                m_d2dContext->FillRoundedRectangle(
+                    ToRoundedRect(rect, Scaled(kButtonRadius)), m_accent.get());
+            }
+            else if (hovered)
+            {
+                m_d2dContext->FillRoundedRectangle(
+                    ToRoundedRect(rect, Scaled(kButtonRadius)), m_hover.get());
+            }
+        };
+        modeButton(m_toolbar.editSelection, editActive,
+                   m_toolbar.hovered == ToolbarButton::EditSelection);
+        modeButton(m_toolbar.textRecognition, textActive,
+                   m_toolbar.hovered == ToolbarButton::TextRecognition);
+        m_d2dContext->FillRectangle(ToRectF(m_toolbar.divider), m_panelEdge.get());
+
         const bool copyHovered = m_toolbar.hovered == ToolbarButton::Copy;
         const bool cancelHovered = m_toolbar.hovered == ToolbarButton::Cancel;
-
         if (copyHovered)
         {
             m_d2dContext->FillRoundedRectangle(
@@ -1605,31 +2273,275 @@ namespace agshot
         }
 
         const int inset = MulDiv(kIconInset, m_dpi, 96);
+        DrawIconEditSelection(Inset(m_toolbar.editSelection, inset),
+                              editActive ? m_handleFill.get() : m_icon.get());
+        DrawIconTextRecognition(Inset(m_toolbar.textRecognition, inset),
+                                textActive ? m_handleFill.get() : m_icon.get());
         DrawIconCopy(Inset(m_toolbar.copy, inset));
         DrawIconCancel(Inset(m_toolbar.cancel, inset));
     }
 
+#ifdef AGSHOT_TOOLBAR_PROOF
+    bool Overlay::ExportToolbarProof(const wchar_t* path, int dpi, bool textRecognitionActive,
+                                     float ocrScrollProbe)
+    {
+        m_ocrScrollProbe = ocrScrollProbe;
+        m_dpi = dpi;
+        m_handleSize = MulDiv(kHandleSize, m_dpi, 96);
+        m_mode = textRecognitionActive ? OperationMode::TextRecognition
+                                       : OperationMode::EditSelection;
+
+        if (!m_d2dFactory)
+        {
+            CreateDeviceIndependentResources();
+        }
+        if (!m_d2dContext)
+        {
+            winrt::com_ptr<ID3D11Device> device;
+            HRESULT hr = E_FAIL;
+            for (D3D_DRIVER_TYPE driver : { D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP })
+            {
+                hr = D3D11CreateDevice(nullptr, driver, nullptr,
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED,
+                    nullptr, 0, D3D11_SDK_VERSION, device.put(), nullptr, nullptr);
+                if (SUCCEEDED(hr))
+                {
+                    break;
+                }
+            }
+            AGSHOT_CHECK_HR(hr);
+            AGSHOT_CHECK_HR(device->QueryInterface(__uuidof(IDXGIDevice), m_dxgiDevice.put_void()));
+            AGSHOT_CHECK_HR(m_d2dFactory->CreateDevice(m_dxgiDevice.get(), m_d2dDevice.put()));
+            AGSHOT_CHECK_HR(m_d2dDevice->CreateDeviceContext(
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE, m_d2dContext.put()));
+        }
+
+        // Small enough that the mock text overflows and the scrollbar appears.
+        const RECT selection = textRecognitionActive ? RECT{ 0, 0, 360, 240 }
+                                                     : RECT{ 0, 0, 600, 400 };
+        const RECT bounds{ 0, 0, 1920, 1080 };
+        m_selection = selection;
+        if (!LayoutToolbar(m_toolbar, selection, bounds, m_dpi))
+        {
+            return false;
+        }
+        m_toolbarVisible = true;
+
+        if (textRecognitionActive)
+        {
+            m_ocrText = L"AGShot text recognition preview\r\n\r\nThis is mock OCR content for the selected area. Select part of this text with the mouse or keyboard, then copy it.\r\n\r\nThe recognized text stays cached while the selection remains unchanged.";
+            m_ocrCacheValid = true;
+            m_ocrCacheSelection = selection;
+            // A sub-pixel scroll offset, so the render proves the text lands on
+            // whole pixels rather than on softened half ones.
+            m_ocrScrollY = m_ocrScrollProbe;
+        }
+
+        // The mark geometry depends on the DPI, and the normal startup path is
+        // not the one that runs here.
+        const float localStroke =
+            Scaled(kIconStroke) * 18.0f / (std::max(1.0f, Scaled(kIconInk)) - Scaled(kIconStroke));
+        if (m_copyLocalStroke != localStroke)
+        {
+            CreateCopyIconGeometry(localStroke);
+        }
+
+        const RECT area = textRecognitionActive
+            ? RECT{ selection.left - 16, selection.top - 16,
+                    selection.right + 16, selection.bottom + 16 }
+            : RECT{ m_toolbar.panel.left - 16, m_toolbar.panel.top - 16,
+                    m_toolbar.panel.right + 16, m_toolbar.panel.bottom + 16 };
+        const UINT width = static_cast<UINT>(area.right - area.left);
+        const UINT height = static_cast<UINT>(area.bottom - area.top);
+        const D2D1_SIZE_U size = D2D1::SizeU(width, height);
+        const UINT stride = width * 4;
+        const UINT bytes = stride * height;
+
+        winrt::com_ptr<ID2D1DeviceContext> target;
+        AGSHOT_CHECK_HR(m_d2dDevice->CreateDeviceContext(
+            D2D1_DEVICE_CONTEXT_OPTIONS_NONE, target.put()));
+
+        const D2D1_BITMAP_PROPERTIES1 targetProperties = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            static_cast<float>(m_dpi), static_cast<float>(m_dpi));
+        winrt::com_ptr<ID2D1Bitmap1> surface;
+        AGSHOT_CHECK_HR(target->CreateBitmap(size, nullptr, 0, targetProperties, surface.put()));
+        target->SetTarget(surface.get());
+
+        const D2D1_BITMAP_PROPERTIES1 readProperties = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            static_cast<float>(m_dpi), static_cast<float>(m_dpi));
+        winrt::com_ptr<ID2D1Bitmap1> readable;
+        AGSHOT_CHECK_HR(target->CreateBitmap(size, nullptr, 0, readProperties, readable.put()));
+
+        winrt::com_ptr<ID2D1DeviceContext> saved = m_d2dContext;
+        m_d2dContext = target;
+        m_d2dContext->BeginDraw();
+        m_d2dContext->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+
+        const auto brush = [this](float r, float g, float b, float a,
+                                  winrt::com_ptr<ID2D1SolidColorBrush>& out)
+        {
+            AGSHOT_CHECK_HR(m_d2dContext->CreateSolidColorBrush(D2D1::ColorF(r, g, b, a), out.put()));
+        };
+        brush(0.0f, 0.0f, 0.0f, 0.45f, m_dim);
+        brush(0.0f, 0.0f, 0.0f, 0.1f, m_shadow);
+        brush(0.18f, 0.49f, 0.94f, 1.0f, m_accent);
+        brush(1.0f, 1.0f, 1.0f, 1.0f, m_handleFill);
+        brush(0.10f, 0.10f, 0.12f, 1.0f, m_handleEdge);
+        brush(0.14f, 0.15f, 0.18f, 0.97f, m_panel);
+        brush(1.0f, 1.0f, 1.0f, 0.14f, m_panelEdge);
+        brush(1.0f, 1.0f, 1.0f, 0.13f, m_hover);
+        brush(0.96f, 0.97f, 0.99f, 1.0f, m_icon);
+        brush(0.94f, 0.35f, 0.35f, 1.0f, m_cancel);    // the one destructive mark
+        brush(0.90f, 0.91f, 0.93f, 1.0f, m_textScrollTrack);
+        brush(0.48f, 0.51f, 0.56f, 1.0f, m_textScrollThumb);
+
+        const D2D1_MATRIX_3X2_F shift = D2D1::Matrix3x2F::Translation(
+            -static_cast<float>(area.left), -static_cast<float>(area.top));
+        m_d2dContext->SetTransform(shift);
+        if (textRecognitionActive)
+        {
+            // The text box and its scrollbar only exist in text-recognition mode,
+            // so proving the scrollbar means proving this panel too.
+            DrawTextRecognition();
+        }
+        DrawToolbar();
+        m_d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
+        AGSHOT_CHECK_HR(m_d2dContext->EndDraw());
+
+        AGSHOT_CHECK_HR(readable->CopyFromBitmap(nullptr, surface.get(), nullptr));
+        D2D1_MAPPED_RECT mapped{};
+        AGSHOT_CHECK_HR(readable->Map(D2D1_MAP_OPTIONS_READ, &mapped));
+
+        BITMAPFILEHEADER header{};
+        header.bfType = 0x4D42;
+        header.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+        header.bfSize = header.bfOffBits + bytes;
+
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = static_cast<LONG>(width);
+        info.bmiHeader.biHeight = -static_cast<LONG>(height);
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+
+        bool ok = false;
+        FILE* file = nullptr;
+        if (_wfopen_s(&file, path, L"wb") == 0 && file != nullptr)
+        {
+            std::fwrite(&header, sizeof(header), 1, file);
+            std::fwrite(&info.bmiHeader, sizeof(BITMAPINFOHEADER), 1, file);
+            for (UINT row = 0; row < height; ++row)
+            {
+                std::fwrite(mapped.bits + static_cast<size_t>(row) * mapped.pitch, 1, stride, file);
+            }
+            std::fclose(file);
+            ok = true;
+        }
+        readable->Unmap();
+        m_d2dContext = saved;
+        return ok;
+    }
+#endif
+
+    void Overlay::DrawIconEditSelection(const RECT& box, ID2D1SolidColorBrush* brush)
+    {
+        const float stroke = Scaled(kIconStroke);
+        // Round caps reach half a stroke past each end, so the geometry is inset
+        // by half of whatever the painted size leaves over.
+        const float inset =
+            (static_cast<float>(box.right - box.left) + stroke - Scaled(kIconInk)) * 0.5f;
+        const float left = static_cast<float>(box.left) + inset;
+        const float top = static_cast<float>(box.top) + inset;
+        const float right = static_cast<float>(box.right) - inset;
+        const float bottom = static_cast<float>(box.bottom) - inset;
+        const float corner = std::min(Scaled(5), std::min(right - left, bottom - top) * 0.35f);
+        const auto line = [this, brush, stroke](float x1, float y1, float x2, float y2)
+        {
+            m_d2dContext->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x2, y2),
+                                   brush, stroke, m_roundStroke.get());
+        };
+        line(left, top + corner, left, top);
+        line(left, top, left + corner, top);
+        line(right - corner, top, right, top);
+        line(right, top, right, top + corner);
+        line(left, bottom - corner, left, bottom);
+        line(left, bottom, left + corner, bottom);
+        line(right - corner, bottom, right, bottom);
+        line(right, bottom - corner, right, bottom);
+    }
+
+    void Overlay::DrawIconTextRecognition(const RECT& box, ID2D1SolidColorBrush* brush)
+    {
+        // The mark spans the same box the edit-selection mark does, inset by the
+        // same amount and widened by its own stroke, so the two read as a pair
+        // at every DPI instead of only where the rounding happens to agree.
+        const float stroke = Scaled(kIconStroke);
+        const TextRecognitionIcon icon =
+            LayoutTextRecognitionIcon(box, Scaled(kIconInk), stroke);
+
+        winrt::com_ptr<ID2D1PathGeometry> brackets;
+        AGSHOT_CHECK_HR(m_d2dFactory->CreatePathGeometry(brackets.put()));
+        winrt::com_ptr<ID2D1GeometrySink> sink;
+        AGSHOT_CHECK_HR(brackets->Open(sink.put()));
+        for (const auto& bracket : icon.brackets)
+        {
+            sink->BeginFigure(bracket.points[0], D2D1_FIGURE_BEGIN_HOLLOW);
+            for (std::size_t i = 1; i < bracket.count; ++i)
+            {
+                sink->AddLine(bracket.points[i]);
+            }
+            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+        }
+        AGSHOT_CHECK_HR(sink->Close());
+
+        // Flat ends: the reference art's bars are cut off square, and a round
+        // cap would add half a stroke to each of the six bar ends.
+        m_d2dContext->DrawGeometry(brackets.get(), brush, icon.stroke, m_flatStroke.get());
+        for (int i = 0; i < 3; ++i)
+        {
+            m_d2dContext->DrawLine(
+                icon.barFrom[i], icon.barTo[i], brush, icon.stroke, m_flatStroke.get());
+        }
+    }
     void Overlay::DrawIconCopy(const RECT& box)
     {
         D2D1_MATRIX_3X2_F original{};
         m_d2dContext->GetTransform(&original);
-        const float scaleX = static_cast<float>(box.right - box.left) / 18.0f;
-        const float scaleY = static_cast<float>(box.bottom - box.top) / 18.0f;
+        // The mark is scaled so that the painted outline -- the 18-unit
+        // geometry plus half a stroke on every side -- comes out at kIconInk,
+        // the same visual size as the other three marks.
+        const float boxSpan = static_cast<float>(box.right - box.left);
+        const float scale = (Scaled(kIconInk) - Scaled(kIconStroke)) / 18.0f;
+        const float scaleX = scale;
+        const float scaleY = scale;
+        const float offset = (boxSpan - Scaled(kIconInk) + Scaled(kIconStroke)) * 0.5f;
         const D2D1_MATRIX_3X2_F iconTransform =
             D2D1::Matrix3x2F::Scale(scaleX, scaleY)
             * D2D1::Matrix3x2F::Translation(
-                static_cast<float>(box.left), static_cast<float>(box.top))
+                static_cast<float>(box.left) + offset, static_cast<float>(box.top) + offset)
             * original;
+        // The geometry is authored in an 18-unit square and scaled up to the
+        // box, so the stroke is scaled back down to stay at kIconStroke DIPs
+        // rather than growing with the icon.
         m_d2dContext->SetTransform(iconTransform);
-        m_d2dContext->DrawGeometry(
-            m_copyIconGeometry.get(), m_icon.get(), static_cast<float>(kIconStroke), m_roundStroke.get());
+        // The geometry already is the stroked area of both squares merged, so it
+        // is filled straight, in a single pass.
+        m_d2dContext->FillGeometry(m_copyIconGeometry.get(), m_icon.get());
         m_d2dContext->SetTransform(original);
     }
 
     void Overlay::DrawIconCancel(const RECT& box)
     {
         const float stroke = Scaled(kIconStroke);
-        const float inset = static_cast<float>(box.right - box.left) * 0.24f;
+        // A round cap is a semicircle, so it reaches stroke/2 past the endpoint
+        // in every direction; the inset leaves exactly kIconInk of painted width.
+        const float inset = (static_cast<float>(box.right - box.left)
+                             + stroke - Scaled(kIconInk)) * 0.5f;
 
         const D2D1_POINT_2F topLeft{ static_cast<float>(box.left) + inset,
                                      static_cast<float>(box.top) + inset };
@@ -1640,8 +2552,8 @@ namespace agshot
         const D2D1_POINT_2F bottomLeft{ static_cast<float>(box.left) + inset,
                                         static_cast<float>(box.bottom) - inset };
 
-        m_d2dContext->DrawLine(topLeft, bottomRight, m_icon.get(), stroke, m_roundStroke.get());
-        m_d2dContext->DrawLine(topRight, bottomLeft, m_icon.get(), stroke, m_roundStroke.get());
+        m_d2dContext->DrawLine(topLeft, bottomRight, m_cancel.get(), stroke, m_roundStroke.get());
+        m_d2dContext->DrawLine(topRight, bottomLeft, m_cancel.get(), stroke, m_roundStroke.get());
     }
 
     void Overlay::DrawTooltip()
@@ -1676,7 +2588,11 @@ namespace agshot
 
         const RECT& button = m_toolbar.hovered == ToolbarButton::Copy
             ? m_toolbar.copy
-            : m_toolbar.cancel;
+            : m_toolbar.hovered == ToolbarButton::Cancel
+                ? m_toolbar.cancel
+                : m_toolbar.hovered == ToolbarButton::EditSelection
+                    ? m_toolbar.editSelection
+                    : m_toolbar.textRecognition;
 
         float x = static_cast<float>(button.left + button.right) / 2.0f - width / 2.0f;
         float y = static_cast<float>(button.bottom) + gap;
@@ -1744,6 +2660,14 @@ namespace agshot
             }
             return 0;
 
+        case WM_TIMER:
+            if (wparam == kOcrSelectionTimer && m_ocrSelecting)
+            {
+                UpdateOcrSelection(m_ocrSelectionPoint);
+                return 0;
+            }
+            break;
+
         case kSelectionAnimationFrameMessage:
         {
             if (m_animationFrameSignal)
@@ -1786,6 +2710,17 @@ namespace agshot
             // rather than the thing underneath it.
             return 0;
 
+        // TODO(pointer): this mouse handling is still the legacy WM_MOUSE* /
+        // WM_LBUTTON* family. The process already opts into mouse-in-pointer, and
+        // the system only keeps posting these because nothing here answers
+        // WM_POINTER, so move the whole hit and click path onto WM_POINTERDOWN /
+        // WM_POINTERUP / WM_POINTERUPDATE and keep the click count here.
+        // CS_DBLCLKS is not the answer: WM_LBUTTONDBLCLK is the only click-count
+        // message Windows defines, so it cannot express a triple click at all,
+        // and it puts the count in the OS where this code cannot see it.
+        // Blocked on that, double click selects the word and triple click the
+        // paragraph in the text-recognition box; both belong in the pointer
+        // handler above, not on a second code path of their own.
         case WM_MOUSEMOVE:
             OnMouseMove(POINT{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) });
             return 0;
@@ -1799,9 +2734,7 @@ namespace agshot
             return 0;
 
         case WM_RBUTTONUP:
-            // The usual way out of a capture overlay, and cheaper than finding the
-            // button.
-            Cancel();
+            ShowOcrContextMenu(POINT{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) });
             return 0;
 
         case WM_MOUSEWHEEL:
@@ -1821,30 +2754,29 @@ namespace agshot
 
         case WM_SETCURSOR:
         {
-            LPCWSTR shape = IDC_CROSS;
-            const ToolbarHitTarget toolbarTarget = m_toolbarVisible
-                ? HitTestToolbarTarget(m_toolbar, m_pointer)
-                : ToolbarHitTarget::None;
-
+            LPCWSTR shape = m_mode == OperationMode::TextRecognition ? IDC_ARROW : IDC_CROSS;
+            const HitTarget hit = HitTest(m_pointer);
             if (m_dragMode == DragMode::MoveOrResize)
             {
                 shape = CursorForPart(m_dragPart);
             }
-            else if (m_dragMode == DragMode::ToolbarMove
-                || toolbarTarget == ToolbarHitTarget::Handle)
+            else if (m_dragMode == DragMode::ToolbarMove || hit == HitTarget::ToolbarHandle)
             {
                 shape = IDC_SIZEALL;
             }
-            else if (toolbarTarget == ToolbarHitTarget::Copy
-                || toolbarTarget == ToolbarHitTarget::Cancel)
+            else if (hit == HitTarget::ToolbarButton)
             {
                 shape = IDC_HAND;
             }
-            else if (toolbarTarget == ToolbarHitTarget::Panel)
+            else if (hit == HitTarget::ToolbarPanel || hit == HitTarget::OcrScrollbar)
             {
                 shape = IDC_ARROW;
             }
-            else if (!m_smart && m_hasSelection)
+            else if (hit == HitTarget::OcrText)
+            {
+                shape = IDC_IBEAM;
+            }
+            else if (hit == HitTarget::SelectionHandle || hit == HitTarget::Selection)
             {
                 shape = CursorForPart(HitTestSelection(m_selection, m_pointer, m_handleSize));
             }
@@ -1858,6 +2790,47 @@ namespace agshot
             {
                 Cancel();
                 return 0;
+            }
+            if (m_mode == OperationMode::TextRecognition)
+            {
+                if (wparam == 'C' && (GetKeyState(VK_CONTROL) & 0x8000))
+                {
+                    // Ctrl+C is a done-with-this gesture: it takes the text and
+                    // closes, the same as pressing the copy button.
+                    CopyOcrText(true);
+                    return 0;
+                }
+                if (wparam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000))
+                {
+                    m_ocrAnchor = 0;
+                    m_ocrCaret = m_ocrText.size();
+                    EnsureOcrCaretVisible();
+                    RequestRender();
+                    return 0;
+                }
+                if (wparam == VK_LEFT || wparam == VK_UP
+                    || wparam == VK_RIGHT || wparam == VK_DOWN
+                    || wparam == VK_HOME || wparam == VK_END)
+                {
+                    MoveOcrCaret(wparam);
+                    return 0;
+                }
+                if (wparam == VK_PRIOR || wparam == VK_NEXT)
+                {
+                    const RECT box = OcrTextBox();
+                    const float page = std::max(1.0f,
+                        static_cast<float>(box.bottom - box.top) - Scaled(27));
+                    m_ocrScrollY = std::clamp(
+                        m_ocrScrollY + (wparam == VK_NEXT ? page : -page),
+                        0.0f, OcrScrollMaximum());
+                    RequestRender();
+                    return 0;
+                }
+                if (wparam == VK_RETURN)
+                {
+                    return 0;
+                }
+                break;
             }
             if (wparam == VK_RETURN && !m_smart && m_hasSelection)
             {
@@ -1889,7 +2862,20 @@ namespace agshot
             }
             break;
 
+        case WM_CHAR:
+            if (m_mode == OperationMode::TextRecognition)
+            {
+                return 0;
+            }
+            break;
+
+        case WM_CANCELMODE:
+            StopOcrSelection();
+            if (GetCapture() == hwnd) ReleaseCapture();
+            return 0;
+
         case WM_DESTROY:
+            StopOcrSelection();
             return 0;
         }
 

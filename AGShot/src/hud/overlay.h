@@ -13,8 +13,10 @@
 
 #include <winrt/base.h>
 
+#include <cstddef>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace agshot
@@ -57,6 +59,11 @@ namespace agshot
 
         LRESULT HandleMessage(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 
+#ifdef AGSHOT_TOOLBAR_PROOF
+        bool ExportToolbarProof(const wchar_t* path, int dpi, bool textRecognitionActive,
+                                float ocrScrollProbe = 0.0f);
+#endif
+
     private:
         // How a drag is changing the selection, if one is in progress.
         enum class DragMode
@@ -67,8 +74,26 @@ namespace agshot
             ToolbarMove,       // dragging the toolbar by its left handle
         };
 
+        enum class OperationMode
+        {
+            EditSelection,
+            TextRecognition,
+        };
+
+        enum class HitTarget
+        {
+            Canvas,
+            Selection,
+            SelectionHandle,
+            OcrText,
+            OcrScrollbar,
+            ToolbarPanel,
+            ToolbarHandle,
+            ToolbarButton,
+        };
+
         void CreateDeviceIndependentResources();
-        void CreateCopyIconGeometry();
+        void CreateCopyIconGeometry(float localStroke);
         void CreateDeviceResources();
         void CreateSizeDependentResources();
 
@@ -81,6 +106,10 @@ namespace agshot
         };
 
         RECT ClientBounds() const noexcept;
+        HitTarget HitTest(POINT point) const noexcept;
+        void ShowOcrContextMenu(POINT point);
+        void UpdateOcrSelection(POINT point);
+        void StopOcrSelection() noexcept;
 
         void OnMouseMove(POINT point);
         void OnLeftButtonDown(POINT point);
@@ -98,16 +127,29 @@ namespace agshot
         void UpdateHover(POINT point);
         void Settle();
         void Invoke(ToolbarButton button);
+        void EnterTextRecognitionMode();
+        void CopyOcrText(bool closeAfterCopy);
+        RECT OcrTextBox() const noexcept;
+        RECT OcrScrollTrack() const noexcept;
+        RECT OcrScrollThumb() const;
+        winrt::com_ptr<IDWriteTextLayout> CreateOcrTextLayout() const;
+        std::size_t OcrPositionFromPoint(POINT point) const;
+        float OcrScrollMaximum() const;
+        void EnsureOcrCaretVisible();
+        void MoveOcrCaret(WPARAM key);
 
         void ClearSurface();
         void DrawDim();
         void DrawSelection();
+        void DrawTextRecognition();
         void DrawSizeLabel();
         void DrawToolbar();
         void DrawTooltip();
         void DrawPixelMagnifier();
         void DrawIconCopy(const RECT& box);
         void DrawIconCancel(const RECT& box);
+        void DrawIconEditSelection(const RECT& box, ID2D1SolidColorBrush* brush);
+        void DrawIconTextRecognition(const RECT& box, ID2D1SolidColorBrush* brush);
 
         float Scaled(int value) const noexcept;
         float Scaled(float value) const noexcept;
@@ -133,7 +175,18 @@ namespace agshot
         winrt::com_ptr<IDWriteTextFormat> m_textFormat;
         winrt::com_ptr<IDWriteTextFormat> m_magnifierTextFormat;
         winrt::com_ptr<ID2D1StrokeStyle> m_roundStroke;
+        // The same joins, but with square ends: the text-recognition mark is
+        // traced from a reference image whose bars are cut off flat.
+        winrt::com_ptr<ID2D1StrokeStyle> m_flatStroke;
+        // The copy mark's two squares merged into a single stroked area, plus the
+        // stroke it was built for, so it can be rebuilt when the DPI changes that
+        // stroke. Merging keeps the crossing solid: stroking the squares apart
+        // paints it twice and leaves a pale seam.
         winrt::com_ptr<ID2D1PathGeometry> m_copyIconGeometry;
+        float m_copyLocalStroke{};
+#ifdef AGSHOT_TOOLBAR_PROOF
+        float m_ocrScrollProbe{};
+#endif
         winrt::com_ptr<ID2D1Layer> m_magnifierLayer;
         winrt::com_ptr<IDCompositionDevice> m_composition;
         winrt::com_ptr<IDCompositionTarget> m_target;
@@ -149,7 +202,12 @@ namespace agshot
         winrt::com_ptr<ID2D1SolidColorBrush> m_panelEdge;
         winrt::com_ptr<ID2D1SolidColorBrush> m_hover;
         winrt::com_ptr<ID2D1SolidColorBrush> m_icon;
+        // The cancel mark is the one destructive control in the row, so it is
+        // drawn in red rather than the shared icon colour.
+        winrt::com_ptr<ID2D1SolidColorBrush> m_cancel;
         winrt::com_ptr<ID2D1SolidColorBrush> m_tooltip;
+        winrt::com_ptr<ID2D1SolidColorBrush> m_textScrollTrack;
+        winrt::com_ptr<ID2D1SolidColorBrush> m_textScrollThumb;
 
         // The rectangle on show: either the user's, or the suggestion under the
         // pointer while "m_smart" is still true.
@@ -167,6 +225,18 @@ namespace agshot
         // True while the selection is still following the pointer, which is what
         // "smart selection" means: nothing has been committed yet.
         bool m_smart{true};
+        OperationMode m_mode{ OperationMode::EditSelection };
+        std::wstring m_ocrText;
+        RECT m_ocrCacheSelection{};
+        bool m_ocrCacheValid{};
+        std::size_t m_ocrCaret{};
+        std::size_t m_ocrAnchor{};
+        bool m_ocrSelecting{};
+        bool m_ocrScrollDragging{};
+        POINT m_ocrScrollDragOrigin{};
+        float m_ocrScrollDragStart{};
+        POINT m_ocrSelectionPoint{};
+        float m_ocrScrollY{};
         int m_depth{};            // wheel-adjusted level within the UIA tree
         ULONGLONG m_lastQuery{};  // throttles the UIA call
 

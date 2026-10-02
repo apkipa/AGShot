@@ -7,6 +7,8 @@ namespace agshot
     enum class ToolbarButton
     {
         None,
+        EditSelection,
+        TextRecognition,
         Copy,
         Cancel,
     };
@@ -16,6 +18,8 @@ namespace agshot
         None,
         Panel,
         Handle,
+        EditSelection,
+        TextRecognition,
         Copy,
         Cancel,
     };
@@ -27,6 +31,9 @@ namespace agshot
     {
         RECT panel{};
         RECT handle{};
+        RECT editSelection{};
+        RECT textRecognition{};
+        RECT divider{};
         RECT copy{};
         RECT cancel{};
         ToolbarButton hovered = ToolbarButton::None;
