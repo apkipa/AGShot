@@ -89,6 +89,48 @@ namespace agshot
         };
     }
 
+    ScreenImage::~ScreenImage() noexcept
+    {
+        Release();
+    }
+
+    ScreenImage::ScreenImage(ScreenImage&& other) noexcept
+    {
+        *this = std::move(other);
+    }
+
+    ScreenImage& ScreenImage::operator=(ScreenImage&& other) noexcept
+    {
+        if (this != &other)
+        {
+            Release();
+            m_region = other.m_region;
+            m_width = other.m_width;
+            m_height = other.m_height;
+            m_bitmap = other.m_bitmap;
+            m_bits = other.m_bits;
+            other.m_bitmap = nullptr;
+            other.m_bits = nullptr;
+            other.m_region = RECT{};
+            other.m_width = 0;
+            other.m_height = 0;
+        }
+        return *this;
+    }
+
+    void ScreenImage::Release() noexcept
+    {
+        if (m_bitmap != nullptr)
+        {
+            DeleteObject(m_bitmap);
+            m_bitmap = nullptr;
+        }
+        m_bits = nullptr;
+        m_region = RECT{};
+        m_width = 0;
+        m_height = 0;
+    }
+
     void ScreenImage::Capture(const RECT& region)
     {
         const int width = region.right - region.left;
@@ -102,7 +144,8 @@ namespace agshot
         AGSHOT_CHECK_WIN32(screen.handle != nullptr);
 
         // A top-down 32-bit DIB section: BitBlt writes straight into memory in
-        // the order the rest of this file wants to read it, with no second pass.
+        // the order the rest of this file wants to read it, and that memory is
+        // the picture this object hands out, with no second pass.
         BITMAPINFO info{};
         info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         info.bmiHeader.biWidth = width;
@@ -112,7 +155,7 @@ namespace agshot
         info.bmiHeader.biCompression = BI_RGB;
 
         void* bits = nullptr;
-        const Bitmap bitmap{ CreateDIBSection(screen.handle, &info, DIB_RGB_COLORS, &bits, nullptr, 0) };
+        Bitmap bitmap{ CreateDIBSection(screen.handle, &info, DIB_RGB_COLORS, &bits, nullptr, 0) };
         AGSHOT_CHECK_WIN32(bitmap.handle != nullptr);
         AGSHOT_CHECK_WIN32(bits != nullptr);
 
@@ -130,10 +173,18 @@ namespace agshot
 
         SelectObject(memory.handle, previous);
 
-        // The bits belong to the bitmap and go away with it, so the picture is
-        // taken out before this function returns.
-        const std::size_t bytes = static_cast<std::size_t>(width) * height * 4;
-        m_pixels.assign(static_cast<const BYTE*>(bits), static_cast<const BYTE*>(bits) + bytes);
+        // GDI is allowed to hold the blit, and the bits are about to be read as
+        // ordinary memory rather than through the DC.
+        GdiFlush();
+
+        // Everything that can fail has happened, so the section takes over as the
+        // owner of the pixels from here. Until this point the local keeps them,
+        // which is what makes a failure part way through leave the object as it
+        // was.
+        Release();
+        m_bitmap = bitmap.handle;
+        m_bits = static_cast<BYTE*>(bits);
+        bitmap.handle = nullptr;
         m_region = region;
         m_width = width;
         m_height = height;
@@ -152,11 +203,11 @@ namespace agshot
 
         const int width = clipped.right - clipped.left;
         const int height = clipped.bottom - clipped.top;
-        const std::size_t pixels = static_cast<std::size_t>(width) * height * 4;
+        const std::size_t pixelBytes = static_cast<std::size_t>(width) * height * 4;
 
         // One block holding the header and the pixels together, because that is
         // the shape CF_DIB has on the clipboard.
-        HGLOBAL block = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + pixels);
+        HGLOBAL block = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + pixelBytes);
         AGSHOT_CHECK_WIN32(block != nullptr);
 
         BYTE* target = static_cast<BYTE*>(GlobalLock(block));
@@ -181,7 +232,7 @@ namespace agshot
         for (int row = 0; row < height; ++row)
         {
             const int sourceRow = clipped.top - m_region.top + (height - 1 - row);
-            const BYTE* source = m_pixels.data()
+            const BYTE* source = m_bits
                 + (static_cast<std::size_t>(sourceRow) * m_width + (clipped.left - m_region.left)) * 4;
             std::memcpy(out + static_cast<std::size_t>(row) * width * 4, source,
                         static_cast<std::size_t>(width) * 4);

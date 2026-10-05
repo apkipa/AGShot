@@ -10,8 +10,12 @@ namespace agshot
     // Schema version stamped into the file. Bump this whenever the meaning or
     // the shape of a stored key changes, then extend the migration step in
     // LoadConfig() so older files are upgraded instead of silently misread.
-    // 1: version on its own. 2: added [window]. 3: added [screenshot].
-    inline constexpr int kConfigVersion = 3;
+    //
+    // Still 1 because no version has ever been released: every key so far was
+    // added before anyone could have a file, so there is nothing in the wild to
+    // migrate from. The mechanism below stays in place for the first release
+    // that changes an existing key's meaning.
+    inline constexpr int kConfigVersion = 1;
 
     // A window size is a client area in DIPs at 96 DPI, so the same file gives
     // the same apparent size on any monitor. The upper bound is the largest
@@ -29,6 +33,11 @@ namespace agshot
         // "Ctrl+Shift+A" - and it is kept here already parsed, because that is
         // the form RegisterHotKey() will want.
         Hotkey screenshotHotkey = DefaultHotkey();
+
+        // Draws the frame rate and a short history of it over the overlay. Off
+        // by default: it is a diagnostic, not something to ship in front of a
+        // screenshot.
+        bool debugShowStats = false;
     };
 
     // Settings are applied by comparing: a reload that produces the same values
@@ -38,13 +47,18 @@ namespace agshot
         return left.version == right.version
             && left.windowWidth == right.windowWidth
             && left.windowHeight == right.windowHeight
-            && left.screenshotHotkey == right.screenshotHotkey;
+            && left.screenshotHotkey == right.screenshotHotkey
+            && left.debugShowStats == right.debugShowStats;
     }
 
     inline bool operator!=(const Config& left, const Config& right) noexcept
     {
         return !(left == right);
     }
+
+    // The directory holding the running executable, or empty if it cannot be
+    // determined. Anything that ships beside the binary is found through this.
+    std::filesystem::path ExecutableDirectory();
 
     // %APPDATA%\AGShot\config.toml normally. If a file named AGShot.portable
     // sits next to the executable, <exe dir>\config.toml is used instead, which

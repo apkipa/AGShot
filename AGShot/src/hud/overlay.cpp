@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "hud/overlay.h"
+#include "../../OcrEngine/src/wic_decoder.hpp"
 
 #include "core/error.h"
 #include "hud/toolbar_icon.h"
@@ -63,6 +64,15 @@ namespace agshot
         constexpr int kOcrScrollInset = 5;
         // Room the text leaves free on the right so it cannot run under the bar.
         constexpr int kOcrScrollGutter = 10;
+
+        // The mark shown while a capture is being recognized: an arc that turns
+        // once per period, drawn as short segments so the head is opaque and the
+        // tail fades. The segments abut exactly, so the arc reads as one stroke.
+        constexpr float kDegreesToRadians = 3.14159265358979f / 180.0f;
+        constexpr float kOcrSpinnerSweepDeg = 270.0f;
+        constexpr float kOcrSpinnerRadius = 9.0f;
+        constexpr float kOcrSpinnerStroke = 2.0f;
+        constexpr int kOcrSpinnerPeriodMs = 900;
 
         // A drag that never reaches this size is a click that wobbled, not a
         // selection, and goes back to following the pointer.
@@ -298,6 +308,8 @@ namespace agshot
         StopSelectionAnimation();
         StopAnimationClock();
         StopOcrSelection();
+        m_ocrCompletion.reset();
+        m_ocrPending = false;
         if (m_window != nullptr)
         {
             DestroyWindow(m_window);
@@ -308,6 +320,7 @@ namespace agshot
             g_overlay = nullptr;
         }
 
+        InvalidateTextLayouts();
         m_surface = nullptr;
         m_visual = nullptr;
         m_target = nullptr;
@@ -319,12 +332,14 @@ namespace agshot
         m_flatStroke = nullptr;
         m_textFormat = nullptr;
         m_magnifierTextFormat = nullptr;
+        m_statsTextFormat = nullptr;
         m_dwriteFactory = nullptr;
         m_icon = nullptr;
         m_cancel = nullptr;
         m_tooltip = nullptr;
         m_textScrollThumb = nullptr;
         m_textScrollTrack = nullptr;
+        m_spinnerEffect = nullptr;
         m_hover = nullptr;
         m_panelEdge = nullptr;
         m_panel = nullptr;
@@ -339,8 +354,29 @@ namespace agshot
         m_dxgiDevice = nullptr;
     }
 
+    void Overlay::InvalidateTextLayouts() noexcept
+    {
+        // Layouts retain the format used to create them. Invalidate them before
+        // replacing any format; object addresses are not a valid cache key.
+        m_ocrLayout = nullptr;
+        m_ocrLayoutText.clear();
+        m_ocrLayoutWidth = -1.0f;
+        m_ocrLayoutHighlightFirst = 0;
+        m_ocrLayoutHighlightLast = 0;
+        m_ocrHitMetrics.clear();
+
+        m_sizeLabelLayout = nullptr;
+        m_sizeLabelSelection = RECT{};
+        m_sizeLabelValid = false;
+
+        m_tooltipLayout = nullptr;
+        m_tooltipLayoutButton = ToolbarButton::None;
+    }
+
     void Overlay::CreateDeviceIndependentResources()
     {
+        InvalidateTextLayouts();
+
         AGSHOT_CHECK_HR(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, m_d2dFactory.put()));
 
         AGSHOT_CHECK_HR(DWriteCreateFactory(
@@ -366,6 +402,16 @@ namespace agshot
             Scaled(MeasuredPixels(18.0f)),
             L"en-US",
             m_magnifierTextFormat.put()));
+
+        AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextFormat(
+            L"Consolas",
+            nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            Scaled(11),
+            L"en-US",
+            m_statsTextFormat.put()));
 
         // Round caps, so the cross of the cancel button reads as a drawn mark
         // rather than four clipped ends.
@@ -543,6 +589,8 @@ namespace agshot
         brush(0.06f, 0.06f, 0.08f, 0.97f, m_tooltip);
         brush(0.90f, 0.91f, 0.93f, 1.0f, m_textScrollTrack);
         brush(0.48f, 0.51f, 0.56f, 1.0f, m_textScrollThumb);
+
+        CreateSpinnerEffect();
     }
 
     void Overlay::CreateSizeDependentResources()
@@ -673,6 +721,8 @@ namespace agshot
         m_smart = true;
         m_mode = OperationMode::EditSelection;
         m_ocrText.clear();
+        m_ocrCompletion.reset();
+        m_ocrPending = false;
         m_ocrCacheValid = false;
         m_ocrCaret = 0;
         m_ocrAnchor = 0;
@@ -686,7 +736,6 @@ namespace agshot
         m_pendingConfirm = false;
         m_toolbarVisible = false;
         m_toolbar.hovered = ToolbarButton::None;
-        m_trackingLeave = false;
 
         // Resolve and draw the initial suggestion while hidden so the previous
         // capture cannot flash when the overlay is shown.
@@ -705,6 +754,7 @@ namespace agshot
                      SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
         SetForegroundWindow(m_window);
         SetFocus(m_window);
+
     }
 
     void Overlay::Cancel() noexcept
@@ -717,6 +767,8 @@ namespace agshot
         StopSelectionAnimation();
         StopAnimationClock();
         StopOcrSelection();
+        m_ocrCompletion.reset();
+        m_ocrPending = false;
         ShowWindow(m_window, SW_HIDE);
 
         m_hasSelection = false;
@@ -819,6 +871,19 @@ namespace agshot
         }
     }
 
+    // The one way to ask for a repaint. Everything that changes what is on
+    // screen comes through here, and the frame it lands on is decided by the
+    // compositor clock rather than by the caller.
+    //
+    // TODO(render): there is no dirty tracking behind this. Render() always
+    // redraws the whole surface - the update rect handed to BeginDraw is the
+    // full client area, never a sub-rectangle - so moving the pointer over a
+    // toolbar button repaints every pixel of a 2560x1440 surface. The callers
+    // here each know which region they changed and that knowledge is dropped at
+    // this boundary. Give RequestRender an optional dirty rectangle, union them
+    // while a frame is pending, and pass the result to BeginDraw; that also
+    // makes it possible to stop the clock when nothing has changed, which
+    // matters because the frame handler below redraws unconditionally.
     void Overlay::RequestRender()
     {
         if (m_window == nullptr || !IsWindowVisible(m_window))
@@ -826,9 +891,176 @@ namespace agshot
             Render();
             return;
         }
+
+        // Whatever changed the frame usually changed the pointer shape too - the
+        // mode, whether a drag is running, whether the toolbar is up - and none
+        // of those produce a mouse message of their own. Re-applying here is what
+        // keeps the shape right until the pointer next moves.
+        ApplyCursor();
+
         if (!m_animationFrameSignal && !StartAnimationClock())
         {
             Render();
+        }
+    }
+
+    void Overlay::SetDebugStats(bool show)
+    {
+        if (m_showStats == show)
+        {
+            return;
+        }
+
+        m_showStats = show;
+        m_statsSampleCount = 0;
+        m_statsSampleHead = 0;
+        m_statsFrameMs = 0.0f;
+        m_statsRenderMs = 0.0f;
+        m_statsLastFrame = 0;
+        m_statsLastSample = 0;
+
+        RequestRender();
+    }
+
+    void Overlay::RecordFrame() noexcept
+    {
+        if (!m_showStats)
+        {
+            return;
+        }
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const double frequency = static_cast<double>(PerformanceCounterFrequency());
+
+        if (m_statsLastFrame != 0)
+        {
+            const double elapsed = static_cast<double>(now.QuadPart - m_statsLastFrame)
+                * 1000.0 / frequency;
+            // Smoothed, because a single frame's time is far too noisy to read.
+            m_statsFrameMs += (static_cast<float>(elapsed) - m_statsFrameMs) * 0.1f;
+        }
+        m_statsLastFrame = now.QuadPart;
+
+        // Sampled on a time cadence rather than per frame, so the graph keeps a
+        // consistent time axis whether the overlay is busy or idle.
+        if (m_statsLastSample != 0
+            && static_cast<double>(now.QuadPart - m_statsLastSample) * 1000.0 / frequency
+                < static_cast<double>(kStatsWindowMs))
+        {
+            return;
+        }
+        m_statsLastSample = now.QuadPart;
+
+        m_statsSamples[m_statsSampleHead] = m_statsFrameMs > 0.0f
+            ? 1000.0f / m_statsFrameMs
+            : 0.0f;
+        m_statsSampleTime[m_statsSampleHead] = now.QuadPart;
+        m_statsSampleHead = (m_statsSampleHead + 1) % kStatsSamples;
+        if (m_statsSampleCount < kStatsSamples)
+        {
+            ++m_statsSampleCount;
+        }
+    }
+
+    // A small panel in the top-right corner: the current rate, and the last few
+    // seconds of it as a graph. Drawn last so nothing paints over it.
+    void Overlay::DrawDebugStats()
+    {
+        if (!m_showStats || !m_d2dContext || !m_statsTextFormat)
+        {
+            return;
+        }
+
+        const float margin = Scaled(10);
+        const float width = Scaled(190);
+        const float height = Scaled(78);
+        const float left = static_cast<float>(m_width) - margin - width;
+        const D2D1_RECT_F panel = D2D1::RectF(left, margin, left + width, margin + height);
+
+        m_d2dContext->FillRoundedRectangle(
+            D2D1::RoundedRect(panel, Scaled(4), Scaled(4)), m_panel.get());
+        m_d2dContext->DrawRoundedRectangle(
+            D2D1::RoundedRect(panel, Scaled(4), Scaled(4)), m_panelEdge.get(), Scaled(1));
+
+        // Two different measurements, deliberately not derived from one another:
+        // the rate is the reciprocal of the frame interval, the milliseconds are
+        // how long the last frame took to generate. Both describe the last frame
+        // drawn rather than the present moment, because the panel is only
+        // repainted when something else asks for a frame.
+        const float fps = m_statsFrameMs > 0.0f ? 1000.0f / m_statsFrameMs : 0.0f;
+        wchar_t caption[96]{};
+        swprintf_s(caption, L"%5.1f fps   %6.2f ms", fps, m_statsRenderMs);
+        // Deliberately not cached: the caption is the reading itself, so its text
+        // changes on every frame.
+        m_d2dContext->DrawTextW(
+            caption,
+            static_cast<UINT32>(wcslen(caption)),
+            m_statsTextFormat.get(),
+            D2D1::RectF(panel.left + Scaled(8), panel.top + Scaled(6),
+                        panel.right - Scaled(8), panel.top + Scaled(26)),
+            m_icon.get());
+
+        // The plot area, with the graph running left to right and the newest
+        // sample at the right edge.
+        const D2D1_RECT_F plot = D2D1::RectF(
+            panel.left + Scaled(8), panel.top + Scaled(30),
+            panel.right - Scaled(8), panel.bottom - Scaled(8));
+        const float plotWidth = plot.right - plot.left;
+        const float plotHeight = plot.bottom - plot.top;
+        if (m_statsSampleCount < 2 || plotWidth <= 0.0f || plotHeight <= 0.0f)
+        {
+            return;
+        }
+
+        // The graph is laid out against the clock, not against the sample index:
+        // a stretch with no frames leaves a gap rather than being silently
+        // stretched across the width. The right edge is now.
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const double span = kStatsGraphSeconds * static_cast<double>(PerformanceCounterFrequency());
+
+        // Oldest first, so the graph reads as time moving rightwards, and the
+        // scale is picked before anything is placed.
+        int slots[kStatsSamples]{};
+        float peak = 0.0f;
+        int visible = 0;
+        for (int i = 0; i < m_statsSampleCount; ++i)
+        {
+            const int slot = (m_statsSampleHead - m_statsSampleCount + i + kStatsSamples * 2)
+                % kStatsSamples;
+            const double age = static_cast<double>(now.QuadPart - m_statsSampleTime[slot]);
+            if (age < 0.0 || age > span)
+            {
+                continue;   // older than the window: it has scrolled off the left
+            }
+            slots[visible++] = slot;
+            peak = std::max(peak, m_statsSamples[slot]);
+        }
+
+        if (visible < 2)
+        {
+            return;
+        }
+
+        // A fixed scale would clip or flatten depending on the display, so the
+        // top follows the highest rate in the window, with a 60 Hz floor.
+        const float scale = std::max(60.0f, peak * 1.1f);
+
+        D2D1_POINT_2F previous{};
+        for (int i = 0; i < visible; ++i)
+        {
+            const int slot = slots[i];
+            const float age = static_cast<float>(
+                static_cast<double>(now.QuadPart - m_statsSampleTime[slot]) / span);
+            const D2D1_POINT_2F current{
+                plot.right - plotWidth * age,
+                plot.bottom - plotHeight * std::min(1.0f, m_statsSamples[slot] / scale) };
+            if (i > 0)
+            {
+                m_d2dContext->DrawLine(previous, current, m_accent.get(), Scaled(1));
+            }
+            previous = current;
         }
     }
 
@@ -937,20 +1169,114 @@ namespace agshot
             if (target != ToolbarHitTarget::None) return HitTarget::ToolbarButton;
         }
 
-        if (!m_hasSelection || !PtInRect(&m_selection, point))
+        if (!m_hasSelection)
         {
             return HitTarget::Canvas;
         }
+
         if (m_mode == OperationMode::TextRecognition)
         {
+            // Only a scrollbar that exists answers as one. The track spans the
+            // box whether or not there is anything to scroll, so reporting it
+            // unconditionally would put an arrow over a strip of the text.
             const RECT track = OcrScrollTrack();
-            return PtInRect(&track, point) ? HitTarget::OcrScrollbar : HitTarget::OcrText;
+            if (OcrScrollMaximum() > 0.0f && PtInRect(&track, point))
+            {
+                return HitTarget::OcrScrollbar;
+            }
+            return PtInRect(&m_selection, point) ? HitTarget::OcrText : HitTarget::Canvas;
         }
-        if (!m_smart && HitTestSelection(m_selection, point, m_handleSize) != SelectionPart::None)
+
+        if (!m_smart)
         {
-            return HitTarget::SelectionHandle;
+            // The handles are consulted before the rectangle, because half of
+            // each edge handle lies outside it: PtInRect excludes the right and
+            // bottom edges, so testing the rectangle first left the outer half
+            // of the right, bottom and three corner handles unable to answer.
+            const SelectionPart part = HitTestSelection(m_selection, point, m_handleSize);
+            if (part == SelectionPart::Body)
+            {
+                return HitTarget::Selection;
+            }
+            if (part != SelectionPart::None)
+            {
+                return HitTarget::SelectionHandle;
+            }
         }
-        return HitTarget::Selection;
+
+        return PtInRect(&m_selection, point) ? HitTarget::Selection : HitTarget::Canvas;
+    }
+
+    LPCWSTR Overlay::CursorShapeForPoint(POINT point) const noexcept
+    {
+        // A drag keeps the shape it started with, so the pointer does not flicker
+        // as the rectangle it is dragging moves out from under it.
+        if (m_dragMode == DragMode::MoveOrResize)
+        {
+            return CursorForPart(m_dragPart);
+        }
+        if (m_dragMode == DragMode::ToolbarMove)
+        {
+            return IDC_SIZEALL;
+        }
+        if (m_dragMode == DragMode::NewRectangle)
+        {
+            // Drawing, not resizing. The rectangle follows the pointer, so it is
+            // always under it and would otherwise be read as a handle.
+            return IDC_CROSS;
+        }
+
+        switch (HitTest(point))
+        {
+        case HitTarget::ToolbarHandle:
+            return IDC_SIZEALL;
+        case HitTarget::ToolbarButton:
+            return IDC_HAND;
+        case HitTarget::ToolbarPanel:
+        case HitTarget::OcrScrollbar:
+            return IDC_ARROW;
+        case HitTarget::OcrText:
+            return IDC_IBEAM;
+        case HitTarget::SelectionHandle:
+            return CursorForPart(HitTestSelection(m_selection, point, m_handleSize));
+        case HitTarget::Selection:
+            // While the rectangle is still a suggestion the user is choosing, not
+            // moving: pressing it either confirms it or starts a new one, so the
+            // crosshair is what the press actually does. Only once it has been
+            // settled - confirmed with a click, or drawn - does it become
+            // something to drag around. Its edges are reported as handles by
+            // then, so this is never a resize target.
+            return m_smart ? IDC_CROSS : IDC_SIZEALL;
+        case HitTarget::Canvas:
+        default:
+            // Text is read, not outlined, so the crosshair only means something
+            // while a selection is being drawn.
+            return m_mode == OperationMode::TextRecognition ? IDC_ARROW : IDC_CROSS;
+        }
+    }
+
+    void Overlay::ApplyCursor()
+    {
+        if (m_window == nullptr || !IsWindowVisible(m_window))
+        {
+            return;
+        }
+
+        POINT point{};
+        if (!GetCursorPos(&point))
+        {
+            return;
+        }
+        ScreenToClient(m_window, &point);
+
+        // SetCursor acts on whichever window of this thread the pointer is over,
+        // so there is nothing to set while it is somewhere else.
+        const RECT bounds = ClientBounds();
+        if (!PtInRect(&bounds, point))
+        {
+            return;
+        }
+        SetCursor(LoadCursorW(nullptr, CursorShapeForPoint(point)));
     }
 
     void Overlay::UpdateHover(POINT point)
@@ -1015,6 +1341,8 @@ namespace agshot
     void Overlay::UpdateOcrSelection(POINT point)
     {
         m_ocrSelectionPoint = point;
+        const float oldScrollY = m_ocrScrollY;
+        const std::size_t oldCaret = m_ocrCaret;
         const RECT box = OcrTextBox();
         const LONG inset = static_cast<LONG>(Scaled(9));
         const LONG top = box.top + inset;
@@ -1032,7 +1360,10 @@ namespace agshot
                 m_ocrScrollY + (point.y < top ? -step : step), 0.0f, OcrScrollMaximum());
         }
         m_ocrCaret = OcrPositionFromPoint(POINT{ clampedX, clampedY });
-        RequestRender();
+        if (m_ocrCaret != oldCaret || m_ocrScrollY != oldScrollY)
+        {
+            RequestRender();
+        }
     }
 
     void Overlay::StopOcrSelection() noexcept
@@ -1044,21 +1375,59 @@ namespace agshot
         }
     }
 
+    bool Overlay::PointerEvent(WPARAM wparam, POINTER_INFO& info, POINT& point) const noexcept
+    {
+        info = POINTER_INFO{};
+        if (!GetPointerInfo(GET_POINTERID_WPARAM(wparam), &info))
+        {
+            return false;
+        }
+
+        // Pointer coordinates are screen pixels; everything downstream works in
+        // client pixels.
+        point = POINT{ info.ptPixelLocation.x, info.ptPixelLocation.y };
+        ScreenToClient(m_window, &point);
+        return true;
+    }
+
     void Overlay::OnMouseMove(POINT point)
     {
-        m_pointer = point;
-
-        if (!m_trackingLeave)
+        // Windows generates spurious WM_MOUSEMOVE messages as a side effect of
+        // mouse cursor recalculations. When Windows recomputes the cursor it sets
+        // the "the mouse moved" flag on the thread that owns the window under the
+        // cursor, and that window is then told it has the cursor and should set
+        // an appropriate shape - as a WM_NCHITTEST / WM_SETCURSOR / WM_MOUSEMOVE
+        // sequence for a position that has not changed at all. Raymond Chen
+        // explains the mechanism and what triggers it in "Why do I get a spurious
+        // WM_MOUSEMOVE message whenever Resource Manager is running?"
+        // (https://devblogs.microsoft.com/oldnewthing/20160616-00/?p=93685/):
+        // the default WM_SETREDRAW implementation makes a window
+        // "pseudo-invisible" while redrawing is disabled, and undoing that fakery
+        // when redrawing is re-enabled is what produces the message. Any other
+        // process that does that on a timer therefore shows up here as a burst at
+        // a fixed interval with an unchanging point. That is somebody else's
+        // activity, not ours, and nothing here can stop it.
+        //
+        // The concrete case here was SystemInformer (Process Hacker): its
+        // ToolStatus plugin updates its status bar every 500 ms (UpdateInterval)
+        // wrapped in exactly that WM_SETREDRAW pair, and while it was running this
+        // window received one of these messages every 500 ms with an unchanging
+        // point. Suspending that process stopped them; resuming it brought them
+        // straight back.
+        //
+        // What is ours is the cost: each one would reach RequestRender() at the
+        // end of this function and repaint the whole surface, so that interval
+        // would become this overlay's idle redraw rate. Chen's advice for exactly
+        // this case is to drop a mouse move whose coordinates repeat the previous
+        // one, provided our own state has not changed in between - if it has, the
+        // message still has to be processed, because the answer may be different
+        // the second time around.
+        if (point.x == m_pointer.x && point.y == m_pointer.y)
         {
-            TRACKMOUSEEVENT track{};
-            track.cbSize = sizeof(track);
-            track.dwFlags = TME_LEAVE;
-            track.hwndTrack = m_window;
-            if (TrackMouseEvent(&track))
-            {
-                m_trackingLeave = true;
-            }
+            return;
         }
+
+        m_pointer = point;
 
         if (m_ocrScrollDragging)
         {
@@ -1139,7 +1508,12 @@ namespace agshot
 
     void Overlay::OnLeftButtonDown(POINT point)
     {
-        SetCapture(m_window);
+        // No capture is taken. The window covers the whole virtual screen, so
+        // the pointer cannot leave it and there is nothing to capture for - and
+        // SetCapture does not work here anyway: the process enables mouse-in-
+        // pointer, which makes the mouse a pointer, and mouse capture does not
+        // apply to pointer input. A pointer has to be captured with
+        // SetPointerCapture, which this does not need.
         const HitTarget hit = HitTest(point);
 
         if (hit == HitTarget::ToolbarButton || hit == HitTarget::ToolbarHandle
@@ -1257,10 +1631,6 @@ namespace agshot
     void Overlay::OnLeftButtonUp(POINT point)
     {
         m_pointer = point;
-        if (GetCapture() == m_window)
-        {
-            ReleaseCapture();
-        }
 
         if (m_ocrScrollDragging)
         {
@@ -1478,6 +1848,61 @@ namespace agshot
         Cancel();
     }
 
+    // Crops the frozen screen to the selection and hands it over as the 24bpp
+    // BGR the engine expects. The capture is top-down BGRA, so this is a copy
+    // with the alpha dropped.
+    ppocr::ImageBGR Overlay::OcrImageForSelection() const
+    {
+        ppocr::ImageBGR image;
+        if (m_image.empty())
+        {
+            return image;
+        }
+
+        // The selection is in overlay coordinates and the frozen picture knows
+        // where on the desktop it was taken, so the two are lined up here.
+        const RECT& region = m_image.region();
+        RECT crop{
+            m_selection.left + m_bounds.left - region.left,
+            m_selection.top + m_bounds.top - region.top,
+            m_selection.right + m_bounds.left - region.left,
+            m_selection.bottom + m_bounds.top - region.top };
+        crop.left = std::clamp<LONG>(crop.left, 0, m_image.width());
+        crop.top = std::clamp<LONG>(crop.top, 0, m_image.height());
+        crop.right = std::clamp<LONG>(crop.right, crop.left, m_image.width());
+        crop.bottom = std::clamp<LONG>(crop.bottom, crop.top, m_image.height());
+
+        const int width = static_cast<int>(crop.right - crop.left);
+        const int height = static_cast<int>(crop.bottom - crop.top);
+        if (width <= 0 || height <= 0)
+        {
+            return image;
+        }
+
+        // TODO(ocr-input): do this with zero copies. The engine should read the capture where it
+        // lies - the capture is already 32-bit BGRA - instead of the whole selection being
+        // repacked into 24-bit BGR here, on the UI thread, on every recognition.
+        const BYTE* source = static_cast<const BYTE*>(m_image.pixels());
+        const int stride = m_image.stride();
+        image.width = width;
+        image.height = height;
+        image.channels = 3;
+        image.data.resize(static_cast<std::size_t>(width) * height * 3);
+        for (int y = 0; y < height; ++y)
+        {
+            const BYTE* row = source + static_cast<std::size_t>(crop.top + y) * stride
+                + static_cast<std::size_t>(crop.left) * 4;
+            uint8_t* out = image.data.data() + static_cast<std::size_t>(y) * width * 3;
+            for (int x = 0; x < width; ++x)
+            {
+                out[x * 3 + 0] = row[x * 4 + 0];
+                out[x * 3 + 1] = row[x * 4 + 1];
+                out[x * 3 + 2] = row[x * 4 + 2];
+            }
+        }
+        return image;
+    }
+
     void Overlay::EnterTextRecognitionMode()
     {
         if (!m_hasSelection)
@@ -1487,12 +1912,26 @@ namespace agshot
 
         if (!m_ocrCacheValid || !EqualRect(&m_ocrCacheSelection, &m_selection))
         {
-            m_ocrText = L"AGShot text recognition preview\r\n\r\nThis is mock OCR content for the selected area. Select part of this text with the mouse or keyboard, then copy it.\r\n\r\nThe recognized text stays cached while the selection remains unchanged.";
             m_ocrCacheSelection = m_selection;
             m_ocrCacheValid = true;
             m_ocrCaret = 0;
             m_ocrAnchor = 0;
             m_ocrScrollY = 0.0f;
+
+            // The box stays empty until there is something to put in it: while a
+            // capture is being recognized it shows the spinner instead, and a
+            // missing model payload is the one case that has text of its own.
+            const bool canRecognize = m_ocrRuntime != nullptr && m_ocrRuntime->available();
+            m_ocrPending = false;
+            m_ocrText = canRecognize ? std::wstring{} : L"OCR models are unavailable.";
+            if (canRecognize)
+            {
+                LARGE_INTEGER now{};
+                QueryPerformanceCounter(&now);
+                m_ocrCompletion = m_ocrRuntime->Submit(m_window, OcrImageForSelection());
+                m_ocrPending = static_cast<bool>(m_ocrCompletion);
+                m_ocrPendingStart = now.QuadPart;
+            }
         }
 
         m_mode = OperationMode::TextRecognition;
@@ -1589,18 +2028,33 @@ namespace agshot
                      static_cast<LONG>(thumbTop + thumbHeight) };
     }
 
-    winrt::com_ptr<IDWriteTextLayout> Overlay::CreateOcrTextLayout() const
+    winrt::com_ptr<IDWriteTextLayout> Overlay::OcrTextLayout() const
     {
         const RECT box = OcrTextBox();
         const float padding = Scaled(9);
         const float width = std::max(1.0f, static_cast<float>(box.right - box.left)
             - padding * 2.0f - Scaled(kOcrScrollGutter));
-        winrt::com_ptr<IDWriteTextLayout> layout;
-        AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextLayout(
-            m_ocrText.c_str(), static_cast<UINT32>(m_ocrText.size()),
-            m_textFormat.get(), width, 100000.0f, layout.put()));
-        AGSHOT_CHECK_HR(layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP));
-        return layout;
+
+        // Shaping and line-breaking a whole recognition result is far too
+        // expensive to repeat for every frame, and it is what this used to do.
+        // The text format is handled by explicit invalidation when its settings
+        // change, so the remaining cache key is the text and its wrap width.
+        if (!m_ocrLayout
+            || m_ocrLayoutText != m_ocrText
+            || m_ocrLayoutWidth != width)
+        {
+            m_ocrLayout = nullptr;
+            AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextLayout(
+                m_ocrText.c_str(), static_cast<UINT32>(m_ocrText.size()),
+                m_textFormat.get(), width, 100000.0f, m_ocrLayout.put()));
+            AGSHOT_CHECK_HR(m_ocrLayout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP));
+            m_ocrLayoutText = m_ocrText;
+            m_ocrLayoutWidth = width;
+            // A fresh layout carries no drawing effect, so nothing is highlighted.
+            m_ocrLayoutHighlightFirst = 0;
+            m_ocrLayoutHighlightLast = 0;
+        }
+        return m_ocrLayout;
     }
 
     std::size_t Overlay::OcrPositionFromPoint(POINT point) const
@@ -1621,7 +2075,7 @@ namespace agshot
         const float y = std::max(0.0f, static_cast<float>(
             std::clamp(point.y, textTop, std::max(textTop, textBottom - 1)) - box.top)
             - padding + m_ocrScrollY);
-        auto layout = CreateOcrTextLayout();
+        auto layout = OcrTextLayout();
         BOOL trailing = FALSE;
         BOOL inside = FALSE;
         DWRITE_HIT_TEST_METRICS metrics{};
@@ -1639,7 +2093,7 @@ namespace agshot
         {
             return 0.0f;
         }
-        auto layout = CreateOcrTextLayout();
+        auto layout = OcrTextLayout();
         DWRITE_TEXT_METRICS metrics{};
         AGSHOT_CHECK_HR(layout->GetMetrics(&metrics));
         const RECT box = OcrTextBox();
@@ -1650,7 +2104,7 @@ namespace agshot
 
     void Overlay::EnsureOcrCaretVisible()
     {
-        auto layout = CreateOcrTextLayout();
+        auto layout = OcrTextLayout();
         FLOAT x = 0.0f;
         FLOAT y = 0.0f;
         DWRITE_HIT_TEST_METRICS caret{};
@@ -1705,7 +2159,7 @@ namespace agshot
         }
         else if (key == VK_UP || key == VK_DOWN)
         {
-            auto layout = CreateOcrTextLayout();
+            auto layout = OcrTextLayout();
             FLOAT x = 0.0f;
             FLOAT y = 0.0f;
             DWRITE_HIT_TEST_METRICS caret{};
@@ -1761,6 +2215,16 @@ namespace agshot
         POINT updateOffset{};
         AGSHOT_CHECK_HR(m_surface->BeginDraw(
             &update, __uuidof(IDXGISurface), updateSurface.put_void(), &updateOffset));
+
+        const bool collectStats = m_showStats;
+        LARGE_INTEGER renderStart{};
+        if (collectStats)
+        {
+            // The frame's generation cost is timed from here to the end of EndDraw.
+            // Acquiring the tile above and presenting below are excluded on purpose:
+            // both can wait on the compositor, and a wait is not work.
+            QueryPerformanceCounter(&renderStart);
+        }
 
         // One DIP per pixel, so that what is drawn and what gets captured are the
         // same thing and no scaling creeps in between them.
@@ -1822,15 +2286,32 @@ namespace agshot
         {
             DrawPixelMagnifier();
         }
+        DrawDebugStats();
 
         m_d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
         AGSHOT_CHECK_HR(m_d2dContext->EndDraw());
+
+        if (collectStats)
+        {
+            LARGE_INTEGER renderEnd{};
+            QueryPerformanceCounter(&renderEnd);
+            const float renderMs = static_cast<float>(
+                static_cast<double>(renderEnd.QuadPart - renderStart.QuadPart) * 1000.0
+                / static_cast<double>(PerformanceCounterFrequency()));
+            // Smoothed for the same reason the interval is: a single frame's time is
+            // far too noisy to read.
+            m_statsRenderMs += (renderMs - m_statsRenderMs) * 0.1f;
+        }
 
         m_d2dContext->SetTarget(nullptr);
         tile = nullptr;
 
         AGSHOT_CHECK_HR(m_surface->EndDraw());
         AGSHOT_CHECK_HR(m_composition->Commit());
+
+        // Counted after the work is done, so the number describes frames that
+        // actually reached the screen.
+        RecordFrame();
     }
 
     void Overlay::DrawDim()
@@ -1891,6 +2372,14 @@ namespace agshot
         m_d2dContext->FillRectangle(ToRectF(box), m_handleFill.get());
         m_d2dContext->DrawRectangle(ToRectF(box), m_handleEdge.get(), Scaled(1));
 
+        // While a capture is being recognized the box holds the spinner instead
+        // of text, so an empty box is never mistaken for an empty result.
+        if (m_ocrPending)
+        {
+            DrawOcrSpinner();
+            return;
+        }
+
         const float padding = Scaled(9);
         // The render target works a DIP per pixel, so a fractional scroll offset
         // would land the text on half pixels and make it shimmer as it moves.
@@ -1903,29 +2392,51 @@ namespace agshot
             static_cast<float>(box.left), static_cast<float>(box.top),
             static_cast<float>(box.right), static_cast<float>(box.bottom));
         m_d2dContext->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
-        auto layout = CreateOcrTextLayout();
+        auto layout = OcrTextLayout();
 
         const std::size_t first = std::min(m_ocrAnchor, m_ocrCaret);
         const std::size_t last = std::max(m_ocrAnchor, m_ocrCaret);
         if (last > first)
         {
-            std::vector<DWRITE_HIT_TEST_METRICS> metrics(m_ocrText.size() + 1);
+            // Reused, so this does not allocate a vector the size of the text on
+            // every frame.
+            m_ocrHitMetrics.resize(m_ocrText.size() + 1);
             UINT32 count = 0;
             if (SUCCEEDED(layout->HitTestTextRange(
                     static_cast<UINT32>(first), static_cast<UINT32>(last - first),
-                    origin.x, origin.y, metrics.data(), static_cast<UINT32>(metrics.size()), &count)))
+                    origin.x, origin.y, m_ocrHitMetrics.data(),
+                    static_cast<UINT32>(m_ocrHitMetrics.size()), &count)))
             {
                 for (UINT32 i = 0; i < count; ++i)
                 {
-                    const auto& item = metrics[i];
+                    const auto& item = m_ocrHitMetrics[i];
                     m_d2dContext->FillRectangle(
                         D2D1::RectF(item.left, item.top, item.left + item.width, item.top + item.height),
                         m_accent.get());
                 }
             }
-            DWRITE_TEXT_RANGE range{ static_cast<UINT32>(first), static_cast<UINT32>(last - first) };
-            AGSHOT_CHECK_HR(layout->SetDrawingEffect(m_handleFill.get(), range));
         }
+
+        // The layout now outlives the frame, so the selection's drawing effect has
+        // to be taken off the old range before it is put on the new one; leaving
+        // it set would keep the previous selection filled.
+        if (m_ocrLayoutHighlightFirst != first || m_ocrLayoutHighlightLast != last)
+        {
+            if (m_ocrLayoutHighlightLast > m_ocrLayoutHighlightFirst)
+            {
+                AGSHOT_CHECK_HR(layout->SetDrawingEffect(nullptr, DWRITE_TEXT_RANGE{
+                    static_cast<UINT32>(m_ocrLayoutHighlightFirst),
+                    static_cast<UINT32>(m_ocrLayoutHighlightLast - m_ocrLayoutHighlightFirst) }));
+            }
+            if (last > first)
+            {
+                AGSHOT_CHECK_HR(layout->SetDrawingEffect(m_handleFill.get(), DWRITE_TEXT_RANGE{
+                    static_cast<UINT32>(first), static_cast<UINT32>(last - first) }));
+            }
+            m_ocrLayoutHighlightFirst = first;
+            m_ocrLayoutHighlightLast = last;
+        }
+
         m_d2dContext->DrawTextLayout(origin, layout.get(), m_handleEdge.get());
 
         FLOAT caretX = 0.0f;
@@ -1955,22 +2466,101 @@ namespace agshot
         }
     }
 
+    // Creates the effect that draws the spinner. Its shader is compiled once and
+    // its constants are the only thing that changes per frame.
+    void Overlay::CreateSpinnerEffect()
+    {
+        m_spinnerEffect = nullptr;
+        if (!m_d2dFactory || !m_d2dContext)
+        {
+            return;
+        }
+
+        winrt::com_ptr<ID2D1Factory1> factory1;
+        if (FAILED(m_d2dFactory->QueryInterface(factory1.put())))
+        {
+            return;
+        }
+        if (FAILED(SpinnerEffect::Register(factory1.get())))
+        {
+            return;
+        }
+        if (FAILED(m_d2dContext->CreateEffect(SpinnerEffect::ClassId(), m_spinnerEffect.put())))
+        {
+            m_spinnerEffect = nullptr;
+        }
+    }
+
+    // The arc is turned by the clock rather than by a frame count so its speed
+    // does not follow the compositor's rate. The fade comes from the shader, so
+    // the head is opaque and the tail falls off continuously. The box is empty
+    // behind it, so this is the only mark that says work is still going on.
+    void Overlay::DrawOcrSpinner()
+    {
+        if (!m_spinnerEffect)
+        {
+            return;
+        }
+
+        const RECT box = OcrTextBox();
+        const float centerX = static_cast<float>(box.left + box.right) * 0.5f;
+        const float centerY = static_cast<float>(box.top + box.bottom) * 0.5f;
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const double elapsedMs = static_cast<double>(now.QuadPart - m_ocrPendingStart)
+            * 1000.0 / static_cast<double>(PerformanceCounterFrequency());
+        const float turn = static_cast<float>(
+            std::fmod(elapsedMs / static_cast<double>(kOcrSpinnerPeriodMs), 1.0)) * 360.0f;
+
+        SpinnerParameters parameters;
+        parameters.radius = Scaled(kOcrSpinnerRadius);
+        parameters.half_stroke = Scaled(kOcrSpinnerStroke) * 0.5f;
+        parameters.sweep = kOcrSpinnerSweepDeg * kDegreesToRadians;
+        parameters.tail_alpha = 0.15f;
+        parameters.feather = 1.0f;
+        SpinnerEffect::SetNextParameters(parameters);
+
+        // The effect draws the arc on its own origin and the same size every
+        // time, so Direct2D rasterizes it once and reuses that. The turn and the
+        // move into the box are this transform, which is what keeps the cached
+        // rasterization correct instead of something that has to be invalidated.
+        //
+        // The context already carries the surface offset, so the turn is composed
+        // in front of it rather than replacing it.
+        D2D1_MATRIX_3X2_F saved{};
+        m_d2dContext->GetTransform(&saved);
+        m_d2dContext->SetTransform(
+            D2D1::Matrix3x2F::Rotation(turn)
+            * D2D1::Matrix3x2F::Translation(centerX, centerY)
+            * saved);
+
+        m_d2dContext->DrawImage(m_spinnerEffect.get(),
+                                D2D1_INTERPOLATION_MODE_LINEAR,
+                                D2D1_COMPOSITE_MODE_SOURCE_OVER);
+
+        m_d2dContext->SetTransform(saved);
+    }
+
     void Overlay::DrawSizeLabel()
     {
         wchar_t text[64]{};
         const RECT& selection = m_smart ? m_displaySelection : m_selection;
-        swprintf_s(text, L"%d x %d",
-                   selection.right - selection.left,
-                   selection.bottom - selection.top);
+        const LONG selectionWidth = selection.right - selection.left;
+        const LONG selectionHeight = selection.bottom - selection.top;
+        swprintf_s(text, L"%d x %d", selectionWidth, selectionHeight);
 
-        winrt::com_ptr<IDWriteTextLayout> layout;
-        AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextLayout(
-            text,
-            static_cast<UINT32>(wcslen(text)),
-            m_textFormat.get(),
-            static_cast<float>(m_width),
-            static_cast<float>(m_height),
-            layout.put()));
+        if (!m_sizeLabelValid || !EqualRect(&m_sizeLabelSelection, &selection))
+        {
+            m_sizeLabelLayout = nullptr;
+            AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextLayout(
+                text, static_cast<UINT32>(wcslen(text)), m_textFormat.get(),
+                static_cast<float>(m_width), static_cast<float>(m_height),
+                m_sizeLabelLayout.put()));
+            m_sizeLabelSelection = selection;
+            m_sizeLabelValid = true;
+        }
+        const auto& layout = m_sizeLabelLayout;
 
         DWRITE_TEXT_METRICS metrics{};
         AGSHOT_CHECK_HR(layout->GetMetrics(&metrics));
@@ -2188,6 +2778,9 @@ namespace agshot
         const auto drawCenteredText = [this](const wchar_t* text, const D2D1_RECT_F& bounds,
                                               ID2D1SolidColorBrush* brush)
         {
+            // Deliberately not cached: both labels are built from the sampled
+            // point, so the text is different on every pointer move and there is
+            // nothing to reuse.
             winrt::com_ptr<IDWriteTextLayout> layout;
             AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextLayout(
                 text, static_cast<UINT32>(wcslen(text)), m_magnifierTextFormat.get(),
@@ -2283,9 +2876,10 @@ namespace agshot
 
 #ifdef AGSHOT_TOOLBAR_PROOF
     bool Overlay::ExportToolbarProof(const wchar_t* path, int dpi, bool textRecognitionActive,
-                                     float ocrScrollProbe)
+                                     float ocrScrollProbe, bool ocrSpinnerProbe)
     {
         m_ocrScrollProbe = ocrScrollProbe;
+        m_ocrSpinnerProbe = ocrSpinnerProbe;
         m_dpi = dpi;
         m_handleSize = MulDiv(kHandleSize, m_dpi, 96);
         m_mode = textRecognitionActive ? OperationMode::TextRecognition
@@ -2314,6 +2908,7 @@ namespace agshot
             AGSHOT_CHECK_HR(m_d2dFactory->CreateDevice(m_dxgiDevice.get(), m_d2dDevice.put()));
             AGSHOT_CHECK_HR(m_d2dDevice->CreateDeviceContext(
                 D2D1_DEVICE_CONTEXT_OPTIONS_NONE, m_d2dContext.put()));
+            CreateSpinnerEffect();
         }
 
         // Small enough that the mock text overflows and the scrollbar appears.
@@ -2335,6 +2930,18 @@ namespace agshot
             // A sub-pixel scroll offset, so the render proves the text lands on
             // whole pixels rather than on softened half ones.
             m_ocrScrollY = m_ocrScrollProbe;
+
+            // The spinner probe proves the loading state: the box is empty and
+            // the mark is at a fixed quarter turn, so the image is reproducible.
+            m_ocrPending = m_ocrSpinnerProbe;
+            if (m_ocrPending)
+            {
+                m_ocrText.clear();
+                LARGE_INTEGER now{};
+                QueryPerformanceCounter(&now);
+                m_ocrPendingStart = now.QuadPart
+                    - PerformanceCounterFrequency() * kOcrSpinnerPeriodMs / 4000;
+            }
         }
 
         // The mark geometry depends on the DPI, and the normal startup path is
@@ -2569,14 +3176,18 @@ namespace agshot
             return;
         }
 
-        winrt::com_ptr<IDWriteTextLayout> layout;
-        AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextLayout(
-            text,
-            static_cast<UINT32>(wcslen(text)),
-            m_textFormat.get(),
-            static_cast<float>(m_width),
-            static_cast<float>(m_height),
-            layout.put()));
+        // A button's label never changes, so this is built when the hovered button
+        // changes rather than on every frame the tooltip is up.
+        if (!m_tooltipLayout || m_tooltipLayoutButton != m_toolbar.hovered)
+        {
+            m_tooltipLayout = nullptr;
+            AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextLayout(
+                text, static_cast<UINT32>(wcslen(text)), m_textFormat.get(),
+                static_cast<float>(m_width), static_cast<float>(m_height),
+                m_tooltipLayout.put()));
+            m_tooltipLayoutButton = m_toolbar.hovered;
+        }
+        const auto& layout = m_tooltipLayout;
 
         DWRITE_TEXT_METRICS metrics{};
         AGSHOT_CHECK_HR(layout->GetMetrics(&metrics));
@@ -2616,6 +3227,38 @@ namespace agshot
     {
         switch (message)
         {
+        case kOcrResultMessage:
+        {
+            using CompletionMessage = std::shared_ptr<OcrCompletion>;
+            std::unique_ptr<CompletionMessage> completionMessage{
+                reinterpret_cast<CompletionMessage*>(lparam) };
+            const std::shared_ptr<OcrCompletion> completion =
+                completionMessage ? *completionMessage : nullptr;
+            if (completion && completion == m_ocrCompletion)
+            {
+                bool ok{};
+                std::wstring text;
+                std::wstring error;
+                {
+                    std::lock_guard lock(completion->mutex);
+                    ok = completion->ok;
+                    text = completion->text;
+                    error = completion->error;
+                }
+
+                // The worker has completed; the UI can consume this completion.
+                m_ocrPending = false;
+                m_ocrText = ok ? std::move(text)
+                                : L"OCR failed: " + std::move(error);
+                if (m_ocrText.empty() && ok) m_ocrText = L"No text found.";
+                m_ocrCaret = 0;
+                m_ocrAnchor = 0;
+                m_ocrScrollY = 0.0f;
+                if (m_mode == OperationMode::TextRecognition) RequestRender();
+            }
+            return 0;
+        }
+
         case WM_DPICHANGED:
             m_dpi = HIWORD(wparam);
             if (m_dpi <= 0)
@@ -2623,6 +3266,7 @@ namespace agshot
                 m_dpi = 96;
             }
             m_handleSize = MulDiv(kHandleSize, m_dpi, 96);
+            InvalidateTextLayouts();
             if (m_textFormat)
             {
                 m_textFormat = nullptr;
@@ -2639,6 +3283,14 @@ namespace agshot
                     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
                     Scaled(MeasuredPixels(18.0f)), L"en-US",
                     m_magnifierTextFormat.put()));
+            }
+            if (m_statsTextFormat)
+            {
+                m_statsTextFormat = nullptr;
+                AGSHOT_CHECK_HR(m_dwriteFactory->CreateTextFormat(
+                    L"Consolas", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                    Scaled(11), L"en-US", m_statsTextFormat.put()));
             }
             if (m_toolbarVisible)
             {
@@ -2675,6 +3327,7 @@ namespace agshot
                 std::lock_guard lock(m_animationFrameSignal->mutex);
                 m_animationFrameSignal->posted = false;
             }
+
             if (m_animatingSelection)
             {
                 LARGE_INTEGER now{};
@@ -2682,7 +3335,13 @@ namespace agshot
                 AdvanceSelectionAnimation(now.QuadPart);
             }
             Render();
-            if (!m_animatingSelection)
+            // The clock also has to keep running while the spinner is up: it is
+            // what advances the mark rather than letting it sit still. The debug
+            // readout is deliberately not a reason to keep it running: a frame
+            // rate display that generates the frames it measures would be
+            // reporting its own cost and nothing else.
+            if (!m_animatingSelection
+                && !(m_mode == OperationMode::TextRecognition && m_ocrPending))
             {
                 StopAnimationClock();
             }
@@ -2710,17 +3369,109 @@ namespace agshot
             // rather than the thing underneath it.
             return 0;
 
-        // TODO(pointer): this mouse handling is still the legacy WM_MOUSE* /
-        // WM_LBUTTON* family. The process already opts into mouse-in-pointer, and
-        // the system only keeps posting these because nothing here answers
-        // WM_POINTER, so move the whole hit and click path onto WM_POINTERDOWN /
-        // WM_POINTERUP / WM_POINTERUPDATE and keep the click count here.
-        // CS_DBLCLKS is not the answer: WM_LBUTTONDBLCLK is the only click-count
-        // message Windows defines, so it cannot express a triple click at all,
-        // and it puts the count in the OS where this code cannot see it.
-        // Blocked on that, double click selects the word and triple click the
-        // paragraph in the text-recognition box; both belong in the pointer
-        // handler above, not on a second code path of their own.
+        // Pointer messages are handled when Windows delivers them. The legacy
+        // mouse handlers below remain present for WM_MOUSE* input.
+        // TODO(clickcount): double click should select the word and triple click
+        // the paragraph in the text-recognition box. That count belongs here,
+        // where the sequence is visible, and not in CS_DBLCLKS: WM_LBUTTONDBLCLK
+        // is the only click-count message Windows defines, so it cannot express a
+        // triple click at all, and it puts the count somewhere this code cannot
+        // read it.
+        case WM_POINTERUPDATE:
+        case WM_POINTERDOWN:
+        case WM_POINTERUP:
+        {
+            POINTER_INFO info{};
+            POINT point{};
+            if (!PointerEvent(wparam, info, point))
+            {
+                // Not a pointer this overlay handles, so it is not ours to
+                // answer; letting it through keeps the system's own handling.
+                break;
+            }
+
+            // One message can carry a move and a button change at once, and the
+            // change is the one that must not be missed.
+            switch (info.ButtonChangeType)
+            {
+            case POINTER_CHANGE_FIRSTBUTTON_DOWN:
+                OnLeftButtonDown(point);
+                return 0;
+            case POINTER_CHANGE_FIRSTBUTTON_UP:
+                OnLeftButtonUp(point);
+                return 0;
+            case POINTER_CHANGE_SECONDBUTTON_UP:
+                // Up, not down: the legacy path opened the menu on
+                // WM_RBUTTONUP, and the menu taking the release is the
+                // behaviour that was already here.
+                ShowOcrContextMenu(point);
+                return 0;
+            default:
+                break;
+            }
+
+            OnMouseMove(point);
+            return 0;
+        }
+
+        case WM_POINTERENTER:
+        {
+            // Arriving over the overlay is a move as far as the rest of the code
+            // is concerned, and hover state follows from it.
+            POINTER_INFO info{};
+            POINT point{};
+            if (!PointerEvent(wparam, info, point))
+            {
+                break;
+            }
+            OnMouseMove(point);
+            return 0;
+        }
+
+        case WM_POINTERLEAVE:
+        {
+            // Nothing is hovered once the pointer is off the window. This is the
+            // pointer form of WM_MOUSELEAVE, and unlike that one it needs no
+            // tracking call to arm it.
+            m_toolbar.hovered = ToolbarButton::None;
+            RequestRender();
+            return 0;
+        }
+
+        case WM_POINTERWHEEL:
+        {
+            // Same coordinates as WM_MOUSEWHEEL: screen pixels, not client ones.
+            POINT point{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
+            ScreenToClient(hwnd, &point);
+            OnWheel(point, GET_WHEEL_DELTA_WPARAM(wparam));
+            return 0;
+        }
+
+        case WM_POINTERHWHEEL:
+            // A horizontal wheel has nothing to scroll here: the text box runs
+            // one way only.
+            return 0;
+
+        case WM_POINTERCAPTURECHANGED:
+        {
+            // This overlay never takes capture, so it only fires when something
+            // else does. A drag in progress would then never see its release, and
+            // the selection would keep following a pointer with no button held,
+            // so the drag is ended here instead.
+            if (m_dragMode != DragMode::None)
+            {
+                m_dragMode = DragMode::None;
+                m_dragPart = SelectionPart::None;
+                Settle();
+            }
+            m_ocrScrollDragging = false;
+            StopOcrSelection();
+            RequestRender();
+            return 0;
+        }
+
+        // Legacy mouse input. Kept as the fallback path described above; these
+        // only fire for events that did not arrive as pointer messages.
         case WM_MOUSEMOVE:
             OnMouseMove(POINT{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) });
             return 0;
@@ -2737,6 +3488,11 @@ namespace agshot
             ShowOcrContextMenu(POINT{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) });
             return 0;
 
+        case WM_MOUSELEAVE:
+            m_toolbar.hovered = ToolbarButton::None;
+            RequestRender();
+            return 0;
+
         case WM_MOUSEWHEEL:
         {
             // Wheel messages carry screen coordinates, not client ones.
@@ -2746,42 +3502,20 @@ namespace agshot
             return 0;
         }
 
-        case WM_MOUSELEAVE:
-            m_trackingLeave = false;
-            m_toolbar.hovered = ToolbarButton::None;
-            RequestRender();
-            return 0;
-
         case WM_SETCURSOR:
         {
-            LPCWSTR shape = m_mode == OperationMode::TextRecognition ? IDC_ARROW : IDC_CROSS;
-            const HitTarget hit = HitTest(m_pointer);
-            if (m_dragMode == DragMode::MoveOrResize)
+            // Anything but the client area belongs to the system.
+            if (LOWORD(lparam) != HTCLIENT)
             {
-                shape = CursorForPart(m_dragPart);
-            }
-            else if (m_dragMode == DragMode::ToolbarMove || hit == HitTarget::ToolbarHandle)
-            {
-                shape = IDC_SIZEALL;
-            }
-            else if (hit == HitTarget::ToolbarButton)
-            {
-                shape = IDC_HAND;
-            }
-            else if (hit == HitTarget::ToolbarPanel || hit == HitTarget::OcrScrollbar)
-            {
-                shape = IDC_ARROW;
-            }
-            else if (hit == HitTarget::OcrText)
-            {
-                shape = IDC_IBEAM;
-            }
-            else if (hit == HitTarget::SelectionHandle || hit == HitTarget::Selection)
-            {
-                shape = CursorForPart(HitTestSelection(m_selection, m_pointer, m_handleSize));
+                break;
             }
 
-            SetCursor(LoadCursorW(nullptr, shape));
+            // The shape comes from where the pointer really is, never from
+            // m_pointer: the system sends WM_SETCURSOR before the WM_MOUSEMOVE
+            // that would update it, so anything derived from the stored point
+            // describes where the pointer used to be. That is what made arriving
+            // somewhere show the shape of wherever the pointer came from.
+            ApplyCursor();
             return TRUE;
         }
 
@@ -2871,8 +3605,19 @@ namespace agshot
 
         case WM_CANCELMODE:
             StopOcrSelection();
-            if (GetCapture() == hwnd) ReleaseCapture();
             return 0;
+
+        case WM_NCDESTROY:
+        {
+            using CompletionMessage = std::shared_ptr<OcrCompletion>;
+            MSG pending{};
+            while (PeekMessageW(&pending, hwnd, kOcrResultMessage,
+                                kOcrResultMessage, PM_REMOVE))
+            {
+                delete reinterpret_cast<CompletionMessage*>(pending.lParam);
+            }
+            break;
+        }
 
         case WM_DESTROY:
             StopOcrSelection();

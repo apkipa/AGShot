@@ -16,28 +16,33 @@
 
 namespace agshot
 {
+    // Where the executable lives. Data that ships with the application goes
+    // next to it - the portable config file and the OCR model payload both work
+    // this way - so the search is always relative to the binary and never to the
+    // build layout or to whatever directory the process was started from.
+    std::filesystem::path ExecutableDirectory()
+    {
+        std::wstring buffer(MAX_PATH, L'\0');
+        for (;;)
+        {
+            const DWORD written = GetModuleFileNameW(
+                nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (written == 0)
+            {
+                return {};
+            }
+            if (written < buffer.size())
+            {
+                buffer.resize(written);
+                break;
+            }
+            buffer.resize(buffer.size() * 2);   // truncated: try again bigger
+        }
+        return std::filesystem::path{ buffer }.parent_path();
+    }
+
     namespace
     {
-        std::filesystem::path ExecutableDirectory()
-        {
-            std::wstring buffer(MAX_PATH, L'\0');
-            for (;;)
-            {
-                const DWORD written = GetModuleFileNameW(
-                    nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-                if (written == 0)
-                {
-                    return {};
-                }
-                if (written < buffer.size())
-                {
-                    buffer.resize(written);
-                    break;
-                }
-                buffer.resize(buffer.size() * 2);   // truncated: try again bigger
-            }
-            return std::filesystem::path{ buffer }.parent_path();
-        }
 
         std::filesystem::path RoamingAppData()
         {
@@ -171,6 +176,29 @@ namespace agshot
                 }
             }
 
+            if (const auto* node = table.get("debug"))
+            {
+                const auto* debug = node->as_table();
+                if (debug == nullptr)
+                {
+                    result.ok = false;
+                    result.error = L"debug must be a table";
+                    return result;
+                }
+
+                if (const auto* showStats = debug->get("showStats"))
+                {
+                    const auto value = showStats->value_exact<bool>();
+                    if (!value)
+                    {
+                        result.ok = false;
+                        result.error = L"debug.showStats must be true or false";
+                        return result;
+                    }
+                    parsed.debugShowStats = *value;
+                }
+            }
+
             if (const auto* node = table.get("screenshot"))
             {
                 const auto* screenshot = node->as_table();
@@ -233,12 +261,12 @@ namespace agshot
 
         result.config = parsed;
 
-        // Migration hook. 1 -> 2 added [window] and 2 -> 3 added [screenshot];
-        // in both cases an absent key already means the default, so stamping the
-        // new version is the whole upgrade - which still matters, because the
-        // rewrite is how the new keys reach a file written before they existed.
-        // Each future bump adds a real step here, keyed on the version that was
-        // just read.
+        // Migration hook. There is no step yet because no version has ever been
+        // released, so there is nothing in the wild to upgrade from. When a
+        // release changes the meaning of a key that already exists, bump
+        // kConfigVersion and add the step here, keyed on the version that was
+        // just read. For a newly added key no step is needed at all: an absent
+        // key already means its default.
         if (result.config.version < kConfigVersion)
         {
             result.config.version = kConfigVersion;
@@ -265,10 +293,14 @@ namespace agshot
         toml::table screenshot;
         screenshot.insert("hotkey", ToUtf8(FormatHotkey(config.screenshotHotkey)));
 
+        toml::table debug;
+        debug.insert("showStats", config.debugShowStats);
+
         toml::table table;
         table.insert("version", config.version);
         table.insert("window", std::move(window));
         table.insert("screenshot", std::move(screenshot));
+        table.insert("debug", std::move(debug));
 
         // toml++ would rather write single-quoted literal strings. The file is
         // meant to be read and edited by hand, and the comment above shows

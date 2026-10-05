@@ -1,8 +1,10 @@
 #pragma once
 
+#include "core/ocr_runtime.h"
 #include "core/screen_capture.h"
 #include "core/ui_element.h"
 #include "hud/selection.h"
+#include "hud/spinner_effect.h"
 #include "hud/toolbar.h"
 
 #include <windows.h>
@@ -14,6 +16,7 @@
 #include <winrt/base.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -46,6 +49,11 @@ namespace agshot
         void Destroy() noexcept;
 
         HWND window() const noexcept { return m_window; }
+        void SetOcrRuntime(OcrRuntime* runtime) noexcept { m_ocrRuntime = runtime; }
+
+        // Draws the frame rate and its recent history over everything else. A
+        // diagnostic, so it is off unless the configuration asks for it.
+        void SetDebugStats(bool show);
 
         // Covers the whole virtual screen and starts a fresh selection, following
         // the pointer until the user does something decisive.
@@ -61,7 +69,7 @@ namespace agshot
 
 #ifdef AGSHOT_TOOLBAR_PROOF
         bool ExportToolbarProof(const wchar_t* path, int dpi, bool textRecognitionActive,
-                                float ocrScrollProbe = 0.0f);
+                                float ocrScrollProbe = 0.0f, bool ocrSpinnerProbe = false);
 #endif
 
     private:
@@ -93,6 +101,7 @@ namespace agshot
         };
 
         void CreateDeviceIndependentResources();
+        void InvalidateTextLayouts() noexcept;
         void CreateCopyIconGeometry(float localStroke);
         void CreateDeviceResources();
         void CreateSizeDependentResources();
@@ -110,6 +119,11 @@ namespace agshot
         void ShowOcrContextMenu(POINT point);
         void UpdateOcrSelection(POINT point);
         void StopOcrSelection() noexcept;
+
+        // Resolves a pointer message into the information and the client-space
+        // point used by the pointer input path. False when pointer information
+        // cannot be read. Mouse, pen and touch use the same interaction path.
+        bool PointerEvent(WPARAM wparam, POINTER_INFO& info, POINT& point) const noexcept;
 
         void OnMouseMove(POINT point);
         void OnLeftButtonDown(POINT point);
@@ -132,11 +146,30 @@ namespace agshot
         RECT OcrTextBox() const noexcept;
         RECT OcrScrollTrack() const noexcept;
         RECT OcrScrollThumb() const;
-        winrt::com_ptr<IDWriteTextLayout> CreateOcrTextLayout() const;
+        // The laid-out OCR text. CreateTextLayout() shapes and line-breaks the
+        // whole result, so the layout is cached and only rebuilt when the text or
+        // the width it wraps to changes.
+        winrt::com_ptr<IDWriteTextLayout> OcrTextLayout() const;
         std::size_t OcrPositionFromPoint(POINT point) const;
         float OcrScrollMaximum() const;
         void EnsureOcrCaretVisible();
         void MoveOcrCaret(WPARAM key);
+        void DrawOcrSpinner();
+        void CreateSpinnerEffect();
+        ppocr::ImageBGR OcrImageForSelection() const;
+
+        // The pointer shape for a point in client coordinates, and the same
+        // thing applied to wherever the pointer actually is. Kept apart from the
+        // message handler because the shape also changes when the state behind it
+        // changes without the pointer having moved.
+        LPCWSTR CursorShapeForPoint(POINT point) const noexcept;
+        void ApplyCursor();
+
+        // Frame timing for the debug readout. Sampling happens at the end of
+        // Render(), so it measures what was actually drawn rather than what was
+        // asked for.
+        void RecordFrame() noexcept;
+        void DrawDebugStats();
 
         void ClearSurface();
         void DrawDim();
@@ -174,6 +207,9 @@ namespace agshot
         winrt::com_ptr<IDWriteFactory> m_dwriteFactory;
         winrt::com_ptr<IDWriteTextFormat> m_textFormat;
         winrt::com_ptr<IDWriteTextFormat> m_magnifierTextFormat;
+        // Fixed pitch, so the frame-rate digits do not shuffle sideways as the
+        // value changes.
+        winrt::com_ptr<IDWriteTextFormat> m_statsTextFormat;
         winrt::com_ptr<ID2D1StrokeStyle> m_roundStroke;
         // The same joins, but with square ends: the text-recognition mark is
         // traced from a reference image whose bars are cut off flat.
@@ -186,7 +222,17 @@ namespace agshot
         float m_copyLocalStroke{};
 #ifdef AGSHOT_TOOLBAR_PROOF
         float m_ocrScrollProbe{};
+        // Renders the recognition spinner instead of the text, at a fixed phase
+        // so a proof image is reproducible.
+        bool m_ocrSpinnerProbe{};
 #endif
+        // The spinner is drawn by a custom effect that evaluates the conic
+        // gradient per pixel, so nothing here is tessellated or banded. One
+        // instance is enough: the arc's shape never changes, so Direct2D caches
+        // its rasterization and the turning comes from the transform it is drawn
+        // under.
+        winrt::com_ptr<ID2D1Effect> m_spinnerEffect;
+
         winrt::com_ptr<ID2D1Layer> m_magnifierLayer;
         winrt::com_ptr<IDCompositionDevice> m_composition;
         winrt::com_ptr<IDCompositionTarget> m_target;
@@ -227,6 +273,15 @@ namespace agshot
         bool m_smart{true};
         OperationMode m_mode{ OperationMode::EditSelection };
         std::wstring m_ocrText;
+        OcrRuntime* m_ocrRuntime{};
+        // The overlay's observation of the current OCR job. Releasing this
+        // pointer abandons the result for the UI; it never stops the worker.
+        std::shared_ptr<OcrCompletion> m_ocrCompletion;
+        // Set while the current UI observes a completion that has not arrived. The box stays
+        // empty while it is set and draws the spinner instead, so a slow first
+        // recognition cannot be mistaken for an empty one.
+        bool m_ocrPending{};
+        LONGLONG m_ocrPendingStart{};
         RECT m_ocrCacheSelection{};
         bool m_ocrCacheValid{};
         std::size_t m_ocrCaret{};
@@ -237,6 +292,25 @@ namespace agshot
         float m_ocrScrollDragStart{};
         POINT m_ocrSelectionPoint{};
         float m_ocrScrollY{};
+        mutable winrt::com_ptr<IDWriteTextLayout> m_ocrLayout;
+        mutable std::wstring m_ocrLayoutText;
+        mutable float m_ocrLayoutWidth{ -1.0f };
+        // The range the selection's drawing effect is currently set on, so it can
+        // be moved or cleared without throwing the layout away.
+        mutable std::size_t m_ocrLayoutHighlightFirst{};
+        mutable std::size_t m_ocrLayoutHighlightLast{};
+        // Reused by the per-frame hit tests, so they stop allocating a vector the
+        // size of the text on every frame.
+        mutable std::vector<DWRITE_HIT_TEST_METRICS> m_ocrHitMetrics;
+
+        // The size label is tied to the current selection range, so its layout is
+        // rebuilt when that range changes. The tooltip shows a fixed string per
+        // button, so its layout is keyed on the hovered button.
+        winrt::com_ptr<IDWriteTextLayout> m_sizeLabelLayout;
+        RECT m_sizeLabelSelection{};
+        bool m_sizeLabelValid{};
+        winrt::com_ptr<IDWriteTextLayout> m_tooltipLayout;
+        ToolbarButton m_tooltipLayoutButton{ ToolbarButton::None };
         int m_depth{};            // wheel-adjusted level within the UIA tree
         ULONGLONG m_lastQuery{};  // throttles the UIA call
 
@@ -261,8 +335,33 @@ namespace agshot
         // there it means "no, I am drawing my own".
         bool m_pendingConfirm{};
 
+        // The debug readout. Samples are taken only when a frame is actually
+        // drawn; nothing here asks for one, because a frame rate display that
+        // produced its own frames would be measuring itself. Each sample carries
+        // the time it was taken so the graph is laid out against the clock: a
+        // stretch with no frames shows as a gap rather than being compressed
+        // away, which is what makes the reading honest.
+        static constexpr int kStatsSamples = 240;
+        static constexpr int kStatsWindowMs = 250;
+        static constexpr double kStatsGraphSeconds = 10.0;
+        bool m_showStats{};
+        float m_statsSamples[kStatsSamples]{};
+        LONGLONG m_statsSampleTime[kStatsSamples]{};
+        int m_statsSampleCount{};
+        int m_statsSampleHead{};
+        // The interval between frames, smoothed. The rate on the panel is derived
+        // from it, so the rate and the interval cannot disagree.
+        float m_statsFrameMs{};
+        // How long generating a frame takes, smoothed. This is the figure the
+        // panel reports in milliseconds: an interval says how often frames
+        // happen, which is not the same question as how much work one is, and
+        // reporting the interval as a duration made the readout look like a cost
+        // when it was only a cadence.
+        float m_statsRenderMs{};
+        LONGLONG m_statsLastFrame{};
+        LONGLONG m_statsLastSample{};
+
         HWND m_previousForeground{};
-        bool m_trackingLeave{};
 
         // The screen as it was when the capture began. Everything is drawn over
         // it and the copy is a crop of it, so the desktop underneath is never

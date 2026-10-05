@@ -33,6 +33,18 @@ Generated Files/
 # ---- vcpkg (manifest mode installs here) ----
 /vcpkg_installed/
 
+# ---- NPU compilation cache ----
+# Driver-compiled graphs the engine keeps so it does not recompile on every
+# run; ~90 MB and rebuilt on demand. The engine names this path relative to the
+# working directory, so it is matched at any depth rather than only at the root.
+cache/
+
+# ---- OCR model payload ----
+# ~15 MB of binary weights, shipped separately from the source tree. The build
+# links bin\<platform>\models to this directory, so it has to exist on disk but
+# never belongs in a commit.
+/models/
+
 # ---- Scratch ----
 /.work/
 

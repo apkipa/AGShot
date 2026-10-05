@@ -1,12 +1,14 @@
 #include "pch.h"
 #include "resource.h"
 #include "core/config.h"
+#include "core/ocr_runtime.h"
 #include "core/config_watcher.h"
 #include "core/error.h"
 #include "core/tray_icon.h"
 #include "hud/overlay.h"
 
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <new>
 
@@ -21,6 +23,49 @@ namespace
     // both need a window to be posted to, and neither needs a screen.
     constexpr wchar_t kMessageClass[] = L"AGShot.MessageWindow";
 
+    // True when the directory holds a complete OCR model payload. The three
+    // files are checked together so a half-copied directory is rejected here
+    // rather than surfacing as a load failure later, on the pool thread.
+    bool HasOcrModels(const std::filesystem::path& directory)
+    {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(directory / L"ppocr_keys_v1.txt", ec) || ec)
+        {
+            return false;
+        }
+
+        const auto has = [&directory](const wchar_t* stem)
+        {
+            std::error_code probe;
+            return std::filesystem::is_regular_file(
+                directory / (std::wstring(stem) + L".ngraph_lite"), probe)
+                && !probe;
+        };
+        return has(L"ppocrv6_small_det_u8_template")
+            && has(L"ppocrv6_small_rec_u8_template");
+    }
+
+    // The payload is not embedded in the binary; it is distributed beside it, so
+    // "next to the executable" is the location that has to work. The working
+    // directory is a last resort, for running the binary against a copy of the
+    // payload somewhere else.
+    std::filesystem::path FindLocalOcrModels()
+    {
+        if (const auto exeDir = agshot::ExecutableDirectory(); !exeDir.empty()
+            && HasOcrModels(exeDir / L"models"))
+        {
+            return exeDir / L"models";
+        }
+
+        std::error_code ec;
+        if (const auto cwd = std::filesystem::current_path(ec); !ec
+            && HasOcrModels(cwd / L"models"))
+        {
+            return cwd / L"models";
+        }
+        return {};
+    }
+
     constexpr UINT kConfigChangedMessage = WM_APP + 1;
     constexpr UINT kConfigWatchLostMessage = WM_APP + 2;
     constexpr UINT kWakeExistingMessage = WM_APP + 3;
@@ -32,6 +77,10 @@ namespace
 
     HWND g_hwnd{};
     agshot::Overlay g_overlay;
+
+    // Created once the cache directory is known; the overlay holds it raw and
+    // is destroyed first, and Shutdown() runs before static destruction starts.
+    std::shared_ptr<agshot::OcrRuntime> g_ocrRuntime;
 
     // The small icon is shared with the tray icon and must outlive it.
     HICON g_trayIcon{};
@@ -137,18 +186,48 @@ namespace
     void ApplyConfig(const agshot::Config& config)
     {
         ApplyHotkey(config.screenshotHotkey);
+        g_overlay.SetDebugStats(config.debugShowStats);
     }
 
-    // Stands in for the settings window, which will edit what the file holds.
+    // Opens the settings file in whatever the user has associated with it.
+    //
+    // This stands in for the settings window, which will edit these values
+    // itself. Until then the file is the settings, so the useful thing this item
+    // can do is put the file in front of the user rather than describe it.
     void ShowSettings()
     {
-        // Unowned on purpose: the application's only window is a message-only one,
-        // which is no kind of owner for a dialog.
-        const std::wstring message =
-            L"The settings window is not built yet.\n\nFor now the settings are the file:\n"
-            + g_configPath.wstring();
+        // The file is written at startup when it is missing, so this is only
+        // reachable if something removed it while the application was running.
+        std::error_code ec;
+        if (!std::filesystem::exists(g_configPath, ec))
+        {
+            try
+            {
+                agshot::SaveConfig(g_config, g_configPath);
+            }
+            catch (const std::exception& error)
+            {
+                agshot::ShowWarning(
+                    agshot::DescribeException(error, __FILEW__, __LINE__),
+                    L"The settings file could not be created.");
+                return;
+            }
+        }
 
-        MessageBoxW(nullptr, message.c_str(), L"AGShot", MB_OK | MB_ICONINFORMATION);
+        // ShellExecuteW rather than a hard-coded editor: which program opens a
+        // .toml file is the user's choice, not this application's.
+        const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
+            nullptr, L"open", g_configPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+
+        // ShellExecuteW reports success by returning a value above 32; anything
+        // at or below that is an error code, not a handle.
+        if (result <= 32)
+        {
+            agshot::ShowWarning(
+                agshot::DescribeWin32(L"ShellExecuteW(open config)", static_cast<unsigned long>(result),
+                                      __FILEW__, __LINE__),
+                L"The settings file could not be opened.");
+        }
     }
 
     // Reads the settings file again and applies whatever changed. Runs on the UI
@@ -335,6 +414,23 @@ int RunApp(HINSTANCE instance, int showCommand)
     // Shown at the bottom of every report, so it is obvious which file was in play.
     agshot::SetDiagnosticContext(L"Config: " + configPath.wstring());
 
+    // Model distribution is intentionally external. Detect the local payload at
+    // startup, but never attempt a model load on the UI thread.
+    const auto ocrModels = FindLocalOcrModels();
+    if (ocrModels.empty()) {
+        agshot::ShowWarning(
+            agshot::Failure{ {}, L"Expected a local models\\ directory beside AGShot." },
+            L"AGShot OCR models are unavailable.");
+    }
+    const auto ocrCache = configPath.parent_path() / L"cache";
+    std::error_code ocrCacheError;
+    std::filesystem::create_directories(ocrCache, ocrCacheError);
+    g_ocrRuntime = std::make_shared<agshot::OcrRuntime>();
+    // Start() refuses an empty models path, so a missing payload leaves the
+    // runtime unavailable rather than failing later on the pool thread.
+    if (!ocrCacheError) g_ocrRuntime->Start(ocrModels, ocrCache);
+    g_overlay.SetOcrRuntime(g_ocrRuntime.get());
+
     if (!config.exists || config.migrated)
     {
         try
@@ -446,10 +542,11 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
         const int dpi = argc > 1 ? _wtoi(argv[1]) : 144;
         const bool text = argc > 3 && _wtoi(argv[3]) != 0;
         const float probe = argc > 4 ? static_cast<float>(_wtof(argv[4])) : 0.0f;
+        const bool spinner = argc > 5 && _wtoi(argv[5]) != 0;
         try
         {
             agshot::Overlay overlay;
-            const bool ok = overlay.ExportToolbarProof(path, dpi, text, probe);
+            const bool ok = overlay.ExportToolbarProof(path, dpi, text, probe, spinner);
             LocalFree(argv);
             return ok ? 0 : 1;
         }
@@ -489,6 +586,10 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
     {
         agshot::ReportCurrentException(__FILEW__, __LINE__);
     }
+
+    // Before anything static is torn down: the OCR runtime waits for a running
+    // recognition and releases its models while the NPU engine is still alive.
+    if (g_ocrRuntime) g_ocrRuntime->Shutdown();
 
     CloseHandle(singleInstance);
     return result;
