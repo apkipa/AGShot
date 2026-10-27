@@ -105,6 +105,29 @@ namespace agshot
         void CreateCopyIconGeometry(float localStroke);
         void CreateDeviceResources();
         void CreateSizeDependentResources();
+        HRESULT CreateSizeDependentResourcesCore();
+
+        // A lost device is recoverable: it is not an error the user should see
+        // and it must not end the application. Everything created from the
+        // device is released and rebuilt, and the frame that failed is drawn
+        // again. Factories, text formats, stroke styles and the copy geometry
+        // are independent of the device and survive.
+        static bool IsDeviceLost(HRESULT hr) noexcept;
+        void DiscardDeviceResources() noexcept;
+        // S_OK when a complete device is back, otherwise the HRESULT of the step
+        // that gave up. It never throws, so the caller decides how to report.
+        HRESULT RecoverDeviceResources() noexcept;
+        HRESULT CreateBackgroundBitmap();
+
+        // The frame body, returning the first failing HRESULT instead of
+        // throwing, so Render() can tell a lost device from a real fault.
+        HRESULT RenderFrame();
+
+        // Gives up on a frame whose device could not be rebuilt: closes an
+        // overlay that has nothing to draw with, and reports it once, under the
+        // call that actually failed. The OCR worker is untouched, as with every
+        // other cancel.
+        void GiveUpRendering(HRESULT hr, const wchar_t* operation) noexcept;
 
         struct AnimationFrameSignal
         {

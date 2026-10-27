@@ -297,9 +297,6 @@ namespace agshot
         m_width = static_cast<UINT>(client.right - client.left);
         m_height = static_cast<UINT>(client.bottom - client.top);
         CreateSizeDependentResources();
-
-        AGSHOT_CHECK_HR(m_target->SetRoot(m_visual.get()));
-        AGSHOT_CHECK_HR(m_composition->Commit());
         return true;
     }
 
@@ -593,11 +590,22 @@ namespace agshot
         CreateSpinnerEffect();
     }
 
-    void Overlay::CreateSizeDependentResources()
+    // The device-facing part of the rebuild. Split out so that recovery can
+    // retry it directly instead of arriving back here through the recovery path
+    // again.
+    HRESULT Overlay::CreateSizeDependentResourcesCore()
     {
         if (m_width == 0 || m_height == 0)
         {
-            return;
+            return S_FALSE;
+        }
+
+        // Recovery can leave the device torn down when it fails, and a resize
+        // arriving before the next successful rebuild must not walk into a
+        // null composition.
+        if (!m_composition || !m_target || !m_visual)
+        {
+            return E_UNEXPECTED;
         }
 
         // The copy mark's hidden ends are pulled back by half a stroke, so its
@@ -609,21 +617,195 @@ namespace agshot
             CreateCopyIconGeometry(localStroke);
         }
 
+        HRESULT hr = S_OK;
         if (!m_surface)
         {
-            AGSHOT_CHECK_HR(m_composition->CreateVirtualSurface(
+            hr = m_composition->CreateVirtualSurface(
                 m_width, m_height,
                 DXGI_FORMAT_B8G8R8A8_UNORM,
                 DXGI_ALPHA_MODE_PREMULTIPLIED,
-                m_surface.put()));
-            AGSHOT_CHECK_HR(m_visual->SetContent(m_surface.get()));
+                m_surface.put());
+            if (SUCCEEDED(hr))
+            {
+                hr = m_visual->SetContent(m_surface.get());
+                if (FAILED(hr))
+                {
+                    // The visual never took this surface, so keeping it would
+                    // make the next attempt resize a surface that is not on
+                    // screen instead of creating one that is.
+                    m_surface = nullptr;
+                }
+            }
         }
         else
         {
-            AGSHOT_CHECK_HR(m_surface->Resize(m_width, m_height));
+            hr = m_surface->Resize(m_width, m_height);
         }
 
-        AGSHOT_CHECK_HR(m_composition->Commit());
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        // The root has to be set before the content it shows is committed;
+        // both go out in the same transaction, so this is the only commit.
+        hr = m_target->SetRoot(m_visual.get());
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+        return m_composition->Commit();
+    }
+
+    void Overlay::CreateSizeDependentResources()
+    {
+        const HRESULT hr = CreateSizeDependentResourcesCore();
+        if (IsDeviceLost(hr))
+        {
+            // The rebuild is what knows what is wrong with the device now, so a
+            // failure there is the one worth reporting.
+            if (const HRESULT recoverHr = RecoverDeviceResources(); FAILED(recoverHr))
+            {
+                AGSHOT_CHECK_HR(recoverHr);
+            }
+            return;
+        }
+        AGSHOT_CHECK_HR(hr);
+    }
+
+    // A hung device is what a call reports while the GPU is being reset, and the
+    // reset adapter is exactly what the rebuild wants. If the rebuild cannot use
+    // it either, it gives up through the same abandon step as every failure
+    // here, so treating the hang as recoverable never costs more than one try.
+    bool Overlay::IsDeviceLost(HRESULT hr) noexcept
+    {
+        return hr == D2DERR_RECREATE_TARGET
+            || hr == DXGI_ERROR_DEVICE_REMOVED
+            || hr == DXGI_ERROR_DEVICE_RESET
+            || hr == DXGI_ERROR_DEVICE_HUNG
+            || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+    }
+
+    // Releases everything that belongs to the device. The factories, text
+    // formats, stroke styles and the copy geometry are not in here: they are
+    // independent resources and rebuilding them would only throw away work.
+    void Overlay::DiscardDeviceResources() noexcept
+    {
+        if (m_d2dContext)
+        {
+            m_d2dContext->SetTarget(nullptr);
+        }
+
+        m_background = nullptr;
+        m_dim = nullptr;
+        m_shadow = nullptr;
+        m_accent = nullptr;
+        m_handleFill = nullptr;
+        m_handleEdge = nullptr;
+        m_panel = nullptr;
+        m_panelEdge = nullptr;
+        m_hover = nullptr;
+        m_icon = nullptr;
+        m_cancel = nullptr;
+        m_tooltip = nullptr;
+        m_textScrollTrack = nullptr;
+        m_textScrollThumb = nullptr;
+        m_spinnerEffect = nullptr;
+        m_magnifierLayer = nullptr;
+        m_surface = nullptr;
+        m_visual = nullptr;
+        m_target = nullptr;
+        m_composition = nullptr;
+        m_d2dContext = nullptr;
+        m_d2dDevice = nullptr;
+        m_dxgiDevice = nullptr;
+    }
+
+    // Rebuilds the bitmap drawn under everything else from the capture that is
+    // still held. The device lost a bitmap, not the screen it came from.
+    HRESULT Overlay::CreateBackgroundBitmap()
+    {
+        m_background = nullptr;
+        if (!m_d2dContext || m_image.empty())
+        {
+            return S_FALSE;
+        }
+
+        const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+            96.0f,
+            96.0f);
+        return m_d2dContext->CreateBitmap(
+            D2D1::SizeU(static_cast<UINT32>(m_image.width()),
+                        static_cast<UINT32>(m_image.height())),
+            m_image.pixels(),
+            static_cast<UINT32>(m_image.stride()),
+            properties,
+            m_background.put());
+    }
+
+    // Called after a frame or a surface operation reported a lost device. It
+    // never throws: S_OK means a complete device is back, and anything else is
+    // the HRESULT of the step that gave up, for the caller to report.
+    HRESULT Overlay::RecoverDeviceResources() noexcept
+    {
+        if (m_window == nullptr)
+        {
+            return E_UNEXPECTED;
+        }
+
+        // Whatever happens below, the object is left with either a complete
+        // device or none at all: a half-built one would look initialized to
+        // every unrelated message that tests a single member.
+        const auto abandon = [this](HRESULT failure) noexcept
+        {
+            DiscardDeviceResources();
+            return failure;
+        };
+
+        try
+        {
+            DiscardDeviceResources();
+
+            // The window may have been resized while the old device was failing,
+            // and WM_SIZE could not build a surface from it then.
+            RECT client{};
+            if (GetClientRect(m_window, &client))
+            {
+                m_width = static_cast<UINT>(client.right - client.left);
+                m_height = static_cast<UINT>(client.bottom - client.top);
+            }
+
+            CreateDeviceResources();
+
+            const HRESULT hr = CreateSizeDependentResourcesCore();
+            if (FAILED(hr))
+            {
+                return abandon(hr);
+            }
+
+            if (!m_surface)
+            {
+                return S_OK;
+            }
+
+            const HRESULT backgroundHr = CreateBackgroundBitmap();
+            if (FAILED(backgroundHr))
+            {
+                return abandon(backgroundHr);
+            }
+
+            // The device is usable again, so a failure reported earlier no
+            // longer describes the state of anything.
+            m_failed = false;
+            return S_OK;
+        }
+        catch (...)
+        {
+            // A WinRT exception does not carry an HRESULT worth showing here;
+            // the device is gone either way and E_FAIL still names the step.
+            return abandon(E_FAIL);
+        }
     }
 
     float Overlay::Scaled(int value) const noexcept
@@ -665,6 +847,10 @@ namespace agshot
         m_beginning = true;
         const FlagReset resetBeginning{ m_beginning };
 
+        // A new session can be told about a new failure: the report below is
+        // guarded only so that repaints of the same broken device stay quiet.
+        m_failed = false;
+
         m_previousForeground = GetForegroundWindow();
         if (m_previousForeground == m_window)
         {
@@ -696,21 +882,21 @@ namespace agshot
         // Taken while the overlay is still hidden, so what it holds is the
         // desktop rather than the previous capture.
         m_image.Capture(m_bounds);
-        m_background = nullptr;
-        if (!m_image.empty())
+
+        // The capture is new, so the bitmap is too. If the device went away
+        // since it was last used, rebuilding it rebuilds this bitmap from the
+        // capture just taken, so the frame drawn below still has a picture.
+        HRESULT backgroundHr = CreateBackgroundBitmap();
+        if (IsDeviceLost(backgroundHr))
         {
-            const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
-                96.0f,
-                96.0f);
-            AGSHOT_CHECK_HR(m_d2dContext->CreateBitmap(
-                D2D1::SizeU(static_cast<UINT32>(m_image.width()),
-                            static_cast<UINT32>(m_image.height())),
-                m_image.pixels(),
-                static_cast<UINT32>(m_image.stride()),
-                properties,
-                m_background.put()));
+            // A rebuild that fails leaves the device missing, which Render()
+            // below already knows how to give up on. Throwing here would reach
+            // the main window procedure and end the process instead, which is
+            // the one outcome a lost device must never produce.
+            RecoverDeviceResources();
+            backgroundHr = S_OK;
         }
+        AGSHOT_CHECK_HR(backgroundHr);
 
         m_selection = RECT{};
         m_displaySelection = RECT{};
@@ -747,6 +933,15 @@ namespace agshot
             RefreshSuggestion(cursor, 6);
         }
         Render();
+
+        // A frame that could not get a device leaves nothing to show. Opening
+        // the window anyway would put an invisible layer over the desktop that
+        // still takes every click; GiveUpRendering() has already reported why.
+        if (!m_surface)
+        {
+            Cancel();
+            return;
+        }
 
         // Activating is deliberate: the overlay needs the keyboard for Escape and
         // Return, and the mouse for everything else.
@@ -2197,24 +2392,151 @@ namespace agshot
             return;
         }
 
-        AGSHOT_CHECK_HR(m_surface->Trim(nullptr, 0));
-        AGSHOT_CHECK_HR(m_composition->Commit());
+        HRESULT hr = m_surface->Trim(nullptr, 0);
+        if (SUCCEEDED(hr))
+        {
+            hr = m_composition->Commit();
+        }
+        if (IsDeviceLost(hr))
+        {
+            const HRESULT recoverHr = RecoverDeviceResources();
+            if (FAILED(recoverHr) || !m_surface)
+            {
+                // Begin() calls this before the window is shown: throwing here
+                // would reach the main window procedure and end the process,
+                // which is the one outcome a lost device must never produce.
+                if (FAILED(recoverHr))
+                {
+                    GiveUpRendering(recoverHr, L"Overlay::RecoverDeviceResources");
+                }
+                else
+                {
+                    GiveUpRendering(hr, L"Overlay::ClearSurface");
+                }
+                return;
+            }
+
+            hr = m_surface->Trim(nullptr, 0);
+            if (SUCCEEDED(hr))
+            {
+                hr = m_composition->Commit();
+            }
+
+            // A freshly built device that loses the surface again is not going
+            // to survive a second rebuild either.
+            if (IsDeviceLost(hr))
+            {
+                GiveUpRendering(hr, L"Overlay::ClearSurface");
+                return;
+            }
+        }
+        AGSHOT_CHECK_HR(hr);
     }
 
 
     void Overlay::Render()
     {
-        if (!m_surface || !m_d2dContext || m_width == 0 || m_height == 0)
+        if (m_width == 0 || m_height == 0)
         {
             return;
         }
 
+        if (!m_d2dContext || !m_surface)
+        {
+            // A previous attempt to rebuild the device did not get all the way
+            // there. A frame is what actually needs it, so try again from the
+            // one place that knows a frame was wanted.
+            const HRESULT recoverHr = RecoverDeviceResources();
+            if (FAILED(recoverHr) || !m_surface)
+            {
+                GiveUpRendering(recoverHr, L"Overlay::RecoverDeviceResources");
+                return;
+            }
+        }
+
+        HRESULT hr = RenderFrame();
+        if (IsDeviceLost(hr))
+        {
+            // Losing the device invalidates what was drawn through it, but not
+            // the frame itself: draw it again against the device just built.
+            const HRESULT recoverHr = RecoverDeviceResources();
+            if (FAILED(recoverHr))
+            {
+                GiveUpRendering(recoverHr, L"Overlay::RecoverDeviceResources");
+                return;
+            }
+            if (!m_surface)
+            {
+                GiveUpRendering(hr, L"Overlay::RenderFrame");
+                return;
+            }
+            hr = RenderFrame();
+        }
+
+        // Losing the device a second time straight after the rebuild means this
+        // one is not going to survive a third attempt either.
+        if (IsDeviceLost(hr))
+        {
+            GiveUpRendering(hr, L"Overlay::RenderFrame");
+            return;
+        }
+        AGSHOT_CHECK_HR(hr);
+
+        // Counted after the work is done, so the number describes frames that
+        // actually reached the screen.
+        RecordFrame();
+    }
+
+    void Overlay::GiveUpRendering(HRESULT hr, const wchar_t* operation) noexcept
+    {
+        if (SUCCEEDED(hr))
+        {
+            // The device came back but without a surface to draw on, which is
+            // just as unusable for a frame as no device at all.
+            hr = E_UNEXPECTED;
+        }
+
+        // Nothing can be drawn without a device, and a full-screen window that
+        // draws nothing still covers the desktop and takes the mouse. Closing it
+        // is the same exit Escape takes, so the OCR worker keeps its job and the
+        // process stays up.
+        if (IsWindowVisible(m_window))
+        {
+            Cancel();
+        }
+
+        // One report per failure: a repaint that finds the same dead device must
+        // not stack one dialog per frame. The flag is cleared when a device is
+        // successfully rebuilt, and when a new capture starts.
+        if (m_failed)
+        {
+            return;
+        }
+        m_failed = true;
+
+        try
+        {
+            ShowWarning(DescribeHresult(operation, hr, __FILEW__, __LINE__),
+                        L"AGShot could not rebuild its graphics device, so the capture overlay was closed.");
+        }
+        catch (...)
+        {
+            // Reporting a failure must not turn it into a terminate.
+        }
+    }
+
+    HRESULT Overlay::RenderFrame()
+    {
         const RECT update = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
 
         winrt::com_ptr<IDXGISurface> updateSurface;
         POINT updateOffset{};
-        AGSHOT_CHECK_HR(m_surface->BeginDraw(
-            &update, __uuidof(IDXGISurface), updateSurface.put_void(), &updateOffset));
+        HRESULT hr = m_surface->BeginDraw(
+            &update, __uuidof(IDXGISurface), updateSurface.put_void(), &updateOffset);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
 
         const bool collectStats = m_showStats;
         LARGE_INTEGER renderStart{};
@@ -2237,7 +2559,15 @@ namespace agshot
             96.0f);
 
         winrt::com_ptr<ID2D1Bitmap1> tile;
-        AGSHOT_CHECK_HR(m_d2dContext->CreateBitmapFromDxgiSurface(updateSurface.get(), &properties, tile.put()));
+        hr = m_d2dContext->CreateBitmapFromDxgiSurface(updateSurface.get(), &properties, tile.put());
+        if (FAILED(hr))
+        {
+            // The surface's tile is already open. Closing it here keeps the
+            // next BeginDraw from being rejected.
+            m_surface->EndDraw();
+            return hr;
+        }
+
         m_d2dContext->SetTarget(tile.get());
 
         m_d2dContext->BeginDraw();
@@ -2289,9 +2619,9 @@ namespace agshot
         DrawDebugStats();
 
         m_d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
-        AGSHOT_CHECK_HR(m_d2dContext->EndDraw());
+        const HRESULT drawHr = m_d2dContext->EndDraw();
 
-        if (collectStats)
+        if (collectStats && SUCCEEDED(drawHr))
         {
             LARGE_INTEGER renderEnd{};
             QueryPerformanceCounter(&renderEnd);
@@ -2306,12 +2636,19 @@ namespace agshot
         m_d2dContext->SetTarget(nullptr);
         tile = nullptr;
 
-        AGSHOT_CHECK_HR(m_surface->EndDraw());
-        AGSHOT_CHECK_HR(m_composition->Commit());
-
-        // Counted after the work is done, so the number describes frames that
-        // actually reached the screen.
-        RecordFrame();
+        // The tile still has to be returned even when drawing failed, so the
+        // surface is closed either way; the first failure is what the caller
+        // needs to see.
+        const HRESULT surfaceHr = m_surface->EndDraw();
+        if (FAILED(drawHr))
+        {
+            return drawHr;
+        }
+        if (FAILED(surfaceHr))
+        {
+            return surfaceHr;
+        }
+        return m_composition->Commit();
     }
 
     void Overlay::DrawDim()
@@ -3304,9 +3641,14 @@ namespace agshot
             {
                 m_width = static_cast<UINT>(LOWORD(lparam));
                 m_height = static_cast<UINT>(HIWORD(lparam));
-                if (m_d2dContext && m_width > 0 && m_height > 0)
+                if (m_width > 0 && m_height > 0)
                 {
-                    CreateSizeDependentResources();
+                    // A device that has not been rebuilt yet cannot size a
+                    // surface; the frame this requests will rebuild it first.
+                    if (m_d2dContext && m_composition)
+                    {
+                        CreateSizeDependentResources();
+                    }
                     RequestRender();
                 }
             }
