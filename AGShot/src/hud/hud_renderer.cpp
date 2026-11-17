@@ -4,11 +4,12 @@
 
 #include "core/error.h"
 #include "hud/ocr_text_panel.h"
-#include "hud/toolbar_icon.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
+#include <string_view>
 
 namespace agshot
 {
@@ -21,8 +22,41 @@ namespace agshot
         constexpr int kTooltipGap = 6;
         constexpr int kIconInset = 7;
         constexpr int kButtonRadius = 4;
-        constexpr float kIconStroke = 1.8f;
         constexpr float kIconInk = 16.0f;
+
+        constexpr std::array<std::string_view, 4> kToolbarIconSvgs{
+            // EditSelection
+            R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M0.9 5.9V1.57A0.67 0.67 0 0 1 1.57 0.9H5.9M10.1 0.9H14.43A0.67 0.67 0 0 1 15.1 1.57V5.9M0.9 10.1V14.43A0.67 0.67 0 0 0 1.57 15.1H5.9M15.1 10.1V14.43A0.67 0.67 0 0 1 14.43 15.1H10.1"/></svg>)",
+            // TextRecognition
+            R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="butt" stroke-linejoin="miter"><path d="M4.89 0.9H1.57A0.67 0.67 0 0 0 0.9 1.57V4.89M11.11 0.9H14.43A0.67 0.67 0 0 1 15.1 1.57V4.89M0.9 11.11V14.43A0.67 0.67 0 0 0 1.57 15.1H4.89M15.1 11.11V14.43A0.67 0.67 0 0 1 14.43 15.1H11.11M3.14 5.21H12.88M3.14 8H10.96M3.14 10.79H11.87"/></svg>)",
+            // Copy
+            R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="butt" stroke-linejoin="round"><path d="M5.16 11.12H2.48A1.58 1.58 0 0 1 0.9 9.54V2.48A1.58 1.58 0 0 1 2.48 0.9H8.12A1.58 1.58 0 0 1 9.70 2.48V4.88M6.74 4.88H13.52A1.58 1.58 0 0 1 15.1 6.46V13.52A1.58 1.58 0 0 1 13.52 15.1H6.74A1.58 1.58 0 0 1 5.16 13.52V6.46A1.58 1.58 0 0 1 6.74 4.88Z"/></svg>)",
+            // Cancel
+            R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M0.9 0.9L15.1 15.1M15.1 0.9L0.9 15.1"/></svg>)",
+        };
+
+        winrt::com_ptr<IStream> CreateUtf8MemoryStream(std::string_view text)
+        {
+            const HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, text.size());
+            AGSHOT_CHECK_WIN32(memory != nullptr);
+            void* locked = GlobalLock(memory);
+            if (locked == nullptr)
+            {
+                GlobalFree(memory);
+                AGSHOT_CHECK_WIN32(false);
+            }
+            std::memcpy(locked, text.data(), text.size());
+            GlobalUnlock(memory);
+
+            winrt::com_ptr<IStream> stream;
+            const HRESULT hr = CreateStreamOnHGlobal(memory, TRUE, stream.put());
+            if (FAILED(hr))
+            {
+                GlobalFree(memory);
+                AGSHOT_CHECK_HR(hr);
+            }
+            return stream;
+        }
 
         RECT InsetRectBy(const RECT& rect, int by) noexcept
         {
@@ -196,104 +230,36 @@ namespace agshot
     void HudRenderer::DiscardIndependentResources() noexcept
     {
         InvalidateLayouts();
-        m_copyIconGeometry = nullptr;
-        m_copyLocalStroke = 0.0f;
+        m_svgContext = nullptr;
+        for (auto& svg : m_iconSvgs)
+        {
+            svg = nullptr;
+        }
     }
 
-    void HudRenderer::EnsureCopyIconGeometry(ID2D1Factory1* factory, ID2D1StrokeStyle* roundStroke,
-                                             float localStroke)
+    void HudRenderer::EnsureToolbarSvgs(ID2D1DeviceContext* context)
     {
-        if (m_copyIconGeometry && m_copyLocalStroke == localStroke)
+        if (m_svgContext == context && m_iconSvgs[0])
         {
             return;
         }
 
-        constexpr float size = 18.0f;
-        constexpr float radius = 2.0f;
-        constexpr float curve = radius * 0.55228475f;
-        constexpr float backRight = size * 0.62f;
-        constexpr float backBottom = size * 0.72f;
-        constexpr float frontLeft = size * 0.30f;
-        constexpr float frontTop = size * 0.28f;
-
-        winrt::com_ptr<ID2D1PathGeometry> back;
-        AGSHOT_CHECK_HR(factory->CreatePathGeometry(back.put()));
-        winrt::com_ptr<ID2D1GeometrySink> backSink;
-        AGSHOT_CHECK_HR(back->Open(backSink.put()));
-        backSink->SetFillMode(D2D1_FILL_MODE_WINDING);
-        backSink->BeginFigure(D2D1::Point2F(frontLeft, backBottom), D2D1_FIGURE_BEGIN_HOLLOW);
-        backSink->AddLine(D2D1::Point2F(radius, backBottom));
-        backSink->AddBezier(D2D1::BezierSegment(
-            D2D1::Point2F(radius - curve, backBottom),
-            D2D1::Point2F(0.0f, backBottom - radius + curve),
-            D2D1::Point2F(0.0f, backBottom - radius)));
-        backSink->AddLine(D2D1::Point2F(0.0f, radius));
-        backSink->AddBezier(D2D1::BezierSegment(
-            D2D1::Point2F(0.0f, radius - curve),
-            D2D1::Point2F(radius - curve, 0.0f),
-            D2D1::Point2F(radius, 0.0f)));
-        backSink->AddLine(D2D1::Point2F(backRight - radius, 0.0f));
-        backSink->AddBezier(D2D1::BezierSegment(
-            D2D1::Point2F(backRight - radius + curve, 0.0f),
-            D2D1::Point2F(backRight, radius - curve),
-            D2D1::Point2F(backRight, radius)));
-        backSink->AddLine(D2D1::Point2F(backRight, frontTop));
-        backSink->EndFigure(D2D1_FIGURE_END_OPEN);
-        AGSHOT_CHECK_HR(backSink->Close());
-
-        winrt::com_ptr<ID2D1PathGeometry> front;
-        AGSHOT_CHECK_HR(factory->CreatePathGeometry(front.put()));
-        winrt::com_ptr<ID2D1GeometrySink> frontSink;
-        AGSHOT_CHECK_HR(front->Open(frontSink.put()));
-        frontSink->SetFillMode(D2D1_FILL_MODE_WINDING);
-        frontSink->BeginFigure(D2D1::Point2F(frontLeft + radius, frontTop), D2D1_FIGURE_BEGIN_HOLLOW);
-        frontSink->AddLine(D2D1::Point2F(size - radius, frontTop));
-        frontSink->AddBezier(D2D1::BezierSegment(
-            D2D1::Point2F(size - radius + curve, frontTop),
-            D2D1::Point2F(size, frontTop + radius - curve),
-            D2D1::Point2F(size, frontTop + radius)));
-        frontSink->AddLine(D2D1::Point2F(size, size - radius));
-        frontSink->AddBezier(D2D1::BezierSegment(
-            D2D1::Point2F(size, size - radius + curve),
-            D2D1::Point2F(size - radius + curve, size),
-            D2D1::Point2F(size - radius, size)));
-        frontSink->AddLine(D2D1::Point2F(frontLeft + radius, size));
-        frontSink->AddBezier(D2D1::BezierSegment(
-            D2D1::Point2F(frontLeft + radius - curve, size),
-            D2D1::Point2F(frontLeft, size - radius + curve),
-            D2D1::Point2F(frontLeft, size - radius)));
-        frontSink->AddLine(D2D1::Point2F(frontLeft, frontTop + radius));
-        frontSink->AddBezier(D2D1::BezierSegment(
-            D2D1::Point2F(frontLeft, frontTop + radius - curve),
-            D2D1::Point2F(frontLeft + radius - curve, frontTop),
-            D2D1::Point2F(frontLeft + radius, frontTop)));
-        frontSink->EndFigure(D2D1_FIGURE_END_CLOSED);
-        AGSHOT_CHECK_HR(frontSink->Close());
-
-        const auto widen = [&](ID2D1Geometry* source, winrt::com_ptr<ID2D1PathGeometry>& out)
+        m_svgContext = nullptr;
+        for (auto& svg : m_iconSvgs)
         {
-            AGSHOT_CHECK_HR(factory->CreatePathGeometry(out.put()));
-            winrt::com_ptr<ID2D1GeometrySink> sink;
-            AGSHOT_CHECK_HR(out->Open(sink.put()));
-            sink->SetFillMode(D2D1_FILL_MODE_WINDING);
-            AGSHOT_CHECK_HR(source->Widen(localStroke, roundStroke, nullptr, sink.get()));
-            AGSHOT_CHECK_HR(sink->Close());
-        };
+            svg = nullptr;
+        }
 
-        winrt::com_ptr<ID2D1PathGeometry> backArea;
-        winrt::com_ptr<ID2D1PathGeometry> frontArea;
-        widen(back.get(), backArea);
-        widen(front.get(), frontArea);
+        winrt::com_ptr<ID2D1DeviceContext5> context5;
+        AGSHOT_CHECK_HR(context->QueryInterface(__uuidof(ID2D1DeviceContext5), context5.put_void()));
 
-        AGSHOT_CHECK_HR(factory->CreatePathGeometry(m_copyIconGeometry.put()));
-        winrt::com_ptr<ID2D1GeometrySink> sink;
-        AGSHOT_CHECK_HR(m_copyIconGeometry->Open(sink.put()));
-        sink->SetFillMode(D2D1_FILL_MODE_WINDING);
-        AGSHOT_CHECK_HR(backArea->CombineWithGeometry(
-            frontArea.get(), D2D1_COMBINE_MODE_UNION, nullptr, sink.get()));
-        AGSHOT_CHECK_HR(sink->Close());
-
-        m_copyLocalStroke = localStroke;
+        for (std::size_t i = 0; i < m_iconSvgs.size(); ++i)
+        {
+            const winrt::com_ptr<IStream> stream = CreateUtf8MemoryStream(kToolbarIconSvgs[i]);
+            AGSHOT_CHECK_HR(context5->CreateSvgDocument(
+                stream.get(), D2D1::SizeF(kIconInk, kIconInk), m_iconSvgs[i].put()));
+        }
+        m_svgContext = context;
     }
 
     void HudRenderer::DrawDim(ID2D1DeviceContext* context, UINT width, UINT height,
@@ -686,118 +652,58 @@ namespace agshot
             context->FillRoundedRectangle(ToRoundedRect(toolbar.cancel, btnRadius), brushes.hover.get());
         }
 
+        (void)factory;
+        (void)roundStroke;
+        (void)flatStroke;
         const int inset = MulDiv(kIconInset, dpi, 96);
-        DrawIconEditSelection(context, roundStroke,
-                              InsetRectBy(toolbar.editSelection, inset), dpi,
-                              editActive ? brushes.handleFill.get() : brushes.icon.get());
-        DrawIconTextRecognition(factory, context, flatStroke,
-                                InsetRectBy(toolbar.textRecognition, inset), dpi,
-                                textActive ? brushes.handleFill.get() : brushes.icon.get());
-        DrawIconCopy(factory, context, roundStroke, brushes, dpi, InsetRectBy(toolbar.copy, inset));
-        DrawIconCancel(context, roundStroke,
+        DrawToolbarSvg(context, ToolbarIconKind::EditSelection,
+                       InsetRectBy(toolbar.editSelection, inset), dpi,
+                       editActive ? brushes.handleFill.get() : brushes.icon.get());
+        DrawToolbarSvg(context, ToolbarIconKind::TextRecognition,
+                       InsetRectBy(toolbar.textRecognition, inset), dpi,
+                       textActive ? brushes.handleFill.get() : brushes.icon.get());
+        DrawToolbarSvg(context, ToolbarIconKind::Copy,
+                       InsetRectBy(toolbar.copy, inset), dpi, brushes.icon.get());
+        DrawToolbarSvg(context, ToolbarIconKind::Cancel,
                        InsetRectBy(toolbar.cancel, inset), dpi, brushes.cancel.get());
     }
 
-    void HudRenderer::DrawIconEditSelection(ID2D1DeviceContext* context,
-                                            ID2D1StrokeStyle* roundStroke,
-                                            const RECT& box, int dpi,
-                                            ID2D1SolidColorBrush* brush)
+    void HudRenderer::DrawToolbarSvg(ID2D1DeviceContext* context, ToolbarIconKind kind,
+                                     const RECT& box, int dpi, ID2D1SolidColorBrush* brush)
     {
-        const float stroke = ScaleByDpi(kIconStroke, dpi);
-        const float inset =
-            (static_cast<float>(box.right - box.left) + stroke - ScaleByDpi(kIconInk, dpi)) * 0.5f;
-        const float left = static_cast<float>(box.left) + inset;
-        const float top = static_cast<float>(box.top) + inset;
-        const float right = static_cast<float>(box.right) - inset;
-        const float bottom = static_cast<float>(box.bottom) - inset;
-        const float corner = std::min(ScaleByDpi(5, dpi), std::min(right - left, bottom - top) * 0.35f);
-        const auto line = [&](float x1, float y1, float x2, float y2)
+        EnsureToolbarSvgs(context);
+        ID2D1SvgDocument* svg = m_iconSvgs[static_cast<std::size_t>(kind)].get();
+        if (svg == nullptr)
         {
-            context->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x2, y2),
-                              brush, stroke, roundStroke);
-        };
-        line(left, top + corner, left, top);
-        line(left, top, left + corner, top);
-        line(right - corner, top, right, top);
-        line(right, top, right, top + corner);
-        line(left, bottom - corner, left, bottom);
-        line(left, bottom, left + corner, bottom);
-        line(right - corner, bottom, right, bottom);
-        line(right, bottom - corner, right, bottom);
-    }
-
-    void HudRenderer::DrawIconTextRecognition(ID2D1Factory1* factory, ID2D1DeviceContext* context,
-                                              ID2D1StrokeStyle* flatStroke, const RECT& box,
-                                              int dpi, ID2D1SolidColorBrush* brush)
-    {
-        const float stroke = ScaleByDpi(kIconStroke, dpi);
-        const TextRecognitionIcon icon =
-            LayoutTextRecognitionIcon(box, ScaleByDpi(kIconInk, dpi), stroke);
-
-        winrt::com_ptr<ID2D1PathGeometry> brackets;
-        AGSHOT_CHECK_HR(factory->CreatePathGeometry(brackets.put()));
-        winrt::com_ptr<ID2D1GeometrySink> sink;
-        AGSHOT_CHECK_HR(brackets->Open(sink.put()));
-        for (const auto& bracket : icon.brackets)
-        {
-            sink->BeginFigure(bracket.points[0], D2D1_FIGURE_BEGIN_HOLLOW);
-            for (std::size_t i = 1; i < bracket.count; ++i)
-            {
-                sink->AddLine(bracket.points[i]);
-            }
-            sink->EndFigure(D2D1_FIGURE_END_OPEN);
+            return;
         }
-        AGSHOT_CHECK_HR(sink->Close());
 
-        context->DrawGeometry(brackets.get(), brush, icon.stroke, flatStroke);
-        for (int i = 0; i < 3; ++i)
+        winrt::com_ptr<ID2D1DeviceContext5> context5;
+        AGSHOT_CHECK_HR(context->QueryInterface(__uuidof(ID2D1DeviceContext5), context5.put_void()));
+
+        winrt::com_ptr<ID2D1SvgElement> root;
+        svg->GetRoot(root.put());
+        if (root && brush != nullptr)
         {
-            context->DrawLine(icon.barFrom[i], icon.barTo[i], brush, icon.stroke, flatStroke);
+            AGSHOT_CHECK_HR(root->SetAttributeValue(L"stroke", brush->GetColor()));
         }
-    }
 
-    void HudRenderer::DrawIconCopy(ID2D1Factory1* factory, ID2D1DeviceContext* context,
-                                   ID2D1StrokeStyle* roundStroke, const HudBrushes& brushes,
-                                   int dpi, const RECT& box)
-    {
-        const float stroke = ScaleByDpi(kIconStroke, dpi);
-        const float ink = ScaleByDpi(kIconInk, dpi);
-        const float localStroke = stroke * 18.0f / (std::max(1.0f, ink) - stroke);
-        EnsureCopyIconGeometry(factory, roundStroke, localStroke);
+        const float scale = ScaleByDpi(1.0f, dpi);
+        const float inkSpan = kIconInk * scale;
+        const float left = static_cast<float>(box.left)
+            + (static_cast<float>(box.right - box.left) - inkSpan) * 0.5f;
+        const float top = static_cast<float>(box.top)
+            + (static_cast<float>(box.bottom - box.top) - inkSpan) * 0.5f;
 
         D2D1_MATRIX_3X2_F original{};
         context->GetTransform(&original);
-        const float boxSpan = static_cast<float>(box.right - box.left);
-        const float scale = (ink - stroke) / 18.0f;
-        const float offset = (boxSpan - ink + stroke) * 0.5f;
         const D2D1_MATRIX_3X2_F iconTransform =
             D2D1::Matrix3x2F::Scale(scale, scale)
-            * D2D1::Matrix3x2F::Translation(
-                static_cast<float>(box.left) + offset, static_cast<float>(box.top) + offset)
+            * D2D1::Matrix3x2F::Translation(left, top)
             * original;
         context->SetTransform(iconTransform);
-        context->FillGeometry(m_copyIconGeometry.get(), brushes.icon.get());
+        context5->DrawSvgDocument(svg);
         context->SetTransform(original);
-    }
-
-    void HudRenderer::DrawIconCancel(ID2D1DeviceContext* context, ID2D1StrokeStyle* roundStroke,
-                                     const RECT& box, int dpi, ID2D1SolidColorBrush* brush)
-    {
-        const float stroke = ScaleByDpi(kIconStroke, dpi);
-        const float inset = (static_cast<float>(box.right - box.left)
-                             + stroke - ScaleByDpi(kIconInk, dpi)) * 0.5f;
-
-        const D2D1_POINT_2F topLeft{ static_cast<float>(box.left) + inset,
-                                     static_cast<float>(box.top) + inset };
-        const D2D1_POINT_2F bottomRight{ static_cast<float>(box.right) - inset,
-                                         static_cast<float>(box.bottom) - inset };
-        const D2D1_POINT_2F topRight{ static_cast<float>(box.right) - inset,
-                                      static_cast<float>(box.top) + inset };
-        const D2D1_POINT_2F bottomLeft{ static_cast<float>(box.left) + inset,
-                                        static_cast<float>(box.bottom) - inset };
-
-        context->DrawLine(topLeft, bottomRight, brush, stroke, roundStroke);
-        context->DrawLine(topRight, bottomLeft, brush, stroke, roundStroke);
     }
 
     void HudRenderer::DrawTooltip(const RenderDevice& device, UINT surfaceWidth, UINT surfaceHeight,

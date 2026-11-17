@@ -8,7 +8,9 @@
 
 #include <windows.h>
 
+#include <array>
 #include <d2d1_1.h>
+#include <d2d1_3.h>
 #include <dwrite.h>
 
 #include <winrt/base.h>
@@ -78,23 +80,23 @@ namespace agshot
 #endif
 
     private:
-        void EnsureCopyIconGeometry(ID2D1Factory1* factory, ID2D1StrokeStyle* roundStroke,
-                                    float localStroke);
+        enum class ToolbarIconKind : std::size_t
+        {
+            EditSelection = 0,
+            TextRecognition,
+            Copy,
+            Cancel,
+            Count
+        };
+
+        void EnsureToolbarSvgs(ID2D1DeviceContext* context);
         void DrawSizeLabel(const RenderDevice& device, UINT width, UINT height,
                            const RECT& selection);
-        void DrawIconEditSelection(ID2D1DeviceContext* context, ID2D1StrokeStyle* roundStroke,
-                                   const RECT& box, int dpi, ID2D1SolidColorBrush* brush);
-        void DrawIconTextRecognition(ID2D1Factory1* factory, ID2D1DeviceContext* context,
-                                     ID2D1StrokeStyle* flatStroke, const RECT& box,
-                                     int dpi, ID2D1SolidColorBrush* brush);
-        void DrawIconCopy(ID2D1Factory1* factory, ID2D1DeviceContext* context,
-                          ID2D1StrokeStyle* roundStroke, const HudBrushes& brushes,
-                          int dpi, const RECT& box);
-        void DrawIconCancel(ID2D1DeviceContext* context, ID2D1StrokeStyle* roundStroke,
+        void DrawToolbarSvg(ID2D1DeviceContext* context, ToolbarIconKind kind,
                             const RECT& box, int dpi, ID2D1SolidColorBrush* brush);
 
-        winrt::com_ptr<ID2D1PathGeometry> m_copyIconGeometry;
-        float m_copyLocalStroke{};
+        ID2D1DeviceContext* m_svgContext{};
+        std::array<winrt::com_ptr<ID2D1SvgDocument>, static_cast<std::size_t>(ToolbarIconKind::Count)> m_iconSvgs;
         winrt::com_ptr<IDWriteTextLayout> m_sizeLabelLayout;
         RECT m_sizeLabelSelection{};
         bool m_sizeLabelValid{};

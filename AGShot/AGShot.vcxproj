@@ -132,7 +132,6 @@
     <ClInclude Include="src\hud\selection.h" />
     <ClInclude Include="src\hud\spinner_effect.h" />
     <ClInclude Include="src\hud\toolbar.h" />
-    <ClInclude Include="src\hud\toolbar_icon.h" />
     <ClCompile Include="src\core\config.cpp" />
     <ClCompile Include="src\core\config_watcher.cpp" />
     <ClCompile Include="src\core\memory_watch.cpp" />
