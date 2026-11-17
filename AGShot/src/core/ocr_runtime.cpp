@@ -1,7 +1,10 @@
 #include "pch.h"
 
 #include "core/ocr_runtime.h"
+#include "../../../OcrEngine/src/ocr_engine.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <exception>
 #include <new>
 #include <string>
@@ -50,6 +53,8 @@ namespace agshot
         }
     }
 
+    OcrRuntime::OcrRuntime() = default;
+
     OcrRuntime::~OcrRuntime()
     {
         Shutdown();
@@ -95,13 +100,47 @@ namespace agshot
         return m_work != nullptr;
     }
 
-    std::shared_ptr<OcrCompletion> OcrRuntime::Submit(HWND target, ppocr::ImageBGR image)
+    std::shared_ptr<OcrCompletion> OcrRuntime::SubmitRegion(
+        HWND target, const void* pixels,
+        int imageWidth, int imageHeight, int imageStride,
+        const RECT& crop)
     {
-        if (!m_work) return {};
+        if (!m_work || pixels == nullptr || imageWidth <= 0 || imageHeight <= 0 || imageStride <= 0)
+        {
+            return {};
+        }
+
+        const int left = std::clamp<int>(crop.left, 0, imageWidth);
+        const int top = std::clamp<int>(crop.top, 0, imageHeight);
+        const int right = std::clamp<int>(crop.right, left, imageWidth);
+        const int bottom = std::clamp<int>(crop.bottom, top, imageHeight);
+        const int width = right - left;
+        const int height = bottom - top;
+        if (width <= 0 || height <= 0)
+        {
+            return {};
+        }
+
+        // Copy only raw BGRA rows on the UI thread; alpha stripping happens on
+        // the worker thread so entering OCR mode stays responsive.
+        BgraImage region;
+        region.width = width;
+        region.height = height;
+        const std::size_t rowBytes = static_cast<std::size_t>(width) * 4;
+        region.pixels.resize(rowBytes * static_cast<std::size_t>(height));
+        const auto* source = static_cast<const std::uint8_t*>(pixels);
+        for (int y = 0; y < height; ++y)
+        {
+            const std::uint8_t* row = source
+                + static_cast<std::size_t>(top + y) * static_cast<std::size_t>(imageStride)
+                + static_cast<std::size_t>(left) * 4;
+            std::memcpy(region.pixels.data() + static_cast<std::size_t>(y) * rowBytes, row, rowBytes);
+        }
+
         auto completion = std::make_shared<OcrCompletion>();
         std::lock_guard lock(m_mutex);
         if (m_stopping) return {};
-        m_pending = Job{ target, completion, std::move(image) };
+        m_pending = Job{ target, completion, std::move(region) };
         if (!m_queued)
         {
             m_queued = true;
@@ -171,7 +210,22 @@ namespace agshot
 
             try
             {
-                const auto lines = m_engine->recognize(job.image);
+                ppocr::ImageBGR bgr;
+                bgr.width = job.image.width;
+                bgr.height = job.image.height;
+                bgr.channels = 3;
+                bgr.data.resize(static_cast<std::size_t>(job.image.width) * job.image.height * 3);
+                const std::size_t pixelCount = static_cast<std::size_t>(job.image.width) * job.image.height;
+                const std::uint8_t* src = job.image.pixels.data();
+                std::uint8_t* dst = bgr.data.data();
+                for (std::size_t i = 0; i < pixelCount; ++i)
+                {
+                    dst[i * 3 + 0] = src[i * 4 + 0];
+                    dst[i * 3 + 1] = src[i * 4 + 1];
+                    dst[i * 3 + 2] = src[i * 4 + 2];
+                }
+
+                const auto lines = m_engine->recognize(bgr);
                 std::wstring text;
                 for (const auto& line : lines)
                 {

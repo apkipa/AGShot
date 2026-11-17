@@ -1,14 +1,19 @@
 #pragma once
 
-#include "../../../OcrEngine/src/ocr_engine.hpp"
-
 #include <windows.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
+
+namespace ppocr
+{
+    class OcrEngine;
+}
 
 namespace agshot
 {
@@ -33,7 +38,7 @@ namespace agshot
     class OcrRuntime
     {
     public:
-        OcrRuntime() = default;
+        OcrRuntime();
         ~OcrRuntime();
 
         OcrRuntime(const OcrRuntime&) = delete;
@@ -42,7 +47,13 @@ namespace agshot
         void Start(const std::filesystem::path& models,
                    const std::filesystem::path& cache);
         bool available() const noexcept;
-        std::shared_ptr<OcrCompletion> Submit(HWND target, ppocr::ImageBGR image);
+
+        // Copies the cropped BGRA rows out of the frozen capture and converts
+        // to 24bpp BGR on the worker thread before calling the NPU engine.
+        std::shared_ptr<OcrCompletion> SubmitRegion(
+            HWND target, const void* pixels,
+            int imageWidth, int imageHeight, int imageStride,
+            const RECT& crop);
 
         // Refuses further requests, waits for a running recognition, and
         // releases the models. Safe to call more than once; the destructor does
@@ -52,11 +63,18 @@ namespace agshot
         void Shutdown();
 
     private:
+        struct BgraImage
+        {
+            int width{};
+            int height{};
+            std::vector<std::uint8_t> pixels; // tightly packed top-down BGRA
+        };
+
         struct Job
         {
             HWND target{};
             std::shared_ptr<OcrCompletion> completion;
-            ppocr::ImageBGR image;
+            BgraImage image;
         };
 
         static VOID CALLBACK WorkCallback(PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WORK);

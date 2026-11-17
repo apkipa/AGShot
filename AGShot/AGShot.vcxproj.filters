@@ -45,7 +45,22 @@
     <ClInclude Include="src\core\ui_element.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\hud\compositor_clock.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\hud_renderer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\hud_theme.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\ocr_text_panel.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\hud\overlay.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\render_device.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\hud\selection.h">
@@ -65,7 +80,19 @@
     <ClCompile Include="src\core\ui_element.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\hud\compositor_clock.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\hud_renderer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\ocr_text_panel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\hud\overlay.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\render_device.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\hud\selection.cpp">
