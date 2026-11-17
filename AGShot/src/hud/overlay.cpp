@@ -8,7 +8,6 @@
 #include "core/screen_capture.h"
 
 #include <d3d11.h>
-#include <dxgi1_2.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -96,6 +95,8 @@ namespace agshot
             return frequency;
         }
         constexpr UINT kSelectionAnimationFrameMessage = WM_APP + 0x4A;
+        constexpr UINT kMemoryPressureMessage = WM_APP + 0x4D;
+        constexpr UINT kVramPressureMessage = WM_APP + 0x4E;
         constexpr DWORD kCompositorClockTimeoutMs = 50;
         constexpr DWORD kClockRetryDelayMs = 50;
 
@@ -282,6 +283,8 @@ namespace agshot
             return false;
         }
 
+        m_lowMemoryHandle = CreateMemoryResourceNotification(LowMemoryResourceNotification);
+
         m_dpi = static_cast<int>(GetDpiForWindow(m_window));
         if (m_dpi <= 0)
         {
@@ -305,6 +308,8 @@ namespace agshot
         StopSelectionAnimation();
         StopAnimationClock();
         StopOcrSelection();
+        StopLowMemoryWatch(true);
+        StopVramWatch();
         m_ocrCompletion.reset();
         m_ocrPending = false;
         if (m_window != nullptr)
@@ -318,6 +323,12 @@ namespace agshot
         }
 
         InvalidateTextLayouts();
+        m_background = nullptr;
+        m_image.Clear();
+        m_picker.Trim();
+        std::vector<RECT>{}.swap(m_ladder);
+        m_ocrText.clear();
+        m_ocrText.shrink_to_fit();
         m_surface = nullptr;
         m_visual = nullptr;
         m_target = nullptr;
@@ -336,7 +347,8 @@ namespace agshot
         m_tooltip = nullptr;
         m_textScrollThumb = nullptr;
         m_textScrollTrack = nullptr;
-        m_spinnerEffect = nullptr;
+        m_spinnerBitmap = nullptr;
+        m_spinnerDpi = 0;
         m_hover = nullptr;
         m_panelEdge = nullptr;
         m_panel = nullptr;
@@ -587,7 +599,7 @@ namespace agshot
         brush(0.90f, 0.91f, 0.93f, 1.0f, m_textScrollTrack);
         brush(0.48f, 0.51f, 0.56f, 1.0f, m_textScrollThumb);
 
-        CreateSpinnerEffect();
+        StartVramWatch();
     }
 
     // The device-facing part of the rebuild. Split out so that recovery can
@@ -654,6 +666,7 @@ namespace agshot
         {
             return hr;
         }
+        m_surfaceTrimmed = false;
         return m_composition->Commit();
     }
 
@@ -691,6 +704,7 @@ namespace agshot
     // independent resources and rebuilding them would only throw away work.
     void Overlay::DiscardDeviceResources() noexcept
     {
+        StopVramWatch();
         if (m_d2dContext)
         {
             m_d2dContext->SetTarget(nullptr);
@@ -710,9 +724,11 @@ namespace agshot
         m_tooltip = nullptr;
         m_textScrollTrack = nullptr;
         m_textScrollThumb = nullptr;
-        m_spinnerEffect = nullptr;
+        m_spinnerBitmap = nullptr;
+        m_spinnerDpi = 0;
         m_magnifierLayer = nullptr;
         m_surface = nullptr;
+        m_surfaceTrimmed = false;
         m_visual = nullptr;
         m_target = nullptr;
         m_composition = nullptr;
@@ -721,14 +737,33 @@ namespace agshot
         m_dxgiDevice = nullptr;
     }
 
-    // Rebuilds the bitmap drawn under everything else from the capture that is
-    // still held. The device lost a bitmap, not the screen it came from.
+    // Rebuilds or updates the bitmap drawn under everything else from the
+    // capture that is held. Reusing an existing matching bitmap skips GPU
+    // allocation on repeat captures.
     HRESULT Overlay::CreateBackgroundBitmap()
     {
-        m_background = nullptr;
         if (!m_d2dContext || m_image.empty())
         {
+            m_background = nullptr;
             return S_FALSE;
+        }
+
+        const UINT32 width = static_cast<UINT32>(m_image.width());
+        const UINT32 height = static_cast<UINT32>(m_image.height());
+        const UINT32 stride = static_cast<UINT32>(m_image.stride());
+
+        if (m_background)
+        {
+            const D2D1_SIZE_U existing = m_background->GetPixelSize();
+            if (existing.width == width && existing.height == height)
+            {
+                const HRESULT hr = m_background->CopyFromMemory(nullptr, m_image.pixels(), stride);
+                if (SUCCEEDED(hr) || IsDeviceLost(hr))
+                {
+                    return hr;
+                }
+            }
+            m_background = nullptr;
         }
 
         const D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
@@ -736,10 +771,9 @@ namespace agshot
             96.0f,
             96.0f);
         return m_d2dContext->CreateBitmap(
-            D2D1::SizeU(static_cast<UINT32>(m_image.width()),
-                        static_cast<UINT32>(m_image.height())),
+            D2D1::SizeU(width, height),
             m_image.pixels(),
-            static_cast<UINT32>(m_image.stride()),
+            stride,
             properties,
             m_background.put());
     }
@@ -869,23 +903,16 @@ namespace agshot
                          SWP_NOACTIVATE);
         }
 
-        // Freeze the z-order/window snapshot while the overlay is still hidden.
-        // UIA nodes are expanded lazily on this same STA thread and cached by the
-        // picker; mouse moves never re-enumerate the desktop.
+        // Freeze the screen pixels immediately while the overlay is hidden, then
+        // snapshot window bounds (with UIA COM setup deferred) and upload into
+        // the warm background bitmap.
+        m_image.Capture(m_bounds);
         m_picker.Freeze(m_window);
         m_ladder.clear();
         m_lastQuery = 0;
         StopSelectionAnimation();
         StopAnimationClock();
-        ClearSurface();
 
-        // Taken while the overlay is still hidden, so what it holds is the
-        // desktop rather than the previous capture.
-        m_image.Capture(m_bounds);
-
-        // The capture is new, so the bitmap is too. If the device went away
-        // since it was last used, rebuilding it rebuilds this bitmap from the
-        // capture just taken, so the frame drawn below still has a picture.
         HRESULT backgroundHr = CreateBackgroundBitmap();
         if (IsDeviceLost(backgroundHr))
         {
@@ -923,8 +950,8 @@ namespace agshot
         m_toolbarVisible = false;
         m_toolbar.hovered = ToolbarButton::None;
 
-        // Resolve and draw the initial suggestion while hidden so the previous
-        // capture cannot flash when the overlay is shown.
+        // Resolve and draw the initial suggestion while hidden so the very first
+        // visible frame already has both the frozen desktop and smart selection.
         POINT cursor{};
         if (GetCursorPos(&cursor))
         {
@@ -937,7 +964,7 @@ namespace agshot
         // A frame that could not get a device leaves nothing to show. Opening
         // the window anyway would put an invisible layer over the desktop that
         // still takes every click; GiveUpRendering() has already reported why.
-        if (!m_surface)
+        if (!m_surface || m_failed)
         {
             Cancel();
             return;
@@ -949,7 +976,6 @@ namespace agshot
                      SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
         SetForegroundWindow(m_window);
         SetFocus(m_window);
-
     }
 
     void Overlay::Cancel() noexcept
@@ -975,6 +1001,38 @@ namespace agshot
         m_pendingConfirm = false;
         m_toolbarVisible = false;
         m_toolbar.hovered = ToolbarButton::None;
+
+        // Always drop cross-process UIA element proxies and per-session text
+        // state, while keeping the capture bitmap, background texture, and
+        // surface warm for instant F1 unless memory or VRAM is tight.
+        m_picker.Clear();
+        m_ladder.clear();
+        m_ocrText.clear();
+        if (m_ocrText.capacity() > 4096)
+        {
+            m_ocrText.shrink_to_fit();
+        }
+        m_ocrLayout = nullptr;
+        m_ocrLayoutText.clear();
+        m_ocrHitMetrics.clear();
+        m_ocrCacheValid = false;
+
+        if (IsSystemMemoryLow())
+        {
+            TrimCpuCaches();
+            TrimGpuCaches();
+        }
+        else
+        {
+            if (!m_image.empty())
+            {
+                ArmLowMemoryWatch();
+            }
+            if (IsVideoMemoryTight())
+            {
+                TrimGpuCaches();
+            }
+        }
 
         if (m_previousForeground != nullptr && IsWindow(m_previousForeground))
         {
@@ -1081,7 +1139,12 @@ namespace agshot
     // matters because the frame handler below redraws unconditionally.
     void Overlay::RequestRender()
     {
-        if (m_window == nullptr || !IsWindowVisible(m_window))
+        if (m_window == nullptr)
+        {
+            return;
+        }
+
+        if (!IsWindowVisible(m_window))
         {
             Render();
             return;
@@ -2385,52 +2448,207 @@ namespace agshot
         RequestRender();
     }
 
-    void Overlay::ClearSurface()
+    VOID CALLBACK Overlay::LowMemoryWaitCallback(PVOID context, BOOLEAN)
     {
-        if (!m_surface || m_width == 0 || m_height == 0)
+        HWND hwnd = static_cast<HWND>(context);
+        if (hwnd != nullptr)
+        {
+            PostMessageW(hwnd, kMemoryPressureMessage, 0, 0);
+        }
+    }
+
+    VOID CALLBACK Overlay::VramWaitCallback(PVOID context, BOOLEAN)
+    {
+        HWND hwnd = static_cast<HWND>(context);
+        if (hwnd != nullptr)
+        {
+            PostMessageW(hwnd, kVramPressureMessage, 0, 0);
+        }
+    }
+
+    void Overlay::ArmLowMemoryWatch() noexcept
+    {
+        if (m_window == nullptr || m_lowMemoryHandle == nullptr || m_lowMemoryWait != nullptr)
         {
             return;
         }
 
-        HRESULT hr = m_surface->Trim(nullptr, 0);
-        if (SUCCEEDED(hr))
-        {
-            hr = m_composition->Commit();
-        }
-        if (IsDeviceLost(hr))
-        {
-            const HRESULT recoverHr = RecoverDeviceResources();
-            if (FAILED(recoverHr) || !m_surface)
-            {
-                // Begin() calls this before the window is shown: throwing here
-                // would reach the main window procedure and end the process,
-                // which is the one outcome a lost device must never produce.
-                if (FAILED(recoverHr))
-                {
-                    GiveUpRendering(recoverHr, L"Overlay::RecoverDeviceResources");
-                }
-                else
-                {
-                    GiveUpRendering(hr, L"Overlay::ClearSurface");
-                }
-                return;
-            }
+        // LowMemoryResourceNotification is level-triggered while memory stays low,
+        // so WT_EXECUTEONLYONCE prevents callback spinning; Cancel() re-arms when
+        // warm idle caches exist again.
+        RegisterWaitForSingleObject(
+            &m_lowMemoryWait,
+            m_lowMemoryHandle,
+            &Overlay::LowMemoryWaitCallback,
+            m_window,
+            INFINITE,
+            WT_EXECUTEONLYONCE);
+    }
 
-            hr = m_surface->Trim(nullptr, 0);
-            if (SUCCEEDED(hr))
-            {
-                hr = m_composition->Commit();
-            }
+    void Overlay::StopLowMemoryWatch(bool closeHandle) noexcept
+    {
+        if (m_lowMemoryWait != nullptr)
+        {
+            UnregisterWaitEx(m_lowMemoryWait, INVALID_HANDLE_VALUE);
+            m_lowMemoryWait = nullptr;
+        }
+        if (closeHandle && m_lowMemoryHandle != nullptr)
+        {
+            CloseHandle(m_lowMemoryHandle);
+            m_lowMemoryHandle = nullptr;
+        }
+    }
 
-            // A freshly built device that loses the surface again is not going
-            // to survive a second rebuild either.
-            if (IsDeviceLost(hr))
+    bool Overlay::IsSystemMemoryLow() const noexcept
+    {
+        BOOL lowMemory = FALSE;
+        return m_lowMemoryHandle != nullptr
+            && QueryMemoryResourceNotification(m_lowMemoryHandle, &lowMemory)
+            && lowMemory != FALSE;
+    }
+
+    void Overlay::StartVramWatch() noexcept
+    {
+        StopVramWatch();
+        if (m_window == nullptr || !m_dxgiDevice)
+        {
+            return;
+        }
+
+        winrt::com_ptr<IDXGIAdapter> adapter;
+        if (FAILED(m_dxgiDevice->GetAdapter(adapter.put())) || !adapter)
+        {
+            return;
+        }
+        m_dxgiAdapter3 = adapter.try_as<IDXGIAdapter3>();
+        if (!m_dxgiAdapter3)
+        {
+            return;
+        }
+
+        m_vramBudgetEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (m_vramBudgetEvent == nullptr)
+        {
+            m_dxgiAdapter3 = nullptr;
+            return;
+        }
+
+        if (FAILED(m_dxgiAdapter3->RegisterVideoMemoryBudgetChangeNotificationEvent(
+                m_vramBudgetEvent, &m_vramBudgetCookie)))
+        {
+            CloseHandle(m_vramBudgetEvent);
+            m_vramBudgetEvent = nullptr;
+            m_dxgiAdapter3 = nullptr;
+            return;
+        }
+
+        if (!RegisterWaitForSingleObject(
+                &m_vramBudgetWait,
+                m_vramBudgetEvent,
+                &Overlay::VramWaitCallback,
+                m_window,
+                INFINITE,
+                WT_EXECUTEDEFAULT))
+        {
+            m_dxgiAdapter3->UnregisterVideoMemoryBudgetChangeNotification(m_vramBudgetCookie);
+            m_vramBudgetCookie = 0;
+            CloseHandle(m_vramBudgetEvent);
+            m_vramBudgetEvent = nullptr;
+            m_dxgiAdapter3 = nullptr;
+        }
+    }
+
+    void Overlay::StopVramWatch() noexcept
+    {
+        if (m_vramBudgetWait != nullptr)
+        {
+            UnregisterWaitEx(m_vramBudgetWait, INVALID_HANDLE_VALUE);
+            m_vramBudgetWait = nullptr;
+        }
+        if (m_dxgiAdapter3 && m_vramBudgetCookie != 0)
+        {
+            m_dxgiAdapter3->UnregisterVideoMemoryBudgetChangeNotification(m_vramBudgetCookie);
+            m_vramBudgetCookie = 0;
+        }
+        if (m_vramBudgetEvent != nullptr)
+        {
+            CloseHandle(m_vramBudgetEvent);
+            m_vramBudgetEvent = nullptr;
+        }
+        m_dxgiAdapter3 = nullptr;
+    }
+
+    bool Overlay::IsVideoMemoryTight() const noexcept
+    {
+        if (!m_dxgiAdapter3)
+        {
+            return false;
+        }
+
+        for (DXGI_MEMORY_SEGMENT_GROUP group :
+             { DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL })
+        {
+            DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+            if (SUCCEEDED(m_dxgiAdapter3->QueryVideoMemoryInfo(0, group, &info))
+                && info.Budget > 0
+                && info.CurrentUsage >= (info.Budget / 100) * 85)
             {
-                GiveUpRendering(hr, L"Overlay::ClearSurface");
-                return;
+                return true;
             }
         }
-        AGSHOT_CHECK_HR(hr);
+        return false;
+    }
+
+    void Overlay::TrimCpuCaches() noexcept
+    {
+        m_image.Clear();
+        m_picker.Trim();
+        std::vector<RECT>{}.swap(m_ladder);
+        m_ocrText.clear();
+        m_ocrText.shrink_to_fit();
+    }
+
+    void Overlay::TrimGpuCaches() noexcept
+    {
+        InvalidateTextLayouts();
+        m_background = nullptr;
+        m_spinnerBitmap = nullptr;
+        m_spinnerDpi = 0;
+        if (!m_surfaceTrimmed && m_surface && m_width > 0 && m_height > 0)
+        {
+            if (SUCCEEDED(m_surface->Trim(nullptr, 0)) && m_composition)
+            {
+                m_composition->Commit();
+            }
+            m_surfaceTrimmed = true;
+        }
+        if (auto dxgiDevice3 = m_dxgiDevice.try_as<IDXGIDevice3>())
+        {
+            dxgiDevice3->Trim();
+        }
+    }
+
+    void Overlay::OnMemoryPressure() noexcept
+    {
+        StopLowMemoryWatch(false);
+        if (m_window == nullptr || IsWindowVisible(m_window) || m_beginning)
+        {
+            return;
+        }
+        TrimCpuCaches();
+        TrimGpuCaches();
+    }
+
+    void Overlay::OnVramPressure() noexcept
+    {
+        if (m_window == nullptr || IsWindowVisible(m_window) || m_beginning)
+        {
+            return;
+        }
+        if ((m_background || m_spinnerBitmap || !m_surfaceTrimmed) && IsVideoMemoryTight())
+        {
+            TrimGpuCaches();
+        }
     }
 
 
@@ -2516,7 +2734,12 @@ namespace agshot
 
         try
         {
-            ShowWarning(DescribeHresult(operation, hr, __FILEW__, __LINE__),
+            Failure failure = DescribeHresult(operation, hr, __FILEW__, __LINE__);
+            if (!failure.what.empty())
+            {
+                failure.detail = failure.what + L"\n" + failure.detail;
+            }
+            ShowWarning(std::move(failure),
                         L"AGShot could not rebuild its graphics device, so the capture overlay was closed.");
         }
         catch (...)
@@ -2648,6 +2871,7 @@ namespace agshot
         {
             return surfaceHr;
         }
+        m_surfaceTrimmed = false;
         return m_composition->Commit();
     }
 
@@ -2803,38 +3027,47 @@ namespace agshot
         }
     }
 
-    // Creates the effect that draws the spinner. Its shader is compiled once and
-    // its constants are the only thing that changes per frame.
-    void Overlay::CreateSpinnerEffect()
+    // Rasterizes the recognition spinner on demand for the current DPI. Its
+    // shape never changes across frames, so one small cached bitmap rotated
+    // under a transform replaces runtime HLSL compilation.
+    bool Overlay::EnsureSpinnerBitmap()
     {
-        m_spinnerEffect = nullptr;
-        if (!m_d2dFactory || !m_d2dContext)
+        if (m_spinnerBitmap && m_spinnerDpi == m_dpi)
         {
-            return;
+            return true;
+        }
+        if (!m_d2dContext)
+        {
+            return false;
         }
 
-        winrt::com_ptr<ID2D1Factory1> factory1;
-        if (FAILED(m_d2dFactory->QueryInterface(factory1.put())))
+        SpinnerParameters parameters{};
+        parameters.radius = Scaled(kOcrSpinnerRadius);
+        parameters.half_stroke = Scaled(kOcrSpinnerStroke) * 0.5f;
+        parameters.sweep = kOcrSpinnerSweepDeg * kDegreesToRadians;
+        parameters.tail_alpha = 0.15f;
+        parameters.feather = 1.0f;
+
+        if (FAILED(CreateSpinnerBitmap(
+                m_d2dContext.get(), parameters, D2D1::ColorF(0.18f, 0.49f, 0.94f, 1.0f),
+                m_spinnerBitmap)))
         {
-            return;
+            m_spinnerBitmap = nullptr;
+            m_spinnerDpi = 0;
+            return false;
         }
-        if (FAILED(SpinnerEffect::Register(factory1.get())))
-        {
-            return;
-        }
-        if (FAILED(m_d2dContext->CreateEffect(SpinnerEffect::ClassId(), m_spinnerEffect.put())))
-        {
-            m_spinnerEffect = nullptr;
-        }
+        m_spinnerDpi = m_dpi;
+        return true;
     }
 
     // The arc is turned by the clock rather than by a frame count so its speed
-    // does not follow the compositor's rate. The fade comes from the shader, so
-    // the head is opaque and the tail falls off continuously. The box is empty
-    // behind it, so this is the only mark that says work is still going on.
+    // does not follow the compositor's rate. The fade is pre-baked per pixel at
+    // the current DPI so the head is opaque and the tail falls off continuously.
+    // The box is empty behind it, so this is the only mark that says work is
+    // still going on.
     void Overlay::DrawOcrSpinner()
     {
-        if (!m_spinnerEffect)
+        if (!EnsureSpinnerBitmap())
         {
             return;
         }
@@ -2850,21 +3083,14 @@ namespace agshot
         const float turn = static_cast<float>(
             std::fmod(elapsedMs / static_cast<double>(kOcrSpinnerPeriodMs), 1.0)) * 360.0f;
 
-        SpinnerParameters parameters;
-        parameters.radius = Scaled(kOcrSpinnerRadius);
-        parameters.half_stroke = Scaled(kOcrSpinnerStroke) * 0.5f;
-        parameters.sweep = kOcrSpinnerSweepDeg * kDegreesToRadians;
-        parameters.tail_alpha = 0.15f;
-        parameters.feather = 1.0f;
-        SpinnerEffect::SetNextParameters(parameters);
+        const D2D1_SIZE_F size = m_spinnerBitmap->GetSize();
+        const float halfWidth = size.width * 0.5f;
+        const float halfHeight = size.height * 0.5f;
+        const D2D1_RECT_F destination{ -halfWidth, -halfHeight, halfWidth, halfHeight };
 
-        // The effect draws the arc on its own origin and the same size every
-        // time, so Direct2D rasterizes it once and reuses that. The turn and the
-        // move into the box are this transform, which is what keeps the cached
-        // rasterization correct instead of something that has to be invalidated.
-        //
-        // The context already carries the surface offset, so the turn is composed
-        // in front of it rather than replacing it.
+        // The bitmap is centred on its own origin, so rotating before translating
+        // turns it in place; the context already carries the surface offset, so
+        // the turn is composed in front of it rather than replacing it.
         D2D1_MATRIX_3X2_F saved{};
         m_d2dContext->GetTransform(&saved);
         m_d2dContext->SetTransform(
@@ -2872,9 +3098,8 @@ namespace agshot
             * D2D1::Matrix3x2F::Translation(centerX, centerY)
             * saved);
 
-        m_d2dContext->DrawImage(m_spinnerEffect.get(),
-                                D2D1_INTERPOLATION_MODE_LINEAR,
-                                D2D1_COMPOSITE_MODE_SOURCE_OVER);
+        m_d2dContext->DrawBitmap(m_spinnerBitmap.get(), &destination, 1.0f,
+                                 D2D1_INTERPOLATION_MODE_LINEAR);
 
         m_d2dContext->SetTransform(saved);
     }
@@ -3245,7 +3470,6 @@ namespace agshot
             AGSHOT_CHECK_HR(m_d2dFactory->CreateDevice(m_dxgiDevice.get(), m_d2dDevice.put()));
             AGSHOT_CHECK_HR(m_d2dDevice->CreateDeviceContext(
                 D2D1_DEVICE_CONTEXT_OPTIONS_NONE, m_d2dContext.put()));
-            CreateSpinnerEffect();
         }
 
         // Small enough that the mock text overflows and the scrollbar appears.
@@ -3603,6 +3827,8 @@ namespace agshot
                 m_dpi = 96;
             }
             m_handleSize = MulDiv(kHandleSize, m_dpi, 96);
+            m_spinnerBitmap = nullptr;
+            m_spinnerDpi = 0;
             InvalidateTextLayouts();
             if (m_textFormat)
             {
@@ -3641,10 +3867,12 @@ namespace agshot
             {
                 m_width = static_cast<UINT>(LOWORD(lparam));
                 m_height = static_cast<UINT>(HIWORD(lparam));
-                if (m_width > 0 && m_height > 0)
+                if (m_width > 0 && m_height > 0 && m_window != nullptr)
                 {
                     // A device that has not been rebuilt yet cannot size a
                     // surface; the frame this requests will rebuild it first.
+                    // Skip while CreateWindowExW is still constructing m_window,
+                    // because Overlay::Create() builds the device right after.
                     if (m_d2dContext && m_composition)
                     {
                         CreateSizeDependentResources();
@@ -3689,6 +3917,14 @@ namespace agshot
             }
             return 0;
         }
+
+        case kMemoryPressureMessage:
+            OnMemoryPressure();
+            return 0;
+
+        case kVramPressureMessage:
+            OnVramPressure();
+            return 0;
 
         case WM_PAINT:
         {

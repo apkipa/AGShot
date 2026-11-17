@@ -38,6 +38,9 @@ namespace agshot
         // Throws Error when the screen cannot be read.
         void Capture(const RECT& region);
 
+        // Releases the captured DIB section immediately.
+        void Clear() noexcept;
+
         bool empty() const noexcept { return m_width <= 0 || m_height <= 0; }
         const RECT& region() const noexcept { return m_region; }
         int width() const noexcept { return m_width; }

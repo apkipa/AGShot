@@ -12,6 +12,7 @@
 #include <d2d1_1.h>
 #include <dcomp.h>
 #include <dwrite.h>
+#include <dxgi1_4.h>
 
 #include <winrt/base.h>
 
@@ -178,7 +179,7 @@ namespace agshot
         void EnsureOcrCaretVisible();
         void MoveOcrCaret(WPARAM key);
         void DrawOcrSpinner();
-        void CreateSpinnerEffect();
+        bool EnsureSpinnerBitmap();
         ppocr::ImageBGR OcrImageForSelection() const;
 
         // The pointer shape for a point in client coordinates, and the same
@@ -194,7 +195,18 @@ namespace agshot
         void RecordFrame() noexcept;
         void DrawDebugStats();
 
-        void ClearSurface();
+        void ArmLowMemoryWatch() noexcept;
+        void StopLowMemoryWatch(bool closeHandle) noexcept;
+        bool IsSystemMemoryLow() const noexcept;
+        void StartVramWatch() noexcept;
+        void StopVramWatch() noexcept;
+        bool IsVideoMemoryTight() const noexcept;
+        void TrimCpuCaches() noexcept;
+        void TrimGpuCaches() noexcept;
+        void OnMemoryPressure() noexcept;
+        void OnVramPressure() noexcept;
+        static VOID CALLBACK LowMemoryWaitCallback(PVOID context, BOOLEAN);
+        static VOID CALLBACK VramWaitCallback(PVOID context, BOOLEAN);
         void DrawDim();
         void DrawSelection();
         void DrawTextRecognition();
@@ -224,6 +236,13 @@ namespace agshot
         bool m_failed{};
 
         winrt::com_ptr<IDXGIDevice> m_dxgiDevice;
+        winrt::com_ptr<IDXGIAdapter3> m_dxgiAdapter3;
+        HANDLE m_lowMemoryHandle{};
+        HANDLE m_lowMemoryWait{};
+        HANDLE m_vramBudgetEvent{};
+        DWORD m_vramBudgetCookie{};
+        HANDLE m_vramBudgetWait{};
+        bool m_surfaceTrimmed{};
         winrt::com_ptr<ID2D1Factory1> m_d2dFactory;
         winrt::com_ptr<ID2D1Device> m_d2dDevice;
         winrt::com_ptr<ID2D1DeviceContext> m_d2dContext;
@@ -249,12 +268,10 @@ namespace agshot
         // so a proof image is reproducible.
         bool m_ocrSpinnerProbe{};
 #endif
-        // The spinner is drawn by a custom effect that evaluates the conic
-        // gradient per pixel, so nothing here is tessellated or banded. One
-        // instance is enough: the arc's shape never changes, so Direct2D caches
-        // its rasterization and the turning comes from the transform it is drawn
-        // under.
-        winrt::com_ptr<ID2D1Effect> m_spinnerEffect;
+        // The spinner bitmap is rasterized on demand for the current DPI from
+        // its vector parameters and rotated under a transform.
+        winrt::com_ptr<ID2D1Bitmap1> m_spinnerBitmap;
+        int m_spinnerDpi{};
 
         winrt::com_ptr<ID2D1Layer> m_magnifierLayer;
         winrt::com_ptr<IDCompositionDevice> m_composition;

@@ -150,6 +150,44 @@ namespace agshot
 
     struct ElementPicker::Impl
     {
+        void EnsureAutomation() noexcept
+        {
+            // COM is already initialised as STA by the application. Keep UIA on this
+            // thread; do not create a second worker just to move the first provider call.
+            if (!automation
+                && FAILED(CoCreateInstance(CLSID_CUIAutomation8, nullptr, CLSCTX_INPROC_SERVER,
+                                           IID_PPV_ARGS(automation.put()))))
+            {
+                return;
+            }
+            if (!automation2)
+            {
+                automation2 = automation.try_as<IUIAutomation2>();
+            }
+            if (!automation2)
+            {
+                return;
+            }
+
+            if (!request || !controlView)
+            {
+                if (FAILED(automation->CreateCacheRequest(request.put()))
+                    || FAILED(automation->get_ControlViewCondition(controlView.put())))
+                {
+                    request = nullptr;
+                    controlView = nullptr;
+                    return;
+                }
+
+                request->put_TreeScope(static_cast<TreeScope>(TreeScope_Element | TreeScope_Children));
+                request->put_TreeFilter(controlView.get());
+                request->put_AutomationElementMode(AutomationElementMode_Full);
+                request->AddProperty(UIA_BoundingRectanglePropertyId);
+                request->AddProperty(UIA_IsOffscreenPropertyId);
+                request->AddProperty(UIA_ControlTypePropertyId);
+            }
+        }
+
         winrt::com_ptr<IUIAutomation> automation;
         winrt::com_ptr<IUIAutomation2> automation2;
         winrt::com_ptr<IUIAutomationCacheRequest> request;
@@ -165,47 +203,29 @@ namespace agshot
 
     ElementPicker::~ElementPicker() = default;
 
+    void ElementPicker::Clear() noexcept
+    {
+        m_impl->windows.clear();
+        m_impl->totalNodes = 0;
+    }
+
+    void ElementPicker::Trim() noexcept
+    {
+        std::vector<WindowSnapshot>{}.swap(m_impl->windows);
+        m_impl->totalNodes = 0;
+        m_impl->request = nullptr;
+        m_impl->controlView = nullptr;
+        m_impl->automation2 = nullptr;
+        m_impl->automation = nullptr;
+    }
+
     void ElementPicker::Freeze(HWND excludedWindow)
     {
         m_impl->windows.clear();
         m_impl->totalNodes = 0;
-        m_impl->request = nullptr;
-        m_impl->controlView = nullptr;
 
         Enumeration enumeration{ excludedWindow, &m_impl->windows };
         EnumWindows(CollectTopWindow, reinterpret_cast<LPARAM>(&enumeration));
-
-        // COM is already initialised as STA by the application. Keep UIA on this
-        // thread; do not create a second worker just to move the first provider call.
-        if (!m_impl->automation
-            && FAILED(CoCreateInstance(CLSID_CUIAutomation8, nullptr, CLSCTX_INPROC_SERVER,
-                                       IID_PPV_ARGS(m_impl->automation.put()))))
-        {
-            return;
-        }
-        if (!m_impl->automation2)
-        {
-            m_impl->automation2 = m_impl->automation.try_as<IUIAutomation2>();
-        }
-        if (!m_impl->automation2)
-        {
-            return;
-        }
-
-        if (FAILED(m_impl->automation->CreateCacheRequest(m_impl->request.put()))
-            || FAILED(m_impl->automation->get_ControlViewCondition(m_impl->controlView.put())))
-        {
-            m_impl->request = nullptr;
-            m_impl->controlView = nullptr;
-            return;
-        }
-
-        m_impl->request->put_TreeScope(static_cast<TreeScope>(TreeScope_Element | TreeScope_Children));
-        m_impl->request->put_TreeFilter(m_impl->controlView.get());
-        m_impl->request->put_AutomationElementMode(AutomationElementMode_Full);
-        m_impl->request->AddProperty(UIA_BoundingRectanglePropertyId);
-        m_impl->request->AddProperty(UIA_IsOffscreenPropertyId);
-        m_impl->request->AddProperty(UIA_ControlTypePropertyId);
     }
 
     int ElementPicker::Ladder(POINT point, std::vector<RECT>& ladder, int expansionBudget)
@@ -234,6 +254,7 @@ namespace agshot
             return 0;
         }
 
+        m_impl->EnsureAutomation();
         if (!m_impl->automation || !m_impl->automation2 || !m_impl->request)
         {
             for (const RECT& childRect : window->childWindowRects)

@@ -82,9 +82,8 @@
       <SubSystem>Windows</SubSystem>
       <GenerateWindowsMetadata>false</GenerateWindowsMetadata>
       <!-- windowscodecs and psapi come from OcrEngine: it decodes images through
-           WIC and reports process memory through PSAPI. d3dcompiler compiles the
-           spinner's conic-gradient shader at first use. -->
-      <AdditionalDependencies>d2d1.lib;d3d11.lib;dcomp.lib;dwrite.lib;dxgi.lib;shell32.lib;comctl32.lib;ole32.lib;gdi32.lib;dwmapi.lib;uiautomationcore.lib;windowscodecs.lib;psapi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+           WIC and reports process memory through PSAPI. -->
+      <AdditionalDependencies>d2d1.lib;d3d11.lib;dcomp.lib;dwrite.lib;dxgi.lib;shell32.lib;comctl32.lib;ole32.lib;gdi32.lib;dwmapi.lib;uiautomationcore.lib;windowscodecs.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">

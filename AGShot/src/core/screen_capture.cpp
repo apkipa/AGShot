@@ -87,6 +87,27 @@ namespace agshot
             ClipboardLock(const ClipboardLock&) = delete;
             ClipboardLock& operator=(const ClipboardLock&) = delete;
         };
+
+        void BlitScreenToBitmap(HDC screen, HBITMAP target, const RECT& region, int width, int height)
+        {
+            const MemoryDc memory{ CreateCompatibleDC(screen) };
+            AGSHOT_CHECK_WIN32(memory.handle != nullptr);
+
+            HGDIOBJ previous = SelectObject(memory.handle, target);
+            AGSHOT_CHECK_WIN32(previous != nullptr && previous != HGDI_ERROR);
+
+            // CAPTUREBLT so that layered windows - which is most modern UI - are part
+            // of the picture rather than holes in it.
+            const BOOL blitted = BitBlt(memory.handle, 0, 0, width, height,
+                                        screen, region.left, region.top,
+                                        SRCCOPY | CAPTUREBLT);
+            SelectObject(memory.handle, previous);
+            AGSHOT_CHECK_WIN32(blitted != 0);
+
+            // GDI is allowed to hold the blit, and the bits are about to be read as
+            // ordinary memory rather than through the DC.
+            GdiFlush();
+        }
     }
 
     ScreenImage::~ScreenImage() noexcept
@@ -118,6 +139,11 @@ namespace agshot
         return *this;
     }
 
+    void ScreenImage::Clear() noexcept
+    {
+        Release();
+    }
+
     void ScreenImage::Release() noexcept
     {
         if (m_bitmap != nullptr)
@@ -143,6 +169,15 @@ namespace agshot
         const ScreenDc screen{ GetDC(nullptr) };
         AGSHOT_CHECK_WIN32(screen.handle != nullptr);
 
+        // Reuse the warm DIB section when dimensions have not changed so a
+        // repeat capture pays only one BitBlt with zero page allocation.
+        if (m_bitmap != nullptr && m_bits != nullptr && m_width == width && m_height == height)
+        {
+            BlitScreenToBitmap(screen.handle, m_bitmap, region, width, height);
+            m_region = region;
+            return;
+        }
+
         // A top-down 32-bit DIB section: BitBlt writes straight into memory in
         // the order the rest of this file wants to read it, and that memory is
         // the picture this object hands out, with no second pass.
@@ -159,23 +194,7 @@ namespace agshot
         AGSHOT_CHECK_WIN32(bitmap.handle != nullptr);
         AGSHOT_CHECK_WIN32(bits != nullptr);
 
-        const MemoryDc memory{ CreateCompatibleDC(screen.handle) };
-        AGSHOT_CHECK_WIN32(memory.handle != nullptr);
-
-        HGDIOBJ previous = SelectObject(memory.handle, bitmap.handle);
-        AGSHOT_CHECK_WIN32(previous != nullptr && previous != HGDI_ERROR);
-
-        // CAPTUREBLT so that layered windows - which is most modern UI - are part
-        // of the picture rather than holes in it.
-        AGSHOT_CHECK_WIN32(BitBlt(memory.handle, 0, 0, width, height,
-                                  screen.handle, region.left, region.top,
-                                  SRCCOPY | CAPTUREBLT) != 0);
-
-        SelectObject(memory.handle, previous);
-
-        // GDI is allowed to hold the blit, and the bits are about to be read as
-        // ordinary memory rather than through the DC.
-        GdiFlush();
+        BlitScreenToBitmap(screen.handle, bitmap.handle, region, width, height);
 
         // Everything that can fail has happened, so the section takes over as the
         // owner of the pixels from here. Until this point the local keeps them,

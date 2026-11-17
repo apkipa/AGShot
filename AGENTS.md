@@ -9,6 +9,10 @@ If a build variant needs an extra preprocessor definition, inject a props file w
 
 A TODO is one paragraph. Never split it across paragraphs with blank comment lines.
 
+## Deletion
+
+Never perform any real deletion; everything removed goes to the Recycle Bin.
+
 ## Forbidden
 
 Never use subagents.
