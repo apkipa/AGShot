@@ -60,9 +60,10 @@ namespace agshot
     // determined. Anything that ships beside the binary is found through this.
     std::filesystem::path ExecutableDirectory();
 
-    // %APPDATA%\AGShot\config.toml normally. If a file named AGShot.portable
-    // sits next to the executable, <exe dir>\config.toml is used instead, which
-    // is what you want when running from a USB stick or a build output folder.
+    // %APPDATA%\AGShot\config.toml normally. If AGShot.portable or an existing
+    // config.toml sits next to the executable, <exe dir>\config.toml is used
+    // instead, which is what you want when running from a USB stick, portable
+    // zip, or build output folder.
     std::filesystem::path ConfigPath();
 
     struct ConfigLoad

@@ -15,7 +15,7 @@
 namespace agshot
 {
     // Owns Direct3D11, Direct2D, DirectComposition, DirectWrite resources, the
-    // warm background bitmap, and system memory / DXGI VRAM pressure watchers.
+    // warm background bitmap, and DXGI VRAM pressure watching.
     // Owned directly as a value member of Overlay on the STA UI thread.
     class RenderDevice
     {
@@ -26,7 +26,7 @@ namespace agshot
         RenderDevice(const RenderDevice&) = delete;
         RenderDevice& operator=(const RenderDevice&) = delete;
 
-        void Initialize(HWND window, int dpi, UINT lowMemoryMsg, UINT vramMsg);
+        void Initialize(HWND window, int dpi, UINT vramMsg);
         void Destroy() noexcept;
 
         void OnDpiChanged(int dpi);
@@ -40,9 +40,6 @@ namespace agshot
                                POINT& outOffset);
         HRESULT EndFrameDraw(HRESULT drawHr);
 
-        void ArmLowMemoryWatch() noexcept;
-        void AcknowledgeLowMemorySignal() noexcept;
-        bool IsSystemMemoryLow() const noexcept;
         bool IsVideoMemoryTight() const noexcept;
         void TrimGpuCaches() noexcept;
 
@@ -77,15 +74,12 @@ namespace agshot
         void CreateDeviceIndependentResources();
         void CreateDeviceResources();
         void CreateTextFormats();
-        void StopLowMemoryWatch(bool closeHandle) noexcept;
         void StartVramWatch() noexcept;
         void StopVramWatch() noexcept;
 
-        static VOID CALLBACK LowMemoryWaitCallback(PVOID context, BOOLEAN);
         static VOID CALLBACK VramWaitCallback(PVOID context, BOOLEAN);
 
         HWND m_window{};
-        UINT m_lowMemoryMessage{};
         UINT m_vramMessage{};
         int m_dpi{ 96 };
 
@@ -112,8 +106,6 @@ namespace agshot
         winrt::com_ptr<ID2D1Bitmap> m_background;
         HudBrushes m_brushes;
 
-        HANDLE m_lowMemoryHandle{};
-        HANDLE m_lowMemoryWait{};
         HANDLE m_vramBudgetEvent{};
         DWORD m_vramBudgetCookie{};
         HANDLE m_vramBudgetWait{};

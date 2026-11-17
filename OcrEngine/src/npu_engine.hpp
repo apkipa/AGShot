@@ -131,7 +131,8 @@ public:
         bool manual_blob_cache = false, // disable driver cache, keep blobs in cache/lite/
         std::filesystem::path cache_dir = {},
         ze_graph_profiling_dditable_ext_t* profiling_api = nullptr,
-        TraceRecorder* trace = nullptr
+        TraceRecorder* trace = nullptr,
+        std::string expected_sha256 = {}
     );
     ~NpuGraph();
 
@@ -172,6 +173,7 @@ private:
     std::filesystem::path cache_dir_ = L"cache";
     ze_graph_profiling_dditable_ext_t* profiling_api_ = nullptr;
     TraceRecorder* trace_ = nullptr;
+    std::string expected_sha256_;
     std::string graph_name_;
     NpuGraphLoadStats load_stats_;
 };
@@ -214,7 +216,8 @@ public:
 
     std::shared_ptr<NpuGraph> load_model(const std::string& model_path,
                                          size_t num_requests = 2,
-                                         std::span<const int64_t> fill_shape = {});
+                                         std::span<const int64_t> fill_shape = {},
+                                         const std::string& expected_sha256 = {});
 
     ze_context_handle_t context() const { return context_; }
     ze_device_handle_t device() const { return device_; }

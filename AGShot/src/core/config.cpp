@@ -90,9 +90,14 @@ namespace agshot
     std::filesystem::path ConfigPath()
     {
         const auto exeDir = ExecutableDirectory();
-        if (!exeDir.empty() && std::filesystem::exists(exeDir / L"AGShot.portable"))
+        if (!exeDir.empty())
         {
-            return exeDir / L"config.toml";
+            std::error_code ec;
+            if ((std::filesystem::exists(exeDir / L"AGShot.portable", ec) && !ec)
+                || (std::filesystem::is_regular_file(exeDir / L"config.toml", ec) && !ec))
+            {
+                return exeDir / L"config.toml";
+            }
         }
 
         if (const auto roaming = RoamingAppData(); !roaming.empty())

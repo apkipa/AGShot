@@ -136,21 +136,21 @@ namespace agshot
                 case IDM_SETTINGS:
                     if (g_callbacks.settings != nullptr)
                     {
-                        g_callbacks.settings();
+                        g_callbacks.settings(g_callbacks.context);
                     }
                     break;
 
                 case IDM_RELOAD:
                     if (g_callbacks.reload != nullptr)
                     {
-                        g_callbacks.reload();
+                        g_callbacks.reload(g_callbacks.context);
                     }
                     break;
 
                 case IDM_EXIT:
                     if (g_callbacks.exit != nullptr)
                     {
-                        g_callbacks.exit();
+                        g_callbacks.exit(g_callbacks.context);
                     }
                     break;
 
@@ -193,7 +193,7 @@ namespace agshot
                 case WM_LBUTTONUP:
                     if (g_callbacks.activate != nullptr)
                     {
-                        g_callbacks.activate();
+                        g_callbacks.activate(g_callbacks.context);
                     }
                     return 0;
 
@@ -230,7 +230,7 @@ namespace agshot
                     ReportCurrentException(__FILEW__, __LINE__);
                     if (g_callbacks.fatal != nullptr)
                     {
-                        g_callbacks.fatal();
+                        g_callbacks.fatal(g_callbacks.context);
                     }
                 }
                 return 0;

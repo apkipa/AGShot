@@ -43,13 +43,11 @@ namespace agshot
         }
     }
 
-    void RenderDevice::Initialize(HWND window, int dpi, UINT lowMemoryMsg, UINT vramMsg)
+    void RenderDevice::Initialize(HWND window, int dpi, UINT vramMsg)
     {
         m_window = window;
         m_dpi = dpi > 0 ? dpi : 96;
-        m_lowMemoryMessage = lowMemoryMsg;
         m_vramMessage = vramMsg;
-        m_lowMemoryHandle = CreateMemoryResourceNotification(LowMemoryResourceNotification);
 
         CreateDeviceIndependentResources();
         CreateDeviceResources();
@@ -57,7 +55,6 @@ namespace agshot
 
     void RenderDevice::Destroy() noexcept
     {
-        StopLowMemoryWatch(true);
         DiscardDeviceResources();
         m_roundStroke = nullptr;
         m_flatStroke = nullptr;
@@ -344,15 +341,6 @@ namespace agshot
         return m_composition->Commit();
     }
 
-    VOID CALLBACK RenderDevice::LowMemoryWaitCallback(PVOID context, BOOLEAN)
-    {
-        auto* self = static_cast<RenderDevice*>(context);
-        if (self != nullptr && self->m_window != nullptr && self->m_lowMemoryMessage != 0)
-        {
-            PostMessageW(self->m_window, self->m_lowMemoryMessage, 0, 0);
-        }
-    }
-
     VOID CALLBACK RenderDevice::VramWaitCallback(PVOID context, BOOLEAN)
     {
         auto* self = static_cast<RenderDevice*>(context);
@@ -360,49 +348,6 @@ namespace agshot
         {
             PostMessageW(self->m_window, self->m_vramMessage, 0, 0);
         }
-    }
-
-    void RenderDevice::ArmLowMemoryWatch() noexcept
-    {
-        if (m_window == nullptr || m_lowMemoryHandle == nullptr || m_lowMemoryWait != nullptr)
-        {
-            return;
-        }
-
-        RegisterWaitForSingleObject(
-            &m_lowMemoryWait,
-            m_lowMemoryHandle,
-            &RenderDevice::LowMemoryWaitCallback,
-            this,
-            INFINITE,
-            WT_EXECUTEONLYONCE);
-    }
-
-    void RenderDevice::AcknowledgeLowMemorySignal() noexcept
-    {
-        StopLowMemoryWatch(false);
-    }
-
-    void RenderDevice::StopLowMemoryWatch(bool closeHandle) noexcept
-    {
-        if (m_lowMemoryWait != nullptr)
-        {
-            UnregisterWaitEx(m_lowMemoryWait, INVALID_HANDLE_VALUE);
-            m_lowMemoryWait = nullptr;
-        }
-        if (closeHandle && m_lowMemoryHandle != nullptr)
-        {
-            CloseHandle(m_lowMemoryHandle);
-            m_lowMemoryHandle = nullptr;
-        }
-    }
-
-    bool RenderDevice::IsSystemMemoryLow() const noexcept
-    {
-        BOOL lowMemory = FALSE;
-        return m_lowMemoryHandle != nullptr
-            && QueryMemoryResourceNotification(m_lowMemoryHandle, &lowMemory)
-            && lowMemory != FALSE;
     }
 
     void RenderDevice::StartVramWatch() noexcept

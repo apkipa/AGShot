@@ -517,7 +517,8 @@ void OcrEngine::initialize(const OcrEngineOptions& options) {
         ? std::array<int64_t, 4>{ 1, det_size, det_size, 3 }
         : std::array<int64_t, 4>{ 1, 3, det_size, det_size };
     const std::span<const int64_t> det_fill(det_fill_dims);
-    state->det_graph = engine.load_model(narrow_path(det_model), 2, det_fill); // 2-deep tile pipeline (submit-ahead)
+    state->det_graph = engine.load_model(
+        narrow_path(det_model), 2, det_fill, options.det_sha256); // 2-deep tile pipeline (submit-ahead)
 
     const std::vector<uint32_t> det_input_dims = options.det_input_u8
         ? std::vector<uint32_t>{ 1, static_cast<uint32_t>(det_size), static_cast<uint32_t>(det_size), 3 }
@@ -547,7 +548,9 @@ void OcrEngine::initialize(const OcrEngineOptions& options) {
             ? std::array<int64_t, 4>{ 1, kRecHeight, width, 3 }
             : std::array<int64_t, 4>{ 1, 3, kRecHeight, width };
         const std::span<const int64_t> fill(fill_dims);
-        *buckets[i] = engine.load_model(narrow_path(rec_paths[i]), static_cast<size_t>(options.rec_depth), fill);
+        const std::string& rec_sha256 = requested[i].empty() ? options.rec_sha256 : std::string{};
+        *buckets[i] = engine.load_model(
+            narrow_path(rec_paths[i]), static_cast<size_t>(options.rec_depth), fill, rec_sha256);
 
         // A graph of the wrong width would decode a different number of cells
         // than the bucket routing assumes, and a graph with the wrong vocabulary

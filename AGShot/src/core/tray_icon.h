@@ -8,11 +8,12 @@ namespace agshot
     // than std::function: there is one tray icon and it never changes.
     struct TrayCallbacks
     {
-        void (*activate)() = nullptr;   // left click: surface the main window
-        void (*settings)() = nullptr;   // Settings chosen from the menu
-        void (*reload)() = nullptr;     // Reload settings chosen from the menu
-        void (*exit)() = nullptr;       // Exit chosen from the menu
-        void (*fatal)() = nullptr;      // unrecoverable failure in the tray window
+        void* context = nullptr;
+        void (*activate)(void* context) = nullptr; // left click: surface the main window
+        void (*settings)(void* context) = nullptr; // Settings chosen from the menu
+        void (*reload)(void* context) = nullptr;   // Reload settings chosen from the menu
+        void (*exit)(void* context) = nullptr;     // Exit chosen from the menu
+        void (*fatal)(void* context) = nullptr;    // unrecoverable failure in the tray window
     };
 
     // Creates the hidden owner window and installs the icon. "icon" is borrowed

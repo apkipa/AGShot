@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "resource.h"
 #include "core/config.h"
+#include "core/ocr_manifest.h"
 #include "core/ocr_runtime.h"
 #include "core/config_watcher.h"
 #include "core/error.h"
@@ -23,47 +24,58 @@ namespace
     // both need a window to be posted to, and neither needs a screen.
     constexpr wchar_t kMessageClass[] = L"AGShot.MessageWindow";
 
-    // True when the directory holds a complete OCR model payload. The three
-    // files are checked together so a half-copied directory is rejected here
-    // rather than surfacing as a load failure later, on the pool thread.
-    bool HasOcrModels(const std::filesystem::path& directory)
+    // Models are kept external under models/ocr/. Search the user data
+    // directory first (%APPDATA%\AGShot, or beside the exe in portable mode),
+    // then next to the executable, then the working directory. Prefer a pack
+    // whose pack_format matches this build; fall back to any present pack so
+    // an unsupported version still surfaces its exact manifest diagnostic.
+    std::filesystem::path FindLocalOcrModels(const std::filesystem::path& dataDirectory)
     {
-        std::error_code ec;
-        if (!std::filesystem::is_regular_file(directory / L"ppocr_keys_v1.txt", ec) || ec)
-        {
-            return false;
-        }
-
-        const auto has = [&directory](const wchar_t* stem)
-        {
-            std::error_code probe;
-            return std::filesystem::is_regular_file(
-                directory / (std::wstring(stem) + L".ngraph_lite"), probe)
-                && !probe;
+        std::filesystem::path candidates[3];
+        std::size_t count = 0;
+        const auto addCandidate = [&](std::filesystem::path root) {
+            if (root.empty())
+            {
+                return;
+            }
+            root = root.lexically_normal();
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                std::error_code eqEc;
+                if (candidates[i] == root || (std::filesystem::equivalent(candidates[i], root, eqEc) && !eqEc))
+                {
+                    return;
+                }
+            }
+            candidates[count++] = std::move(root);
         };
-        return has(L"ppocrv6_small_det_u8_template")
-            && has(L"ppocrv6_small_rec_u8_template");
-    }
 
-    // The payload is not embedded in the binary; it is distributed beside it, so
-    // "next to the executable" is the location that has to work. The working
-    // directory is a last resort, for running the binary against a copy of the
-    // payload somewhere else.
-    std::filesystem::path FindLocalOcrModels()
-    {
-        if (const auto exeDir = agshot::ExecutableDirectory(); !exeDir.empty()
-            && HasOcrModels(exeDir / L"models"))
+        addCandidate(dataDirectory);
+        addCandidate(agshot::ExecutableDirectory());
+        std::error_code cwdEc;
+        if (const auto cwd = std::filesystem::current_path(cwdEc); !cwdEc)
         {
-            return exeDir / L"models";
+            addCandidate(cwd);
         }
 
-        std::error_code ec;
-        if (const auto cwd = std::filesystem::current_path(ec); !ec
-            && HasOcrModels(cwd / L"models"))
+        std::filesystem::path fallback;
+        for (std::size_t i = 0; i < count; ++i)
         {
-            return cwd / L"models";
+            const auto found = agshot::FindOcrModelDirectory(candidates[i]);
+            if (found.empty())
+            {
+                continue;
+            }
+            if (agshot::HasSupportedOcrPackFormat(found))
+            {
+                return found;
+            }
+            if (fallback.empty())
+            {
+                fallback = found;
+            }
         }
-        return {};
+        return fallback;
     }
 
     constexpr UINT kConfigChangedMessage = WM_APP + 1;
@@ -75,82 +87,96 @@ namespace
     // so the number only has to be distinct within this window.
     constexpr int kScreenshotHotkeyId = 1;
 
-    HWND g_hwnd{};
-    agshot::Overlay g_overlay;
+    // Owns the live application state inside RunApp() so that member teardown
+    // runs deterministically in reverse order (watcher -> tray -> overlay ->
+    // message window/hotkey -> ocrRuntime) before wWinMain returns and static
+    // NPU objects begin tearing down.
+    struct AppHost
+    {
+        agshot::OcrRuntime ocrRuntime;
+        agshot::Config config;
+        std::filesystem::path configPath;
+        std::wstring reportedConfigError;
+        bool hotkeyRegistered{};
+        bool fatal{};
+        HICON trayIcon{};
+        HWND hwnd{};
+        agshot::Overlay overlay;
+        agshot::ConfigWatcher watcher;
 
-    // Created once the cache directory is known; the overlay holds it raw and
-    // is destroyed first, and Shutdown() runs before static destruction starts.
-    std::shared_ptr<agshot::OcrRuntime> g_ocrRuntime;
+        ~AppHost()
+        {
+            watcher.Stop();
+            agshot::StopTrayIcon();
+            overlay.Destroy();
 
-    // The small icon is shared with the tray icon and must outlive it.
-    HICON g_trayIcon{};
+            if (hotkeyRegistered && hwnd != nullptr)
+            {
+                UnregisterHotKey(hwnd, kScreenshotHotkeyId);
+                hotkeyRegistered = false;
+            }
+            if (hwnd != nullptr && IsWindow(hwnd))
+            {
+                DestroyWindow(hwnd);
+                hwnd = nullptr;
+            }
+            if (trayIcon != nullptr)
+            {
+                DestroyIcon(trayIcon);
+                trayIcon = nullptr;
+            }
+        }
+    };
 
-    // The settings currently in force, and where they came from. Kept so that a
-    // reload can tell a real change from a rewrite of the same values.
-    agshot::Config g_config;
-    std::filesystem::path g_configPath;
-
-    // The last settings problem already reported. A file that stays broken while
-    // being saved would otherwise stack up one dialog per save.
-    std::wstring g_reportedConfigError;
-
-    // Whether the capture combination is currently registered. False also covers
-    // "another application already had it", which is deliberately quiet.
-    bool g_hotkeyRegistered{};
-
-    // Set once a failure has been reported, so that a repeated fault cannot stack
-    // up one dialog per message.
-    bool g_fatal{};
-
-    // Defined further down, next to the settings they act on.
-    void ShowSettings();
-    void ReloadConfig(bool force);
+    void ShowSettings(AppHost& app);
+    void ReloadConfig(AppHost& app, bool force);
 
     // What the tray icon asks of the application. The tray itself, including its
     // hidden owner window and its menu, lives in core/tray_icon.cpp.
-    void CaptureFromTray()
+    void CaptureFromTray(void* context)
     {
-        g_overlay.Begin();
+        static_cast<AppHost*>(context)->overlay.Begin();
     }
 
-    void ExitFromTray()
+    void ExitFromTray(void* context)
     {
-        if (g_hwnd != nullptr)
+        auto& app = *static_cast<AppHost*>(context);
+        if (app.hwnd != nullptr)
         {
-            DestroyWindow(g_hwnd);
+            DestroyWindow(app.hwnd);
         }
     }
 
-    void FatalFromTray()
+    void FatalFromTray(void* context)
     {
-        g_fatal = true;
+        static_cast<AppHost*>(context)->fatal = true;
         PostQuitMessage(1);
     }
 
-    void SettingsFromTray()
+    void SettingsFromTray(void* context)
     {
-        ShowSettings();
+        ShowSettings(*static_cast<AppHost*>(context));
     }
 
-    void ReloadFromTray()
+    void ReloadFromTray(void* context)
     {
         // Forced: the point of the menu item is to re-apply settings that are
         // already loaded, so that anything which failed the first time - a hotkey
         // another application was holding, say - gets another go.
-        ReloadConfig(true);
+        ReloadConfig(*static_cast<AppHost*>(context), true);
     }
 
     // Owns the capture combination for as long as the window lives. Called again
     // whenever the settings change, so a new combination replaces the old one.
-    void ApplyHotkey(const agshot::Hotkey& hotkey)
+    void ApplyHotkey(AppHost& app, const agshot::Hotkey& hotkey)
     {
-        if (g_hotkeyRegistered)
+        if (app.hotkeyRegistered)
         {
-            UnregisterHotKey(g_hwnd, kScreenshotHotkeyId);
-            g_hotkeyRegistered = false;
+            UnregisterHotKey(app.hwnd, kScreenshotHotkeyId);
+            app.hotkeyRegistered = false;
         }
 
-        if (!hotkey.valid() || g_hwnd == nullptr)
+        if (!hotkey.valid() || app.hwnd == nullptr)
         {
             return;
         }
@@ -158,9 +184,9 @@ namespace
         // MOD_NOREPEAT matters: without it, holding the key down fires the hotkey
         // again and again, which for a capture is not what anyone means by one
         // press. It is a registration detail, not part of what the file stores.
-        if (RegisterHotKey(g_hwnd, kScreenshotHotkeyId, hotkey.modifiers | MOD_NOREPEAT, hotkey.key))
+        if (RegisterHotKey(app.hwnd, kScreenshotHotkeyId, hotkey.modifiers | MOD_NOREPEAT, hotkey.key))
         {
-            g_hotkeyRegistered = true;
+            app.hotkeyRegistered = true;
             return;
         }
 
@@ -183,10 +209,10 @@ namespace
     // [window] is deliberately not applied: it sized the main window, and there
     // is no main window at the moment. The keys stay in the file so that they are
     // still there when it comes back.
-    void ApplyConfig(const agshot::Config& config)
+    void ApplyConfig(AppHost& app, const agshot::Config& config)
     {
-        ApplyHotkey(config.screenshotHotkey);
-        g_overlay.SetDebugStats(config.debugShowStats);
+        ApplyHotkey(app, config.screenshotHotkey);
+        app.overlay.SetDebugStats(config.debugShowStats);
     }
 
     // Opens the settings file in whatever the user has associated with it.
@@ -194,16 +220,16 @@ namespace
     // This stands in for the settings window, which will edit these values
     // itself. Until then the file is the settings, so the useful thing this item
     // can do is put the file in front of the user rather than describe it.
-    void ShowSettings()
+    void ShowSettings(AppHost& app)
     {
         // The file is written at startup when it is missing, so this is only
         // reachable if something removed it while the application was running.
         std::error_code ec;
-        if (!std::filesystem::exists(g_configPath, ec))
+        if (!std::filesystem::exists(app.configPath, ec))
         {
             try
             {
-                agshot::SaveConfig(g_config, g_configPath);
+                agshot::SaveConfig(app.config, app.configPath);
             }
             catch (const std::exception& error)
             {
@@ -217,7 +243,7 @@ namespace
         // ShellExecuteW rather than a hard-coded editor: which program opens a
         // .toml file is the user's choice, not this application's.
         const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
-            nullptr, L"open", g_configPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+            nullptr, L"open", app.configPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
 
         // ShellExecuteW reports success by returning a value above 32; anything
         // at or below that is an error code, not a handle.
@@ -235,50 +261,50 @@ namespace
     //
     // "force" applies the settings even when the values are unchanged, which is
     // what the tray's Reload item is for.
-    void ReloadConfig(bool force)
+    void ReloadConfig(AppHost& app, bool force)
     {
-        const auto load = agshot::LoadConfig(g_configPath);
+        const auto load = agshot::LoadConfig(app.configPath);
 
         if (!load.ok)
         {
             // Once per distinct problem: an editor that keeps saving a file that
             // stays broken must not stack up one dialog per save.
-            if (load.error != g_reportedConfigError)
+            if (load.error != app.reportedConfigError)
             {
-                g_reportedConfigError = load.error;
+                app.reportedConfigError = load.error;
                 agshot::ShowWarning(
-                    agshot::Failure{ {}, g_configPath.wstring() + L"\n" + load.error },
+                    agshot::Failure{ {}, app.configPath.wstring() + L"\n" + load.error },
                     L"The settings file changed, but AGShot could not read it, so the previous settings are still in use.");
             }
             return;
         }
 
-        g_reportedConfigError.clear();
+        app.reportedConfigError.clear();
 
         // Rewriting the file without changing anything is not a change, and a
         // deleted file puts the defaults back in force.
-        if (!force && load.config == g_config)
+        if (!force && load.config == app.config)
         {
             return;
         }
 
-        g_config = load.config;
-        ApplyConfig(g_config);
+        app.config = load.config;
+        ApplyConfig(app, app.config);
     }
 
     // Runs on the watcher thread. Posting is the whole job: applying a setting
     // touches windows, and the message queue is the only synchronisation this
     // application needs.
-    void OnConfigWatchEvent(agshot::WatchEvent event, const std::wstring& detail)
+    void OnConfigWatchEvent(HWND hwnd, agshot::WatchEvent event, const std::wstring& detail)
     {
-        if (g_hwnd == nullptr)
+        if (hwnd == nullptr)
         {
             return;
         }
 
         if (event == agshot::WatchEvent::Changed)
         {
-            PostMessageW(g_hwnd, kConfigChangedMessage, 0, 0);
+            PostMessageW(hwnd, kConfigChangedMessage, 0, 0);
             return;
         }
 
@@ -287,22 +313,22 @@ namespace
         // user editing a file that nothing is listening to.
         auto* text = new (std::nothrow) std::wstring{ detail };
         if (text != nullptr
-            && !PostMessageW(g_hwnd, kConfigWatchLostMessage, 0, reinterpret_cast<LPARAM>(text)))
+            && !PostMessageW(hwnd, kConfigWatchLostMessage, 0, reinterpret_cast<LPARAM>(text)))
         {
             delete text;
         }
     }
 
-    LRESULT HandleMessage(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+    LRESULT HandleMessage(AppHost& app, HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
     {
         switch (message)
         {
         case kWakeExistingMessage:
-            g_overlay.Begin();
+            app.overlay.Begin();
             return 0;
 
         case kConfigChangedMessage:
-            ReloadConfig(false);
+            ReloadConfig(app, false);
             return 0;
 
         case kConfigWatchLostMessage:
@@ -310,7 +336,7 @@ namespace
             // The watcher handed the reason over as a heap string; take it back.
             const std::unique_ptr<std::wstring> detail{ reinterpret_cast<std::wstring*>(lparam) };
             agshot::ShowWarning(
-                agshot::Failure{ {}, g_configPath.wstring() + L"\n"
+                agshot::Failure{ {}, app.configPath.wstring() + L"\n"
                                      + (detail ? *detail : std::wstring{}) },
                 L"AGShot is no longer watching its settings file, so further changes will need a restart.");
             return 0;
@@ -321,18 +347,19 @@ namespace
             // is the only thing worth checking.
             if (static_cast<int>(wparam) == kScreenshotHotkeyId)
             {
-                g_overlay.Begin();
+                app.overlay.Begin();
             }
             return 0;
 
         case WM_DESTROY:
             // The window is going away; hand the combination back rather than
             // leaving it to the process teardown.
-            if (g_hotkeyRegistered)
+            if (app.hotkeyRegistered)
             {
                 UnregisterHotKey(hwnd, kScreenshotHotkeyId);
-                g_hotkeyRegistered = false;
+                app.hotkeyRegistered = false;
             }
+            app.hwnd = nullptr;
             PostQuitMessage(0);
             return 0;
         }
@@ -345,20 +372,32 @@ namespace
     // would get a runtime dialog saying nothing useful. Catch it here instead.
     LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
     {
-        if (g_fatal)
+        if (message == WM_NCCREATE)
+        {
+            const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lparam);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+
+        auto* app = reinterpret_cast<AppHost*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (message == WM_NCDESTROY)
+        {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        if (app == nullptr || app->fatal)
         {
             return DefWindowProcW(hwnd, message, wparam, lparam);
         }
 
         try
         {
-            return HandleMessage(hwnd, message, wparam, lparam);
+            return HandleMessage(*app, hwnd, message, wparam, lparam);
         }
         catch (...)
         {
-            if (!g_fatal)
+            if (!app->fatal)
             {
-                g_fatal = true;
+                app->fatal = true;
                 agshot::ReportCurrentException(__FILEW__, __LINE__);
                 PostQuitMessage(1);
             }
@@ -405,31 +444,36 @@ int RunApp(HINSTANCE instance, int showCommand)
 
     // What the running application is using, so that a reload can tell a real
     // change from a rewrite of the same values.
-    g_configPath = configPath;
-    g_config = config.config;
+    AppHost app;
+    app.configPath = configPath;
+    app.config = config.config;
     // The startup warning below covers this problem already, so do not repeat it
     // the first time the file is touched.
-    g_reportedConfigError = config.ok ? std::wstring{} : config.error;
+    app.reportedConfigError = config.ok ? std::wstring{} : config.error;
 
     // Shown at the bottom of every report, so it is obvious which file was in play.
     agshot::SetDiagnosticContext(L"Config: " + configPath.wstring());
 
     // Model distribution is intentionally external. Detect the local payload at
     // startup, but never attempt a model load on the UI thread.
-    const auto ocrModels = FindLocalOcrModels();
+    const auto dataDirectory = configPath.parent_path();
+    const auto ocrModels = FindLocalOcrModels(dataDirectory);
     if (ocrModels.empty()) {
+        const auto appDataHint = dataDirectory / L"models" / L"ocr";
+        const std::wstring detail = (dataDirectory == agshot::ExecutableDirectory())
+            ? L"Expected a local models\\ocr\\ directory beside AGShot."
+            : L"Expected models\\ocr\\ beside AGShot or in " + appDataHint.wstring() + L".";
         agshot::ShowWarning(
-            agshot::Failure{ {}, L"Expected a local models\\ directory beside AGShot." },
+            agshot::Failure{ {}, detail },
             L"AGShot OCR models are unavailable.");
     }
-    const auto ocrCache = configPath.parent_path() / L"cache";
+    const auto ocrCache = dataDirectory / L"cache";
     std::error_code ocrCacheError;
     std::filesystem::create_directories(ocrCache, ocrCacheError);
-    g_ocrRuntime = std::make_shared<agshot::OcrRuntime>();
     // Start() refuses an empty models path, so a missing payload leaves the
     // runtime unavailable rather than failing later on the pool thread.
-    if (!ocrCacheError) g_ocrRuntime->Start(ocrModels, ocrCache);
-    g_overlay.SetOcrRuntime(g_ocrRuntime.get());
+    if (!ocrCacheError) app.ocrRuntime.Start(ocrModels, ocrCache);
+    app.overlay.SetOcrRuntime(&app.ocrRuntime);
 
     if (!config.exists || config.migrated)
     {
@@ -463,31 +507,31 @@ int RunApp(HINSTANCE instance, int showCommand)
     // HWND_MESSAGE makes it a message-only window: no screen, no taskbar, no
     // Alt+Tab, and no pixels to keep in sync. It is here for the hotkey and the
     // watcher, nothing else.
-    g_hwnd = CreateWindowExW(
+    app.hwnd = CreateWindowExW(
         0, kMessageClass, L"AGShot", 0, 0, 0, 0, 0,
-        HWND_MESSAGE, nullptr, instance, nullptr);
-    AGSHOT_CHECK_WIN32(g_hwnd != nullptr);
+        HWND_MESSAGE, nullptr, instance, &app);
+    AGSHOT_CHECK_WIN32(app.hwnd != nullptr);
 
     // The small icon is shared with the tray, so load it once and keep it.
-    g_trayIcon = static_cast<HICON>(LoadImageW(
+    app.trayIcon = static_cast<HICON>(LoadImageW(
         instance, MAKEINTRESOURCEW(IDI_AGSHOT), IMAGE_ICON,
         GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
-    AGSHOT_CHECK_WIN32(g_trayIcon != nullptr);
+    AGSHOT_CHECK_WIN32(app.trayIcon != nullptr);
 
     // The overlay is created up front and stays hidden. Building it on the first
     // F1 would put device creation in the way of the capture.
-    if (!g_overlay.Create(instance))
+    if (!app.overlay.Create(instance))
     {
         agshot::ShowWarning(
             agshot::DescribeWin32(L"Overlay::Create", GetLastError(), __FILEW__, __LINE__),
             L"AGShot could not create its capture overlay, so the hotkey will do nothing.");
     }
 
-    ApplyConfig(g_config);
+    ApplyConfig(app, app.config);
 
     const agshot::TrayCallbacks trayCallbacks{
-        CaptureFromTray, SettingsFromTray, ReloadFromTray, ExitFromTray, FatalFromTray };
-    if (!agshot::StartTrayIcon(instance, g_trayIcon, trayCallbacks))
+        &app, CaptureFromTray, SettingsFromTray, ReloadFromTray, ExitFromTray, FatalFromTray };
+    if (!agshot::StartTrayIcon(instance, app.trayIcon, trayCallbacks))
     {
         // Not fatal: the hotkey still works, but say so rather than leaving the
         // user wondering why the icon never showed up.
@@ -498,8 +542,9 @@ int RunApp(HINSTANCE instance, int showCommand)
 
     // From here on the settings file is live. Started after the write above, so
     // that AGShot's own save does not come straight back as a change.
-    agshot::ConfigWatcher watcher;
-    if (!watcher.Start(configPath, OnConfigWatchEvent))
+    if (!app.watcher.Start(configPath, [hwnd = app.hwnd](agshot::WatchEvent event, const std::wstring& detail) {
+        OnConfigWatchEvent(hwnd, event, detail);
+    }))
     {
         // Not fatal: the application still runs, but say so rather than leaving
         // the user to wonder why editing the file does nothing.
@@ -513,18 +558,6 @@ int RunApp(HINSTANCE instance, int showCommand)
     {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
-    }
-
-    // The loop can also end through the fatal path, where WM_DESTROY never ran.
-    // The watcher goes first: it posts to a window that has just been destroyed.
-    watcher.Stop();
-    agshot::StopTrayIcon();
-    g_overlay.Destroy();
-
-    if (g_trayIcon != nullptr)
-    {
-        DestroyIcon(g_trayIcon);
-        g_trayIcon = nullptr;
     }
 
     return static_cast<int>(msg.wParam);
@@ -586,10 +619,6 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
     {
         agshot::ReportCurrentException(__FILEW__, __LINE__);
     }
-
-    // Before anything static is torn down: the OCR runtime waits for a running
-    // recognition and releases its models while the NPU engine is still alive.
-    if (g_ocrRuntime) g_ocrRuntime->Shutdown();
 
     CloseHandle(singleInstance);
     return result;

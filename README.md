@@ -27,7 +27,7 @@
    git clone --recursive https://github.com/apkipa/AGShot.git
    ```
 
-2. 准备 OCR 模型，放到仓库根目录的 `models/`（见下一节）。
+2. 准备 OCR 模型，放到仓库根目录的 `models/ocr/`（见下一节）。
 
 3. 用 Visual Studio 2022 打开 `AGShot.sln`，选择 x64 配置构建；也可以直接调用：
 
@@ -35,17 +35,18 @@
    msbuild AGShot.sln /p:Configuration=Debug /p:Platform=x64
    ```
 
-构建完成后，输出目录下的 `models` 是指向仓库根目录 `models/` 的目录联接，程序启动时从那里加载模型。
+构建完成后，输出目录下的 `models` 是指向仓库根目录 `models/` 的目录联接，程序启动时从 `models/ocr/` 读取清单并加载模型。
 
 ## OCR 模型
 
-模型不随源码提交，需要放在 `models/` 目录中，包含以下三个文件：
+模型不随源码提交，需要放在 `models/ocr/` 目录中，包含以下四个文件：
 
+- `manifest.toml`（记录 `pack_format = 1`、`pack_version`、文件名与 SHA-256 校验值）
 - `ppocrv6_small_det_u8_template.ngraph_lite`
 - `ppocrv6_small_rec_u8_template.ngraph_lite`
 - `ppocr_keys_v1.txt`
 
-程序在可执行文件旁的 `models/` 中查找，找不到时再尝试当前工作目录。首次识别会把驱动编译出的硬件 blob 缓存到 `%APPDATA%\AGShot\cache`，后续启动直接复用。
+程序依次在数据目录（默认 `%APPDATA%\AGShot\models\ocr\`，便携模式下即程序同目录）、可执行文件旁的 `models/ocr/` 与当前工作目录中查找，并优先选用 `pack_format` 匹配的模型包。首次识别会把驱动编译出的硬件 blob 缓存到数据目录下的 `cache`，后续启动直接复用。
 
 ## 使用
 
@@ -56,7 +57,7 @@
 
 ## 配置
 
-配置文件默认位于 `%APPDATA%\AGShot\config.toml`。若可执行文件旁存在 `AGShot.portable` 文件，则使用同目录下的 `config.toml`，便于便携使用。
+配置文件默认位于 `%APPDATA%\AGShot\config.toml`。若可执行文件旁存在 `AGShot.portable` 文件或已存在 `config.toml`，则切换为便携模式，使用同目录下的 `config.toml`、`cache/` 与 `models/ocr/`。
 
 ```toml
 version = 1

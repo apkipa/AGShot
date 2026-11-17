@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -32,9 +33,8 @@ namespace agshot
     // most one pending capture is kept, and a newer job replaces it before it
     // starts. A job that has started runs to completion.
     //
-    // Held by shared_ptr, and the work item is handed this: Shutdown() waits for
-    // the callback before the object can go away, so the callback never outlives
-    // what it touches.
+    // Owned by value on the UI thread; ~OcrRuntime() waits for any in-flight
+    // callback before returning, so the callback never outlives what it touches.
     class OcrRuntime
     {
     public:
@@ -47,6 +47,7 @@ namespace agshot
         void Start(const std::filesystem::path& models,
                    const std::filesystem::path& cache);
         bool available() const noexcept;
+        bool hasLoadedEngine() const noexcept;
 
         // Copies the cropped BGRA rows out of the frozen capture and converts
         // to 24bpp BGR on the worker thread before calling the NPU engine.
@@ -54,6 +55,11 @@ namespace agshot
             HWND target, const void* pixels,
             int imageWidth, int imageHeight, int imageStride,
             const RECT& crop);
+
+        // Non-blocking memory pressure trim: queues unloading of the NPU engine
+        // once any pending/running recognition finishes, unless superseded by a
+        // newer SubmitRegion() before the worker goes idle.
+        void Trim() noexcept;
 
         // Refuses further requests, waits for a running recognition, and
         // releases the models. Safe to call more than once; the destructor does
@@ -82,6 +88,7 @@ namespace agshot
         // Loads the models on first use. Returns the reason it failed, or an
         // empty string once the engine is ready. Only the callback calls it.
         std::wstring EnsureEngine();
+        void UnloadEngine() noexcept;
         void DrainJobs();
 
         std::mutex m_mutex;
@@ -93,13 +100,15 @@ namespace agshot
         // backlog.
         std::optional<Job> m_pending;
         bool m_stopping{};
-        bool m_queued{}; // a work item is queued or running
+        bool m_queued{};        // a work item is queued or running
+        bool m_trimRequested{}; // drop loaded engine once queue drains
 
         // Only the callback touches these, and the queued flag is what keeps
         // two callbacks from overlapping.
         std::unique_ptr<ppocr::OcrEngine> m_engine;
         bool m_initializationAttempted{};
         std::wstring m_initializationError;
+        std::atomic<bool> m_hasLoadedEngine{};
 
         // Touched only by the owning thread (Start, Submit, Shutdown).
         PTP_WORK m_work{};

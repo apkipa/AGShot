@@ -3,8 +3,12 @@
 #include <ze_command_queue_npu_ext.h>
 
 #include <windows.h>
+#include <bcrypt.h>
+
+#pragma comment(lib, "bcrypt.lib")
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -256,9 +260,53 @@ std::string compiler_flags_cache_tag() {
     return std::to_string(hash);
 }
 
-fs::path manual_cache_blob(const fs::path& cache_root, const std::string& stem, std::span<const int64_t> fill) {
-    return cache_root / "lite" /
-           (stem + "_" + fill_tag(fill) + "_cfg" + compiler_flags_cache_tag() + ".blob");
+fs::path manual_cache_blob(const fs::path& cache_root, const std::string& stem,
+                           std::span<const int64_t> fill, const std::string& expected_sha256 = {}) {
+    std::string name = stem + "_" + fill_tag(fill);
+    if (!expected_sha256.empty()) {
+        name += "_m" + expected_sha256.substr(0, std::min<size_t>(12, expected_sha256.size()));
+    }
+    name += "_cfg" + compiler_flags_cache_tag() + ".blob";
+    return cache_root / "lite" / name;
+}
+
+std::string sha256_hex(std::span<const uint8_t> bytes) {
+    struct AlgHandle {
+        BCRYPT_ALG_HANDLE h = nullptr;
+        ~AlgHandle() { if (h) BCryptCloseAlgorithmProvider(h, 0); }
+    } alg;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg.h, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
+        throw std::runtime_error("BCryptOpenAlgorithmProvider(SHA256) failed");
+    }
+
+    struct HashHandle {
+        BCRYPT_HASH_HANDLE h = nullptr;
+        ~HashHandle() { if (h) BCryptDestroyHash(h); }
+    } hash;
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(alg.h, &hash.h, nullptr, 0, nullptr, 0, 0))) {
+        throw std::runtime_error("BCryptCreateHash(SHA256) failed");
+    }
+
+    if (!bytes.empty()) {
+        if (!BCRYPT_SUCCESS(BCryptHashData(
+                hash.h, const_cast<PUCHAR>(bytes.data()), static_cast<ULONG>(bytes.size()), 0))) {
+            throw std::runtime_error("BCryptHashData failed");
+        }
+    }
+
+    std::array<uint8_t, 32> digest{};
+    if (!BCRYPT_SUCCESS(BCryptFinishHash(hash.h, digest.data(), static_cast<ULONG>(digest.size()), 0))) {
+        throw std::runtime_error("BCryptFinishHash failed");
+    }
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(digest.size() * 2);
+    for (uint8_t b : digest) {
+        out.push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 0x0F]);
+    }
+    return out;
 }
 
 bool cache_newer_than(const fs::path& blob, std::initializer_list<fs::path> sources) {
@@ -504,11 +552,12 @@ NpuGraph::NpuGraph(
     bool manual_blob_cache,
     fs::path cache_dir,
     ze_graph_profiling_dditable_ext_t* profiling_api,
-    TraceRecorder* trace
+    TraceRecorder* trace,
+    std::string expected_sha256
 ) : context_(context), device_(device), queue_pool_(queue_pool), graph_api_(graph_api),
     use_lite_(use_lite), fill_shape_(fill_shape.begin(), fill_shape.end()),
     manual_blob_cache_(manual_blob_cache), cache_dir_(std::move(cache_dir)),
-    profiling_api_(profiling_api), trace_(trace),
+    profiling_api_(profiling_api), trace_(trace), expected_sha256_(std::move(expected_sha256)),
     graph_name_(fs::path(model_path).stem().string())
 {
     const auto total_start = std::chrono::steady_clock::now();
@@ -570,7 +619,8 @@ void NpuGraph::init_graph(const std::string& model_path) {
         // Default (JIT) mode: check the manual cache before touching the
         // source graph payload, so a hit costs two stats plus the blob read.
         if (use_lite_) {
-            const fs::path early_blob = manual_cache_blob(cache_dir_, p.stem().string(), fill_shape_);
+            const fs::path early_blob = manual_cache_blob(
+                cache_dir_, p.stem().string(), fill_shape_, expected_sha256_);
             if (load_manual_blob_cache(early_blob.string(), cache_newer_than(early_blob, {p, bin_path}),
                                        p.filename().string())) {
                 return;
@@ -595,7 +645,8 @@ void NpuGraph::init_graph(const std::string& model_path) {
             // NGRAPH_LITE path: pack the graph's internal XML metadata and
             // weights into the driver container and let the driver's UMD compiler
             // JIT it (no OpenVINO/Python involved).
-            const fs::path blob_path = manual_cache_blob(cache_dir_, p.stem().string(), fill_shape_);
+            const fs::path blob_path = manual_cache_blob(
+                cache_dir_, p.stem().string(), fill_shape_, expected_sha256_);
             const bool fresh = cache_newer_than(blob_path, {p, bin_path});
             if (load_manual_blob_cache(blob_path.string(), fresh, p.filename().string())) return;
 
@@ -728,11 +779,23 @@ void NpuGraph::init_graph(const std::string& model_path) {
         // for shape templates, the placeholder dims inside the embedded XML, then
         // hand the container straight to the driver compiler. Weights are reused.
         // Manual cache hit: the container file is not even read.
-        const fs::path blob_path = manual_cache_blob(cache_dir_, p.stem().string(), fill_shape_);
-        const bool fresh = cache_newer_than(blob_path, {p});
+        const fs::path blob_path = manual_cache_blob(
+            cache_dir_, p.stem().string(), fill_shape_, expected_sha256_);
+        std::error_code blob_ec;
+        const bool fresh = !expected_sha256_.empty()
+            ? fs::exists(blob_path, blob_ec) && !blob_ec
+            : cache_newer_than(blob_path, {p});
         if (load_manual_blob_cache(blob_path.string(), fresh, p.filename().string())) return;
 
         std::vector<uint8_t> container = read_file_bytes(p);
+        if (!expected_sha256_.empty()) {
+            const std::string actual_sha256 = sha256_hex(container);
+            if (actual_sha256 != expected_sha256_) {
+                throw std::runtime_error(
+                    "Model SHA-256 mismatch for " + p.filename().string() +
+                    " (expected " + expected_sha256_ + ", got " + actual_sha256 + ")");
+            }
+        }
         if (container.size() < 24) {
             throw std::runtime_error("Malformed NGRAPH_LITE container: " + p.string());
         }
@@ -1155,13 +1218,15 @@ void NpuEngine::set_trace_recorder(TraceRecorder* trace) {
 
 std::shared_ptr<NpuGraph> NpuEngine::load_model(const std::string& model_path,
                                                size_t num_requests,
-                                               std::span<const int64_t> fill_shape) {
+                                               std::span<const int64_t> fill_shape,
+                                               const std::string& expected_sha256) {
     if (!initialize()) {
         throw std::runtime_error("NpuEngine initialization failed.");
     }
     ensure_queue_pool(num_requests);
     return std::make_shared<NpuGraph>(context_, device_, &queue_pool_, model_path, graph_api_, num_requests,
-                                      use_lite_, fill_shape, manual_blob_cache_, cache_dir_, profiling_api_, trace_);
+                                      use_lite_, fill_shape, manual_blob_cache_, cache_dir_,
+                                      profiling_api_, trace_, expected_sha256);
 }
 
 std::optional<uint64_t> NpuEngine::print_memory_usage(const char* tag) {

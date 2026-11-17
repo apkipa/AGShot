@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/memory_watch.h"
 #include "core/ocr_runtime.h"
 #include "core/screen_capture.h"
 #include "core/ui_element.h"
@@ -109,6 +110,7 @@ namespace agshot
 
         void TrimCpuCaches() noexcept;
         void TrimGpuCaches() noexcept;
+        void ReconcileMemoryState() noexcept;
         void OnMemoryPressure() noexcept;
         void OnVramPressure() noexcept;
 
@@ -120,6 +122,7 @@ namespace agshot
         bool m_failed{};
 
         RenderDevice m_device;
+        SystemMemoryWatch m_memoryWatch;
         HudRenderer m_renderer;
         DebugStatsTracker m_stats;
         CompositorClockClient m_clock;

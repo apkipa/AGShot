@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "core/ocr_runtime.h"
+#include "core/ocr_manifest.h"
 #include "../../../OcrEngine/src/ocr_engine.hpp"
 
 #include <algorithm>
@@ -68,6 +69,7 @@ namespace agshot
             std::lock_guard lock(m_mutex);
             m_stopping = true;
             m_pending.reset();
+            m_trimRequested = false;
         }
 
         // Drops work that has not started yet and waits for a callback that has
@@ -81,6 +83,7 @@ namespace agshot
         // still alive: letting the models go during static destruction would put
         // zeMemFree after that engine's own teardown.
         m_engine.reset();
+        m_hasLoadedEngine.store(false, std::memory_order_release);
     }
 
     void OcrRuntime::Start(const std::filesystem::path& models,
@@ -98,6 +101,36 @@ namespace agshot
     bool OcrRuntime::available() const noexcept
     {
         return m_work != nullptr;
+    }
+
+    bool OcrRuntime::hasLoadedEngine() const noexcept
+    {
+        return m_hasLoadedEngine.load(std::memory_order_acquire);
+    }
+
+    void OcrRuntime::Trim() noexcept
+    {
+        if (!m_work) return;
+
+        bool submitWork = false;
+        {
+            std::lock_guard lock(m_mutex);
+            if (m_stopping) return;
+            if (!m_queued && !m_hasLoadedEngine.load(std::memory_order_acquire))
+            {
+                return;
+            }
+            m_trimRequested = true;
+            if (!m_queued)
+            {
+                m_queued = true;
+                submitWork = true;
+            }
+        }
+        if (submitWork)
+        {
+            SubmitThreadpoolWork(m_work);
+        }
     }
 
     std::shared_ptr<OcrCompletion> OcrRuntime::SubmitRegion(
@@ -140,6 +173,10 @@ namespace agshot
         auto completion = std::make_shared<OcrCompletion>();
         std::lock_guard lock(m_mutex);
         if (m_stopping) return {};
+        // A newer submission means the engine is needed again, superseding any
+        // prior idle Trim() request (though a Trim() arriving *after* this call
+        // will still unload once this job drains).
+        m_trimRequested = false;
         m_pending = Job{ target, completion, std::move(region) };
         if (!m_queued)
         {
@@ -157,15 +194,20 @@ namespace agshot
         m_initializationAttempted = true;
         try
         {
+            const OcrModelPack pack = LoadOcrModelManifest(m_models);
+
             ppocr::OcrEngineOptions options;
-            options.det_model = (m_models / L"ppocrv6_small_det_u8_template").wstring();
-            options.rec_model = (m_models / L"ppocrv6_small_rec_u8_template").wstring();
-            options.dictionary = (m_models / L"ppocr_keys_v1.txt").wstring();
+            options.det_model = pack.det.path.wstring();
+            options.rec_model = pack.rec.path.wstring();
+            options.dictionary = pack.dict.path.wstring();
+            options.det_sha256 = pack.det.sha256;
+            options.rec_sha256 = pack.rec.sha256;
             options.cache_dir = m_cache.wstring();
 
             auto engine = std::make_unique<ppocr::OcrEngine>();
             engine->initialize(options);
             m_engine = std::move(engine);
+            m_hasLoadedEngine.store(true, std::memory_order_release);
         }
         catch (const std::exception& error)
         {
@@ -178,6 +220,17 @@ namespace agshot
         return m_initializationError;
     }
 
+    void OcrRuntime::UnloadEngine() noexcept
+    {
+        // Only reset a successfully loaded engine so a cached initialization
+        // failure stays reported until models change or the app restarts.
+        if (!m_engine) return;
+        m_engine.reset();
+        m_hasLoadedEngine.store(false, std::memory_order_release);
+        m_initializationAttempted = false;
+        m_initializationError.clear();
+    }
+
     // Runs the queued jobs one at a time. The NPU engine is not reentrant and
     // already pipelines inside itself, so one callback at a time is all this
     // needs; that is also why the queued flag gates the next submission.
@@ -186,19 +239,37 @@ namespace agshot
         for (;;)
         {
             Job job;
+            bool shouldUnload = false;
             {
                 std::lock_guard lock(m_mutex);
                 if (!m_pending)
                 {
-                    // Clearing the queued flag under the same lock as the check
-                    // is what makes a Submit racing with this loop either find
-                    // the callback running or queue its own work item; a job can
-                    // never be left behind.
-                    m_queued = false;
-                    return;
+                    if (m_trimRequested)
+                    {
+                        m_trimRequested = false;
+                        shouldUnload = true;
+                    }
+                    else
+                    {
+                        // Clearing the queued flag under the same lock as the check
+                        // is what makes a Submit racing with this loop either find
+                        // the callback running or queue its own work item; a job can
+                        // never be left behind.
+                        m_queued = false;
+                        return;
+                    }
                 }
-                job = std::move(*m_pending);
-                m_pending.reset();
+                else
+                {
+                    job = std::move(*m_pending);
+                    m_pending.reset();
+                }
+            }
+
+            if (shouldUnload)
+            {
+                UnloadEngine();
+                continue;
             }
 
             if (const std::wstring error = EnsureEngine(); !error.empty())

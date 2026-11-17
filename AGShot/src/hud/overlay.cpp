@@ -126,7 +126,8 @@ namespace agshot
         }
         m_handleSize = MulDiv(kHandleSize, dpi, 96);
 
-        m_device.Initialize(m_window, dpi, kMemoryPressureMessage, kVramPressureMessage);
+        m_memoryWatch.Initialize(m_window, kMemoryPressureMessage);
+        m_device.Initialize(m_window, dpi, kVramPressureMessage);
 
         RECT client{};
         AGSHOT_CHECK_WIN32(GetClientRect(m_window, &client));
@@ -154,6 +155,7 @@ namespace agshot
         StopAnimationClock();
         m_ocrPanel.Destroy(m_window);
         m_renderer.DiscardIndependentResources();
+        m_memoryWatch.Destroy();
         m_device.Destroy();
         if (m_window != nullptr)
         {
@@ -314,28 +316,12 @@ namespace agshot
         m_toolbar.hovered = ToolbarButton::None;
 
         // Always drop cross-process UIA element proxies and per-session text
-        // state, while keeping the capture bitmap, background texture, and
-        // surface warm for instant F1 unless memory or VRAM is tight.
+        // state, while keeping the capture bitmap, background texture, surface,
+        // and loaded NPU OCR engine warm unless memory or VRAM is tight.
         m_picker.Clear();
         m_ladder.clear();
         m_ocrPanel.CancelSession(m_window);
-
-        if (m_device.IsSystemMemoryLow())
-        {
-            TrimCpuCaches();
-            TrimGpuCaches();
-        }
-        else
-        {
-            if (!m_image.empty())
-            {
-                m_device.ArmLowMemoryWatch();
-            }
-            if (m_device.IsVideoMemoryTight())
-            {
-                TrimGpuCaches();
-            }
-        }
+        ReconcileMemoryState();
 
         if (m_previousForeground != nullptr && IsWindow(m_previousForeground))
         {
@@ -1028,6 +1014,10 @@ namespace agshot
         m_picker.Trim();
         std::vector<RECT>{}.swap(m_ladder);
         m_ocrPanel.CancelSession(m_window);
+        if (m_ocrRuntime != nullptr)
+        {
+            m_ocrRuntime->Trim();
+        }
     }
 
     void Overlay::TrimGpuCaches() noexcept
@@ -1038,28 +1028,44 @@ namespace agshot
         m_device.TrimGpuCaches();
     }
 
-    void Overlay::OnMemoryPressure() noexcept
+    void Overlay::ReconcileMemoryState() noexcept
     {
-        m_device.AcknowledgeLowMemorySignal();
         if (m_window == nullptr || IsWindowVisible(m_window) || m_beginning)
         {
             return;
         }
-        TrimCpuCaches();
-        TrimGpuCaches();
-    }
 
-    void Overlay::OnVramPressure() noexcept
-    {
-        if (m_window == nullptr || IsWindowVisible(m_window) || m_beginning)
+        if (m_memoryWatch.IsLow())
         {
+            m_memoryWatch.Acknowledge();
+            TrimCpuCaches();
+            TrimGpuCaches();
             return;
         }
+
+        const bool hasWarmCpuPayload = !m_image.empty()
+            || (m_ocrRuntime != nullptr && m_ocrRuntime->hasLoadedEngine());
+        if (hasWarmCpuPayload)
+        {
+            m_memoryWatch.Arm();
+        }
+
         if ((m_device.hasBackground() || !m_device.surfaceTrimmed())
             && m_device.IsVideoMemoryTight())
         {
             TrimGpuCaches();
         }
+    }
+
+    void Overlay::OnMemoryPressure() noexcept
+    {
+        m_memoryWatch.Acknowledge();
+        ReconcileMemoryState();
+    }
+
+    void Overlay::OnVramPressure() noexcept
+    {
+        ReconcileMemoryState();
     }
 
     void Overlay::Render()

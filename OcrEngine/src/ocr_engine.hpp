@@ -56,6 +56,8 @@ struct OcrEngineOptions {
     bool manual_blob_cache = true; // keep compiled blobs in the app's own cache
     std::wstring cache_dir;        // AGShot-owned cache root; empty keeps the CLI default
     bool turbo = false;            // low-latency command queues (higher power)
+    std::string det_sha256;        // expected lowercase hex SHA-256 of det container; empty skips check
+    std::string rec_sha256;        // expected lowercase hex SHA-256 of shared rec container; empty skips check
 };
 
 // Synchronous det -> crop -> rec pipeline over the NPU.
