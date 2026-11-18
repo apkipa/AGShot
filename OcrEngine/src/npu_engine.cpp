@@ -431,6 +431,11 @@ void NpuInferRequest::start_async() {
                                profile_setup_start, TraceRecorder::Clock::now(), 8);
     }
 
+    // TODO: When trace_ == nullptr and USM input/output pointers stay fixed across
+    // invocations, command_list_ can be pre-recorded once in NpuInferRequest's
+    // constructor (skipping Reset/SetArgumentValue/AppendGraphExecute/Close per
+    // submit). Deferred for now: paired A/B showed ~13-34 us steady-state saving
+    // (~2.4 ms on cold slot-1 first submit).
     check_ze(zeCommandListReset(command_list_), "CommandListReset");
 
     // Bind arguments before execution

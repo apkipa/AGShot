@@ -60,16 +60,29 @@ private:
     float unclip_ratio_;
 };
 
+struct CtcStep {
+    int index = 0;
+    float confidence = 0.0f;
+};
+
 class CtcDecoder {
 public:
     explicit CtcDecoder(const std::string& dict_path);
 
+    static CtcStep argmax_fp16(const uint16_t* step_slice, int vocab_size) noexcept;
+
     // Greedy decode from unnormalized Logits or Softmax probabilities
     std::string decode(const uint16_t* data_fp16, int seq_len, int vocab_size, float& out_conf) const;
+
+    // Fold pre-decoded per-step argmax tokens across contiguous slices.
+    std::string fold_slices(const std::vector<std::vector<CtcStep>>& slices, float& out_conf) const;
 
     size_t vocab_size() const { return dict_.size() + 1; } // +1 for blank at index 0
 
 private:
+    void append_ctc_step(const CtcStep& step, int& prev_idx, std::string& text,
+                         float& conf_sum, int& char_count) const;
+
     std::vector<std::string> dict_;
 };
 

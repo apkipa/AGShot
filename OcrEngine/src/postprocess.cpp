@@ -464,6 +464,65 @@ CtcDecoder::CtcDecoder(const std::string& dict_path) {
     std::cout << "[+] Loaded character dictionary: " << dict_.size() << " symbols.\n";
 }
 
+CtcStep CtcDecoder::argmax_fp16(const uint16_t* step_slice, int vocab_size) noexcept {
+    int best_idx = 0;
+    float best_val = -1e9f;
+
+    // FP16 values are ordered by bits after a sign transform. Normalize
+    // subnormals because fp16_to_float intentionally maps them to signed zero.
+    uint16_t best_key = 0;
+    uint16_t best_raw = 0;
+    bool have_best = false;
+    for (int c = 0; c < vocab_size; ++c) {
+        const uint16_t raw = step_slice[c];
+        const uint16_t exponent = raw & 0x7c00u;
+        const uint16_t mantissa = raw & 0x03ffu;
+        if (exponent == 0x7c00u && mantissa != 0) continue; // NaN
+        const uint16_t normalized = exponent == 0 ? 0 : raw;
+        const uint16_t key = (normalized & 0x8000u)
+            ? static_cast<uint16_t>(~normalized)
+            : static_cast<uint16_t>(normalized ^ 0x8000u);
+        if (!have_best || key > best_key) {
+            best_key = key;
+            best_raw = normalized;
+            best_idx = c;
+            have_best = true;
+        }
+    }
+    if (have_best) best_val = fp16_to_float(best_raw);
+    return { best_idx, best_val };
+}
+
+void CtcDecoder::append_ctc_step(const CtcStep& step, int& prev_idx, std::string& text,
+                                 float& conf_sum, int& char_count) const {
+    // CTC greedy decode: skip blank (0) and consecutive duplicates
+    if (step.index != 0 && step.index != prev_idx) {
+        const size_t dict_idx = static_cast<size_t>(step.index - 1);
+        if (dict_idx < dict_.size()) {
+            text += dict_[dict_idx];
+            conf_sum += step.confidence;
+            char_count++;
+        }
+    }
+    prev_idx = step.index;
+}
+
+std::string CtcDecoder::fold_slices(const std::vector<std::vector<CtcStep>>& slices, float& out_conf) const {
+    std::string text;
+    int prev_idx = -1;
+    float conf_sum = 0.0f;
+    int char_count = 0;
+
+    for (const auto& slice : slices) {
+        for (const CtcStep& step : slice) {
+            append_ctc_step(step, prev_idx, text, conf_sum, char_count);
+        }
+    }
+
+    out_conf = (char_count > 0) ? (conf_sum / char_count) : 0.0f;
+    return text;
+}
+
 std::string CtcDecoder::decode(const uint16_t* data_fp16, int seq_len, int vocab_size, float& out_conf) const {
     std::string text;
     int prev_idx = -1;
@@ -471,44 +530,8 @@ std::string CtcDecoder::decode(const uint16_t* data_fp16, int seq_len, int vocab
     int char_count = 0;
 
     for (int t = 0; t < seq_len; ++t) {
-        const uint16_t* step_slice = data_fp16 + t * vocab_size;
-
-        int best_idx = 0;
-        float best_val = -1e9f;
-
-        // FP16 values are ordered by bits after a sign transform. Normalize
-        // subnormals because fp16_to_float intentionally maps them to signed zero.
-        uint16_t best_key = 0;
-        uint16_t best_raw = 0;
-        bool have_best = false;
-        for (int c = 0; c < vocab_size; ++c) {
-            const uint16_t raw = step_slice[c];
-            const uint16_t exponent = raw & 0x7c00u;
-            const uint16_t mantissa = raw & 0x03ffu;
-            if (exponent == 0x7c00u && mantissa != 0) continue; // NaN
-            const uint16_t normalized = exponent == 0 ? 0 : raw;
-            const uint16_t key = (normalized & 0x8000u)
-                ? static_cast<uint16_t>(~normalized)
-                : static_cast<uint16_t>(normalized ^ 0x8000u);
-            if (!have_best || key > best_key) {
-                best_key = key;
-                best_raw = normalized;
-                best_idx = c;
-                have_best = true;
-            }
-        }
-        if (have_best) best_val = fp16_to_float(best_raw);
-
-        // CTC greedy decode: skip blank (0) and consecutive duplicates
-        if (best_idx != 0 && best_idx != prev_idx) {
-            size_t dict_idx = static_cast<size_t>(best_idx - 1);
-            if (dict_idx < dict_.size()) {
-                text += dict_[dict_idx];
-                conf_sum += best_val;
-                char_count++;
-            }
-        }
-        prev_idx = best_idx;
+        const CtcStep step = argmax_fp16(data_fp16 + static_cast<size_t>(t) * vocab_size, vocab_size);
+        append_ctc_step(step, prev_idx, text, conf_sum, char_count);
     }
 
     out_conf = (char_count > 0) ? (conf_sum / char_count) : 0.0f;

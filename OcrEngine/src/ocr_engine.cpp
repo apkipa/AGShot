@@ -13,6 +13,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -120,12 +121,34 @@ struct OcrEngine::State {
         }
     }
 
-    void fill_rec_input(const ImageBGR& image, void* destination) const {
+    void fill_rec_input(const ImageBGR& source, int src_x, int valid_w, int target_w, void* destination) const {
         if (options.rec_input_u8) {
-            std::memcpy(destination, image.data.data(), image.data.size());
+            auto* dst = static_cast<uint8_t*>(destination);
+            const size_t copy_bytes = static_cast<size_t>(valid_w) * 3;
+            const size_t pad_bytes = static_cast<size_t>(target_w - valid_w) * 3;
+            for (int y = 0; y < kRecHeight; ++y) {
+                const uint8_t* src_row = source.data.data() + (static_cast<size_t>(y) * source.width + src_x) * 3;
+                uint8_t* dst_row = dst + static_cast<size_t>(y) * target_w * 3;
+                std::memcpy(dst_row, src_row, copy_bytes);
+                if (pad_bytes > 0) {
+                    std::memset(dst_row + copy_bytes, 0, pad_bytes);
+                }
+            }
         } else {
+            ImageBGR padded_crop;
+            padded_crop.width = target_w;
+            padded_crop.height = kRecHeight;
+            padded_crop.channels = 3;
+            padded_crop.data.assign(static_cast<size_t>(target_w) * kRecHeight * 3, 0);
+            const size_t copy_bytes = static_cast<size_t>(valid_w) * 3;
+            for (int y = 0; y < kRecHeight; ++y) {
+                std::memcpy(
+                    padded_crop.data.data() + static_cast<size_t>(y) * target_w * 3,
+                    source.data.data() + (static_cast<size_t>(y) * source.width + src_x) * 3,
+                    copy_bytes);
+            }
             WicDecoder::normalize_to_nchw_fp16(
-                image, destination, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f);
+                padded_crop, destination, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f, 127.5f);
         }
     }
 
@@ -255,25 +278,53 @@ void OcrEngine::State::recognize_boxes(const ImageBGR& image, std::vector<TextBo
     if (boxes.empty()) return;
     if (!rec_graph_160 && !rec_graph_320 && !rec_graph_640 && !rec_graph_1280) return;
 
-    // Recognition pipeline: submit box b, prepare b+1, decode b-2. Each slot
-    // waits only on the request it submitted to (pooled per-slot queue), so
-    // while the host crops, normalizes and CTC-decodes, the other in-flight
-    // requests stay queued on the NPU (the device runs them serially; depth=2
-    // keeps it busy).
+    // Unified two-slot (rec_depth) async pipeline covering both single-bucket
+    // lines and long-line sliding-window slices without drain barriers.
+    struct GridBoxResult {
+        TextBox* box = nullptr;
+        std::vector<std::vector<CtcStep>> slices;
+        size_t remaining = 0;
+    };
     struct PendingRec {
         NpuInferRequest* req = nullptr;
         TextBox* box = nullptr;
+        GridBoxResult* grid_box = nullptr;
+        size_t slice_idx = 0;
+        int cell_start = 0;
+        int cell_end = 0;
         int vocab_size = 0;
         int valid_seq_len = 0;
     };
+
     const int rec_depth = options.rec_depth;
+    const int vocab_size = rec_vocab_size;
     std::vector<PendingRec> pending(static_cast<size_t>(rec_depth));
+    std::deque<GridBoxResult> grid_results;
 
     auto consume_rec_slot = [&](size_t slot) {
         PendingRec& p = pending[slot];
         const uint16_t* p_out = reinterpret_cast<const uint16_t*>(p.req->get_output_ptr(0));
-        p.box->text = ctc_decoder->decode(p_out, p.valid_seq_len, p.vocab_size, p.box->text_confidence);
+        if (p.grid_box != nullptr) {
+            auto& dst_slice = p.grid_box->slices[p.slice_idx];
+            if (p.cell_end > p.cell_start) {
+                dst_slice.reserve(static_cast<size_t>(p.cell_end - p.cell_start));
+                for (int t = p.cell_start; t < p.cell_end; ++t) {
+                    dst_slice.push_back(CtcDecoder::argmax_fp16(
+                        p_out + static_cast<size_t>(t) * static_cast<size_t>(p.vocab_size),
+                        p.vocab_size));
+                }
+            }
+            if (--p.grid_box->remaining == 0) {
+                p.grid_box->box->text = ctc_decoder->fold_slices(
+                    p.grid_box->slices, p.grid_box->box->text_confidence);
+                p.grid_box->slices.clear();
+            }
+        } else {
+            p.box->text = ctc_decoder->decode(p_out, p.valid_seq_len, p.vocab_size, p.box->text_confidence);
+        }
         p.req = nullptr;
+        p.box = nullptr;
+        p.grid_box = nullptr;
     };
 
     auto flush_rec_slot = [&](size_t slot) {
@@ -283,154 +334,122 @@ void OcrEngine::State::recognize_boxes(const ImageBGR& image, std::vector<TextBo
         consume_rec_slot(slot);
     };
 
+    auto acquire_rec_slot = [&](size_t submission_idx) -> size_t {
+        if (options.rec_poll && rec_depth == 2) {
+            if (pending[0].req && pending[1].req) {
+                size_t completed_slot = 0;
+                for (;;) {
+                    if (pending[0].req->try_wait()) { completed_slot = 0; break; }
+                    if (pending[1].req->try_wait()) { completed_slot = 1; break; }
+                    Sleep(0);
+                }
+                consume_rec_slot(completed_slot);
+                return completed_slot;
+            }
+            return pending[0].req ? 1 : 0;
+        }
+        const size_t slot = submission_idx % static_cast<size_t>(rec_depth);
+        flush_rec_slot(slot);
+        return slot;
+    };
+
+    struct RecBucket {
+        int width;
+        const std::shared_ptr<NpuGraph>& graph;
+    };
+    const RecBucket single_buckets[4] = {
+        { 160, rec_graph_160 },
+        { 320, rec_graph_320 },
+        { 640, rec_graph_640 },
+        { 1280, rec_graph_1280 },
+    };
+    const RecBucket sliding_candidates[4] = {
+        { 640, rec_graph_640 },
+        { 320, rec_graph_320 },
+        { 1280, rec_graph_1280 },
+        { 160, rec_graph_160 },
+    };
+
+    size_t submission_idx = 0;
     for (size_t b = 0; b < boxes.size(); ++b) {
         auto& box = boxes[b];
-        // Crop quad normalized to height 48, with natural uncompressed width
+        // Crop quad normalized to height 48, with natural uncompressed width.
+        // Runs before acquire_rec_slot() so cropping overlaps with in-flight NPU work.
         const ImageBGR natural_crop = WicDecoder::crop_quad_natural(image, box.quad, kRecHeight);
-
+        if (natural_crop.empty()) continue;
         const int natural_w = natural_crop.width;
 
-        // Use a single bucket through W=1280; preserve the W=640 sliding
-        // fallback above it.
-        if (natural_w <= kLongLineWindow || (natural_w <= 1280 && rec_graph_1280)) {
-            int target_w = 320;
-            std::shared_ptr<NpuGraph> target_graph = rec_graph_320;
-
-            if (natural_w <= 160 && rec_graph_160) {
-                target_w = 160;
-                target_graph = rec_graph_160;
-            } else if (natural_w > 320 && natural_w <= 640 && rec_graph_640) {
-                target_w = 640;
-                target_graph = rec_graph_640;
-            } else if (natural_w > 640 && natural_w <= 1280 && rec_graph_1280) {
-                target_w = 1280;
-                target_graph = rec_graph_1280;
+        int target_w = 0;
+        std::shared_ptr<NpuGraph> target_graph;
+        for (const auto& bucket : single_buckets) {
+            if (bucket.graph && natural_w <= bucket.width) {
+                target_w = bucket.width;
+                target_graph = bucket.graph;
+                break;
             }
+        }
 
-            if (!target_graph) target_graph = rec_graph_320 ? rec_graph_320 : (rec_graph_160 ? rec_graph_160 : (rec_graph_640 ? rec_graph_640 : rec_graph_1280));
-            if (!target_graph) continue;
-
-            ImageBGR padded_crop;
-            padded_crop.width = target_w;
-            padded_crop.height = kRecHeight;
-            padded_crop.channels = 3;
-            padded_crop.data.assign(static_cast<size_t>(target_w) * kRecHeight * 3, 0);
-
+        if (target_graph) {
             const int valid_w = std::min(target_w, natural_w);
-            for (int y = 0; y < kRecHeight; ++y) {
-                std::memcpy(
-                    padded_crop.data.data() + (y * target_w) * 3,
-                    natural_crop.data.data() + (y * natural_w) * 3,
-                    static_cast<size_t>(valid_w) * 3
-                );
-            }
-
-            // Default: reuse slot b%depth only after its previous submission
-            // (box b-depth) is done; the other slots' requests are untouched.
-            // Poll mode (depth 2 only): consume whichever slot finished first,
-            // then reuse that slot.
-            size_t slot = b % static_cast<size_t>(rec_depth);
-            if (options.rec_poll && rec_depth == 2) {
-                if (pending[0].req && pending[1].req) {
-                    size_t completed_slot = pending.size();
-                    for (;;) {
-                        if (pending[0].req->try_wait()) { completed_slot = 0; break; }
-                        if (pending[1].req->try_wait()) { completed_slot = 1; break; }
-                        Sleep(0);
-                    }
-                    slot = completed_slot;
-                    consume_rec_slot(completed_slot);
-                } else {
-                    slot = pending[0].req ? 1 : 0;
-                }
-            } else {
-                flush_rec_slot(slot);
-            }
-
+            const size_t slot = acquire_rec_slot(submission_idx++);
             auto& req = target_graph->get_request(slot);
-            fill_rec_input(padded_crop, req.get_input_ptr(0));
+            fill_rec_input(natural_crop, 0, valid_w, target_w, req.get_input_ptr(0));
             req.start_async();
 
             const int seq_len = target_w / kRecCellStride;
-            // Every loaded graph was checked against this vocabulary, so the
-            // decode width is the validated one rather than a re-derivation.
-            const int vocab_size = rec_vocab_size;
             pending[slot].req = &req;
             pending[slot].box = &box;
+            pending[slot].grid_box = nullptr;
             pending[slot].vocab_size = vocab_size;
             pending[slot].valid_seq_len =
-                std::min(seq_len, static_cast<int>(std::ceil(static_cast<float>(valid_w) / 8.0f)));
+                std::min(seq_len, static_cast<int>(std::ceil(static_cast<float>(valid_w) / kRecCellStride)));
         } else {
-            // Ultra-long lines act as a pipeline barrier: the slice loop below
-            // reuses the 640-graph request slots.
-            for (size_t s = 0; s < pending.size(); ++s) flush_rec_slot(s);
-
-            // Ultra-long line -> grid sliding window with midpoint merging
-            const int overlap_cells = kLongLineOverlap / kRecCellStride; // 16 cells
-            const int half_overlap_cells = overlap_cells / 2;            // 8 cells
-            const int step_px = kLongLineWindow - kLongLineOverlap;      // 512px
-
-            const int num_slices = static_cast<int>(
-                std::ceil(static_cast<float>(natural_w - kLongLineOverlap) / step_px));
-            auto target_graph = rec_graph_640 ? rec_graph_640 : rec_graph_320;
+            int window_w = 0;
+            for (const auto& candidate : sliding_candidates) {
+                if (candidate.graph) {
+                    window_w = candidate.width;
+                    target_graph = candidate.graph;
+                    break;
+                }
+            }
             if (!target_graph) continue;
 
-            const int win_cells = kLongLineWindow / kRecCellStride; // 80 cells
-            const int vocab_size = rec_vocab_size;
+            const int overlap_px = std::min(kLongLineOverlap, window_w / 2);
+            const int overlap_cells = overlap_px / kRecCellStride;
+            const int half_overlap_cells = overlap_cells / 2;
+            const int step_px = window_w - overlap_px;
+            const int num_slices = static_cast<int>(
+                std::ceil(static_cast<float>(natural_w - overlap_px) / step_px));
+            if (num_slices <= 0) continue;
 
-            // Logits merged across slices
-            std::vector<uint16_t> merged_logits;
+            const int win_cells = window_w / kRecCellStride;
+            auto& grid_box = grid_results.emplace_back();
+            grid_box.box = &box;
+            grid_box.slices.resize(static_cast<size_t>(num_slices));
+            grid_box.remaining = static_cast<size_t>(num_slices);
 
             for (int s = 0; s < num_slices; ++s) {
                 const int sx = s * step_px;
-                const int valid_slice_w = std::min(kLongLineWindow, natural_w - sx);
-
-                ImageBGR slice_img;
-                slice_img.width = kLongLineWindow;
-                slice_img.height = kRecHeight;
-                slice_img.channels = 3;
-                slice_img.data.assign(static_cast<size_t>(kLongLineWindow) * kRecHeight * 3, 0);
-
-                for (int y = 0; y < kRecHeight; ++y) {
-                    std::memcpy(
-                        slice_img.data.data() + (y * kLongLineWindow) * 3,
-                        natural_crop.data.data() + (y * natural_w + sx) * 3,
-                        static_cast<size_t>(valid_slice_w) * 3
-                    );
-                }
-
-                auto& req = target_graph->get_request(s % 2);
-                fill_rec_input(slice_img, req.get_input_ptr(0));
-                req.start_async();
-                req.wait();
-
-                const uint16_t* p_slice_out = reinterpret_cast<const uint16_t*>(req.get_output_ptr(0));
+                const int valid_slice_w = std::min(window_w, natural_w - sx);
                 const int valid_slice_cells = std::min(
                     win_cells,
                     static_cast<int>(std::ceil(static_cast<float>(valid_slice_w) / kRecCellStride)));
-
-                // Merge slice into merged_logits using the midpoint split rule
                 const int cell_start = (s == 0) ? 0 : half_overlap_cells;
                 const int cell_end = (s == num_slices - 1) ? valid_slice_cells : (win_cells - half_overlap_cells);
 
-                if (cell_end > cell_start) {
-                    const size_t offset_cells = static_cast<size_t>(cell_start);
-                    const size_t count_cells = static_cast<size_t>(cell_end - cell_start);
-                    const size_t copy_elems = count_cells * static_cast<size_t>(vocab_size);
+                const size_t slot = acquire_rec_slot(submission_idx++);
+                auto& req = target_graph->get_request(slot);
+                fill_rec_input(natural_crop, sx, valid_slice_w, window_w, req.get_input_ptr(0));
+                req.start_async();
 
-                    const size_t curr_sz = merged_logits.size();
-                    merged_logits.resize(curr_sz + copy_elems);
-                    std::memcpy(
-                        merged_logits.data() + curr_sz,
-                        p_slice_out + offset_cells * static_cast<size_t>(vocab_size),
-                        copy_elems * sizeof(uint16_t)
-                    );
-                }
+                pending[slot].req = &req;
+                pending[slot].box = nullptr;
+                pending[slot].grid_box = &grid_box;
+                pending[slot].slice_idx = static_cast<size_t>(s);
+                pending[slot].cell_start = cell_start;
+                pending[slot].cell_end = cell_end;
+                pending[slot].vocab_size = vocab_size;
             }
-
-            // Run a single CTC decode on the merged logits
-            const int total_seq_len = static_cast<int>(merged_logits.size() / static_cast<size_t>(vocab_size));
-            box.text = ctc_decoder->decode(merged_logits.data(), total_seq_len, vocab_size, box.text_confidence);
         }
     }
 
