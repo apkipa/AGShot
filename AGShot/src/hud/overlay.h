@@ -97,7 +97,6 @@ namespace agshot
         void RequestRender();
         void StartSelectionAnimation(const RECT& target);
         bool AdvanceSelectionAnimation(LONGLONG now) noexcept;
-        void StopAnimationClock() noexcept;
         void StopSelectionAnimation() noexcept;
         void UpdateHover(POINT point);
         void Settle();

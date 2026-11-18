@@ -1,15 +1,15 @@
 #pragma once
 
 #include <windows.h>
-#include <winrt/base.h>
 
 #include <memory>
-#include <mutex>
 
 namespace agshot
 {
-    // Posts VSync-aligned frame tick messages to a window while at least one
-    // client holds an active subscription.
+    struct FrameSignal;
+
+    // Requests VSync-aligned frame tick messages for a window using a one-shot
+    // rAF-style interface while keeping the underlying clock subscription warm.
     class CompositorClockClient
     {
     public:
@@ -19,23 +19,16 @@ namespace agshot
         CompositorClockClient(const CompositorClockClient&) = delete;
         CompositorClockClient& operator=(const CompositorClockClient&) = delete;
 
-        bool Start(HWND window, UINT frameMessage) noexcept;
-        void MarkFrameHandled() noexcept;
+        bool RequestFrame(HWND window, UINT frameMessage) noexcept;
+        void BeginFrame() noexcept;
+        void EndFrame() noexcept;
+        void Cancel() noexcept;
         void Stop() noexcept;
-        bool active() const noexcept { return static_cast<bool>(m_signal); }
 
     private:
-        struct FrameSignal
-        {
-            std::mutex mutex;
-            HWND window{};
-            UINT message{};
-            bool active{ true };
-            bool posted{};
-        };
+        void DrainPendingMessages() noexcept;
 
         std::shared_ptr<FrameSignal> m_signal;
-        winrt::event_token m_token{};
         HWND m_window{};
         UINT m_message{};
     };

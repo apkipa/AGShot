@@ -27,8 +27,8 @@ namespace agshot
         constexpr int kHandleSize = 8;
         constexpr int kMinimumDrag = 3;
         constexpr ULONGLONG kQueryIntervalMs = 30;
-        constexpr ULONGLONG kSelectionAnimationMs = 101;
-        constexpr UINT kSelectionAnimationFrameMessage = WM_APP + 0x4A;
+        constexpr ULONGLONG kSelectionAnimationMs = 120;
+        constexpr UINT kFrameMessage = WM_APP + 0x4A;
         constexpr UINT kMemoryPressureMessage = WM_APP + 0x4D;
         constexpr UINT kVramPressureMessage = WM_APP + 0x4E;
 
@@ -147,7 +147,7 @@ namespace agshot
     void Overlay::Destroy() noexcept
     {
         StopSelectionAnimation();
-        StopAnimationClock();
+        m_clock.Stop();
         m_ocrPanel.Destroy(m_window);
         m_renderer.DiscardIndependentResources();
         m_memoryWatch.Destroy();
@@ -238,7 +238,7 @@ namespace agshot
         m_ladder.clear();
         m_lastQuery = 0;
         StopSelectionAnimation();
-        StopAnimationClock();
+        m_clock.Cancel();
 
         HRESULT backgroundHr = m_device.UpdateBackgroundBitmap(m_image);
         if (RenderDevice::IsDeviceLost(backgroundHr))
@@ -304,7 +304,7 @@ namespace agshot
         }
 
         StopSelectionAnimation();
-        StopAnimationClock();
+        m_clock.Cancel();
         ShowWindow(m_window, SW_HIDE);
 
         m_hasSelection = false;
@@ -392,20 +392,24 @@ namespace agshot
             return;
         }
 
+        if (m_animatingSelection && EqualRect(&m_animationTo, &target))
+        {
+            return;
+        }
+
         if (EqualRect(&m_displaySelection, &target))
         {
             StopSelectionAnimation();
             return;
         }
 
-        const bool wasAnimating = m_animatingSelection;
         LARGE_INTEGER now{};
         QueryPerformanceCounter(&now);
         m_animationFrom = m_displaySelection;
         m_animationTo = target;
         m_animationStart = now.QuadPart;
         m_animatingSelection = true;
-        if (!wasAnimating && !m_clock.Start(m_window, kSelectionAnimationFrameMessage))
+        if (!m_clock.RequestFrame(m_window, kFrameMessage))
         {
             m_displaySelection = target;
             StopSelectionAnimation();
@@ -426,7 +430,7 @@ namespace agshot
 
         ApplyCursor();
 
-        if (!m_clock.active() && !m_clock.Start(m_window, kSelectionAnimationFrameMessage))
+        if (!m_clock.RequestFrame(m_window, kFrameMessage))
         {
             Render();
         }
@@ -469,18 +473,9 @@ namespace agshot
         return true;
     }
 
-    void Overlay::StopAnimationClock() noexcept
-    {
-        m_clock.Stop();
-    }
-
     void Overlay::StopSelectionAnimation() noexcept
     {
-        if (m_animatingSelection)
-        {
-            m_animatingSelection = false;
-            StopAnimationClock();
-        }
+        m_animatingSelection = false;
     }
 
     Overlay::HitTarget Overlay::HitTest(POINT point) const noexcept
@@ -1301,8 +1296,16 @@ namespace agshot
             }
             break;
 
-        case kSelectionAnimationFrameMessage:
-            m_clock.MarkFrameHandled();
+        case kFrameMessage:
+        {
+            m_clock.BeginFrame();
+            auto endClock = wil::scope_exit([&] { m_clock.EndFrame(); });
+
+            if (!IsWindowVisible(m_window) || !m_device.hasBackground())
+            {
+                return 0;
+            }
+
             if (m_animatingSelection)
             {
                 LARGE_INTEGER now{};
@@ -1310,12 +1313,15 @@ namespace agshot
                 AdvanceSelectionAnimation(now.QuadPart);
             }
             Render();
-            if (!m_animatingSelection
-                && !(m_mode == OperationMode::TextRecognition && m_ocrPanel.pending()))
+            endClock.reset();
+
+            if (m_animatingSelection
+                || (m_mode == OperationMode::TextRecognition && m_ocrPanel.pending()))
             {
-                StopAnimationClock();
+                m_clock.RequestFrame(m_window, kFrameMessage);
             }
             return 0;
+        }
 
         case kMemoryPressureMessage:
             OnMemoryPressure();

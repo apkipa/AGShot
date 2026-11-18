@@ -2,14 +2,24 @@
 
 #include "hud/compositor_clock.h"
 
-#include <winrt/base.h>
-
+#include <algorithm>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace agshot
 {
+    struct FrameSignal
+    {
+        HWND window{};
+        UINT message{};
+        bool registered{ true };
+        bool requested{};
+        bool inFlight{};
+    };
+
     namespace
     {
         constexpr DWORD kCompositorClockTimeoutMs = 50;
@@ -27,24 +37,52 @@ namespace agshot
         class CompositorClockService
         {
         public:
-            winrt::event_token Add(winrt::delegate<void()> callback)
+            void Register(const std::shared_ptr<FrameSignal>& signal)
             {
-                winrt::event_token token{};
-                {
-                    std::lock_guard lock(m_waitMutex);
-                    token = m_clockTick.add(callback);
-                }
-                m_wake.notify_one();
-                return token;
+                std::lock_guard lock(m_mutex);
+                m_signals.push_back(signal);
             }
 
-            void Remove(winrt::event_token token)
+            void Unregister(const std::shared_ptr<FrameSignal>& signal) noexcept
             {
+                std::lock_guard lock(m_mutex);
+                signal->registered = false;
+                signal->requested = false;
+                signal->inFlight = false;
+                std::erase(m_signals, signal);
+            }
+
+            void Request(const std::shared_ptr<FrameSignal>& signal) noexcept
+            {
+                std::lock_guard lock(m_mutex);
+                signal->requested = true;
+                if (!signal->inFlight)
                 {
-                    std::lock_guard lock(m_waitMutex);
-                    m_clockTick.remove(token);
+                    m_wake.notify_one();
                 }
-                m_wake.notify_one();
+            }
+
+            void BeginFrame(const std::shared_ptr<FrameSignal>& signal) noexcept
+            {
+                std::lock_guard lock(m_mutex);
+                signal->requested = false;
+            }
+
+            void EndFrame(const std::shared_ptr<FrameSignal>& signal) noexcept
+            {
+                std::lock_guard lock(m_mutex);
+                signal->inFlight = false;
+                if (signal->requested)
+                {
+                    m_wake.notify_one();
+                }
+            }
+
+            void Cancel(const std::shared_ptr<FrameSignal>& signal) noexcept
+            {
+                std::lock_guard lock(m_mutex);
+                signal->requested = false;
+                signal->inFlight = false;
             }
 
         private:
@@ -53,27 +91,53 @@ namespace agshot
                 std::thread([this] { Run(); }).detach();
             }
 
+            bool HasDispatchableLocked() const noexcept
+            {
+                return std::any_of(m_signals.begin(), m_signals.end(), [](const auto& signal)
+                {
+                    return signal->registered && signal->requested && !signal->inFlight;
+                });
+            }
+
+            void Dispatch() noexcept
+            {
+                std::lock_guard lock(m_mutex);
+                for (const auto& signal : m_signals)
+                {
+                    if (!signal->registered || !signal->requested || signal->inFlight)
+                    {
+                        continue;
+                    }
+
+                    signal->requested = false;
+                    if (PostMessageW(signal->window, signal->message, 0, 0))
+                    {
+                        signal->inFlight = true;
+                    }
+                }
+            }
+
             void Run() noexcept
             {
                 const auto waitForClock = CompositorClockWaiter();
                 for (;;)
                 {
                     {
-                        std::unique_lock lock(m_waitMutex);
-                        m_wake.wait(lock, [this] { return static_cast<bool>(m_clockTick); });
+                        std::unique_lock lock(m_mutex);
+                        m_wake.wait(lock, [this] { return HasDispatchableLocked(); });
                     }
 
                     if (waitForClock == nullptr)
                     {
                         Sleep(16);
-                        m_clockTick();
+                        Dispatch();
                         continue;
                     }
 
                     const DWORD status = waitForClock(0, nullptr, kCompositorClockTimeoutMs);
                     if (status == ERROR_SUCCESS)
                     {
-                        m_clockTick();
+                        Dispatch();
                     }
                     else if (status != WAIT_TIMEOUT)
                     {
@@ -82,9 +146,9 @@ namespace agshot
                 }
             }
 
-            std::mutex m_waitMutex;
+            std::mutex m_mutex;
             std::condition_variable m_wake;
-            winrt::event<winrt::delegate<void()>> m_clockTick;
+            std::vector<std::shared_ptr<FrameSignal>> m_signals;
 
             friend CompositorClockService& GlobalCompositorClock();
         };
@@ -96,66 +160,79 @@ namespace agshot
         }
     }
 
-    bool CompositorClockClient::Start(HWND window, UINT frameMessage) noexcept
+    bool CompositorClockClient::RequestFrame(HWND window, UINT frameMessage) noexcept
+    {
+        if (window == nullptr || frameMessage == 0)
+        {
+            return false;
+        }
+
+        if (m_signal && (m_window != window || m_message != frameMessage))
+        {
+            Stop();
+        }
+
+        if (!m_signal)
+        {
+            try
+            {
+                auto signal = std::make_shared<FrameSignal>();
+                signal->window = window;
+                signal->message = frameMessage;
+                GlobalCompositorClock().Register(signal);
+                m_signal = std::move(signal);
+                m_window = window;
+                m_message = frameMessage;
+            }
+            catch (...)
+            {
+                return false;
+            }
+        }
+
+        GlobalCompositorClock().Request(m_signal);
+        return true;
+    }
+
+    void CompositorClockClient::BeginFrame() noexcept
     {
         if (m_signal)
         {
-            return true;
-        }
-
-        try
-        {
-            auto signal = std::make_shared<FrameSignal>();
-            signal->window = window;
-            signal->message = frameMessage;
-            m_signal = signal;
-            m_window = window;
-            m_message = frameMessage;
-            m_token = GlobalCompositorClock().Add(winrt::delegate<void()>{ [signal]()
-            {
-                std::lock_guard lock(signal->mutex);
-                if (!signal->active || signal->posted)
-                {
-                    return;
-                }
-
-                signal->posted = true;
-                if (!PostMessageW(signal->window, signal->message, 0, 0))
-                {
-                    signal->posted = false;
-                }
-            } });
-            return true;
-        }
-        catch (...)
-        {
-            m_signal.reset();
-            return false;
+            GlobalCompositorClock().BeginFrame(m_signal);
         }
     }
 
-    void CompositorClockClient::MarkFrameHandled() noexcept
+    void CompositorClockClient::EndFrame() noexcept
     {
         if (m_signal)
         {
-            std::lock_guard lock(m_signal->mutex);
-            m_signal->posted = false;
+            GlobalCompositorClock().EndFrame(m_signal);
         }
+    }
+
+    void CompositorClockClient::Cancel() noexcept
+    {
+        if (m_signal)
+        {
+            GlobalCompositorClock().Cancel(m_signal);
+        }
+        DrainPendingMessages();
     }
 
     void CompositorClockClient::Stop() noexcept
     {
         if (m_signal)
         {
-            {
-                std::lock_guard lock(m_signal->mutex);
-                m_signal->active = false;
-            }
-            GlobalCompositorClock().Remove(m_token);
-            m_token = {};
+            GlobalCompositorClock().Unregister(m_signal);
             m_signal.reset();
         }
+        DrainPendingMessages();
+        m_window = nullptr;
+        m_message = 0;
+    }
 
+    void CompositorClockClient::DrainPendingMessages() noexcept
+    {
         if (m_window != nullptr && m_message != 0)
         {
             MSG pending{};
