@@ -9,99 +9,20 @@ namespace agshot
 {
     namespace
     {
-        // Releases a GDI object on every exit path. The failure branches below
-        // would otherwise leak them one capture at a time.
-        //
-        // Three of them rather than one template: ReleaseDC, DeleteDC and
-        // DeleteObject do not share a signature, so a template would have to be
-        // told which is which at every use.
-        struct ScreenDc
-        {
-            HDC handle{};
-
-            ScreenDc() = default;
-            explicit ScreenDc(HDC value) : handle{ value } {}
-            ~ScreenDc()
-            {
-                if (handle != nullptr)
-                {
-                    ReleaseDC(nullptr, handle);
-                }
-            }
-
-            ScreenDc(const ScreenDc&) = delete;
-            ScreenDc& operator=(const ScreenDc&) = delete;
-        };
-
-        struct MemoryDc
-        {
-            HDC handle{};
-
-            MemoryDc() = default;
-            explicit MemoryDc(HDC value) : handle{ value } {}
-            ~MemoryDc()
-            {
-                if (handle != nullptr)
-                {
-                    DeleteDC(handle);
-                }
-            }
-
-            MemoryDc(const MemoryDc&) = delete;
-            MemoryDc& operator=(const MemoryDc&) = delete;
-        };
-
-        struct Bitmap
-        {
-            HBITMAP handle{};
-
-            Bitmap() = default;
-            explicit Bitmap(HBITMAP value) : handle{ value } {}
-            ~Bitmap()
-            {
-                if (handle != nullptr)
-                {
-                    DeleteObject(handle);
-                }
-            }
-
-            Bitmap(const Bitmap&) = delete;
-            Bitmap& operator=(const Bitmap&) = delete;
-        };
-
-        // Opens the clipboard and closes it again whatever happens: a clipboard
-        // left open by a failure would lock every other application out of it.
-        struct ClipboardLock
-        {
-            bool open{};
-
-            explicit ClipboardLock(HWND owner) : open{ OpenClipboard(owner) != 0 } {}
-            ~ClipboardLock()
-            {
-                if (open)
-                {
-                    CloseClipboard();
-                }
-            }
-
-            ClipboardLock(const ClipboardLock&) = delete;
-            ClipboardLock& operator=(const ClipboardLock&) = delete;
-        };
-
         void BlitScreenToBitmap(HDC screen, HBITMAP target, const RECT& region, int width, int height)
         {
-            const MemoryDc memory{ CreateCompatibleDC(screen) };
-            AGSHOT_CHECK_WIN32(memory.handle != nullptr);
+            const wil::unique_hdc memory{ CreateCompatibleDC(screen) };
+            AGSHOT_CHECK_WIN32(memory != nullptr);
 
-            HGDIOBJ previous = SelectObject(memory.handle, target);
+            HGDIOBJ previous = SelectObject(memory.get(), target);
             AGSHOT_CHECK_WIN32(previous != nullptr && previous != HGDI_ERROR);
+            auto restoreBitmap = wil::scope_exit([&] { SelectObject(memory.get(), previous); });
 
             // CAPTUREBLT so that layered windows - which is most modern UI - are part
             // of the picture rather than holes in it.
-            const BOOL blitted = BitBlt(memory.handle, 0, 0, width, height,
+            const BOOL blitted = BitBlt(memory.get(), 0, 0, width, height,
                                         screen, region.left, region.top,
                                         SRCCOPY | CAPTUREBLT);
-            SelectObject(memory.handle, previous);
             AGSHOT_CHECK_WIN32(blitted != 0);
 
             // GDI is allowed to hold the blit, and the bits are about to be read as
@@ -128,9 +49,8 @@ namespace agshot
             m_region = other.m_region;
             m_width = other.m_width;
             m_height = other.m_height;
-            m_bitmap = other.m_bitmap;
+            m_bitmap = std::move(other.m_bitmap);
             m_bits = other.m_bits;
-            other.m_bitmap = nullptr;
             other.m_bits = nullptr;
             other.m_region = RECT{};
             other.m_width = 0;
@@ -146,11 +66,7 @@ namespace agshot
 
     void ScreenImage::Release() noexcept
     {
-        if (m_bitmap != nullptr)
-        {
-            DeleteObject(m_bitmap);
-            m_bitmap = nullptr;
-        }
+        m_bitmap.reset();
         m_bits = nullptr;
         m_region = RECT{};
         m_width = 0;
@@ -166,14 +82,14 @@ namespace agshot
             throw Error{ Failure{ L"ScreenImage::Capture", L"the region is empty" } };
         }
 
-        const ScreenDc screen{ GetDC(nullptr) };
-        AGSHOT_CHECK_WIN32(screen.handle != nullptr);
+        const auto screen = wil::GetDC(nullptr);
+        AGSHOT_CHECK_WIN32(screen != nullptr);
 
         // Reuse the warm DIB section when dimensions have not changed so a
         // repeat capture pays only one BitBlt with zero page allocation.
-        if (m_bitmap != nullptr && m_bits != nullptr && m_width == width && m_height == height)
+        if (m_bitmap && m_bits != nullptr && m_width == width && m_height == height)
         {
-            BlitScreenToBitmap(screen.handle, m_bitmap, region, width, height);
+            BlitScreenToBitmap(screen.get(), m_bitmap.get(), region, width, height);
             m_region = region;
             return;
         }
@@ -190,20 +106,20 @@ namespace agshot
         info.bmiHeader.biCompression = BI_RGB;
 
         void* bits = nullptr;
-        Bitmap bitmap{ CreateDIBSection(screen.handle, &info, DIB_RGB_COLORS, &bits, nullptr, 0) };
-        AGSHOT_CHECK_WIN32(bitmap.handle != nullptr);
+        wil::unique_hbitmap bitmap{
+            CreateDIBSection(screen.get(), &info, DIB_RGB_COLORS, &bits, nullptr, 0) };
+        AGSHOT_CHECK_WIN32(bitmap != nullptr);
         AGSHOT_CHECK_WIN32(bits != nullptr);
 
-        BlitScreenToBitmap(screen.handle, bitmap.handle, region, width, height);
+        BlitScreenToBitmap(screen.get(), bitmap.get(), region, width, height);
 
         // Everything that can fail has happened, so the section takes over as the
         // owner of the pixels from here. Until this point the local keeps them,
         // which is what makes a failure part way through leave the object as it
         // was.
         Release();
-        m_bitmap = bitmap.handle;
+        m_bitmap = std::move(bitmap);
         m_bits = static_cast<BYTE*>(bits);
-        bitmap.handle = nullptr;
         m_region = region;
         m_width = width;
         m_height = height;
@@ -226,15 +142,11 @@ namespace agshot
 
         // One block holding the header and the pixels together, because that is
         // the shape CF_DIB has on the clipboard.
-        HGLOBAL block = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + pixelBytes);
+        wil::unique_hglobal block{ GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + pixelBytes) };
         AGSHOT_CHECK_WIN32(block != nullptr);
 
-        BYTE* target = static_cast<BYTE*>(GlobalLock(block));
-        if (target == nullptr)
-        {
-            GlobalFree(block);
-            AGSHOT_CHECK_WIN32(false);
-        }
+        BYTE* target = static_cast<BYTE*>(GlobalLock(block.get()));
+        AGSHOT_CHECK_WIN32(target != nullptr);
 
         BITMAPINFOHEADER header{};
         header.biSize = sizeof(BITMAPINFOHEADER);
@@ -257,20 +169,12 @@ namespace agshot
                         static_cast<std::size_t>(width) * 4);
         }
 
-        GlobalUnlock(block);
+        GlobalUnlock(block.get());
 
-        {
-            const ClipboardLock lock{ owner };
-            AGSHOT_CHECK_WIN32(lock.open);
-            AGSHOT_CHECK_WIN32(EmptyClipboard() != 0);
-
-            if (SetClipboardData(CF_DIB, block) == nullptr)
-            {
-                const DWORD error = GetLastError();
-                GlobalFree(block);          // still ours: the clipboard did not take it
-                throw Error{ DescribeWin32(L"SetClipboardData", error, __FILEW__, __LINE__) };
-            }
-            // The clipboard owns the block from here on.
-        }
+        AGSHOT_CHECK_WIN32(OpenClipboard(owner) != 0);
+        auto closeClipboard = wil::scope_exit([] { CloseClipboard(); });
+        AGSHOT_CHECK_WIN32(EmptyClipboard() != 0);
+        AGSHOT_CHECK_WIN32(SetClipboardData(CF_DIB, block.get()) != nullptr);
+        block.release(); // the clipboard owns the block from here on
     }
 }

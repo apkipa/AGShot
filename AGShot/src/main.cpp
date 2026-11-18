@@ -14,6 +14,7 @@
 #include <new>
 
 #include <shellapi.h>
+#include <wil/resource.h>
 
 using namespace winrt;
 
@@ -100,7 +101,7 @@ namespace
         bool hotkeyRegistered{};
         bool fatal{};
         bool* restartRequested{};
-        HICON trayIcon{};
+        wil::unique_hicon trayIcon;
         HWND hwnd{};
         agshot::Overlay overlay;
         agshot::ConfigWatcher watcher;
@@ -120,11 +121,6 @@ namespace
             {
                 DestroyWindow(hwnd);
                 hwnd = nullptr;
-            }
-            if (trayIcon != nullptr)
-            {
-                DestroyIcon(trayIcon);
-                trayIcon = nullptr;
             }
         }
     };
@@ -441,7 +437,8 @@ namespace
         }
         return false;
     }
-    bool LaunchSelfRestart(DWORD& outError) noexcept
+
+    HRESULT LaunchSelfRestart() noexcept
     {
         std::wstring path(MAX_PATH, L'\0');
         for (;;)
@@ -450,8 +447,7 @@ namespace
                 nullptr, path.data(), static_cast<DWORD>(path.size()));
             if (written == 0)
             {
-                outError = GetLastError();
-                return false;
+                return agshot::LastErrorHresult();
             }
             if (written < path.size())
             {
@@ -468,12 +464,11 @@ namespace
         if (!CreateProcessW(path.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
                             0, nullptr, nullptr, &startup, &process))
         {
-            outError = GetLastError();
-            return false;
+            return agshot::LastErrorHresult();
         }
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
-        return true;
+        const wil::unique_handle childThread{ process.hThread };
+        const wil::unique_handle childProcess{ process.hProcess };
+        return S_OK;
     }
 }
 
@@ -562,9 +557,9 @@ int RunApp(HINSTANCE instance, int showCommand, bool& restartRequested)
     AGSHOT_CHECK_WIN32(app.hwnd != nullptr);
 
     // The small icon is shared with the tray, so load it once and keep it.
-    app.trayIcon = static_cast<HICON>(LoadImageW(
+    app.trayIcon.reset(static_cast<HICON>(LoadImageW(
         instance, MAKEINTRESOURCEW(IDI_AGSHOT), IMAGE_ICON,
-        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0)));
     AGSHOT_CHECK_WIN32(app.trayIcon != nullptr);
 
     // The overlay is created up front and stays hidden. Building it on the first
@@ -580,25 +575,26 @@ int RunApp(HINSTANCE instance, int showCommand, bool& restartRequested)
 
     const agshot::TrayCallbacks trayCallbacks{
         &app, CaptureFromTray, SettingsFromTray, ReloadFromTray, RestartFromTray, ExitFromTray, FatalFromTray };
-    if (!agshot::StartTrayIcon(instance, app.trayIcon, trayCallbacks))
+    if (const HRESULT trayHr = agshot::StartTrayIcon(instance, app.trayIcon.get(), trayCallbacks);
+        FAILED(trayHr))
     {
         // Not fatal: the hotkey still works, but say so rather than leaving the
         // user wondering why the icon never showed up.
         agshot::ShowWarning(
-            agshot::DescribeWin32(L"StartTrayIcon", GetLastError(), __FILEW__, __LINE__),
+            agshot::DescribeHresult(L"StartTrayIcon", trayHr, __FILEW__, __LINE__),
             L"AGShot could not add its notification-area icon.");
     }
 
     // From here on the settings file is live. Started after the write above, so
     // that AGShot's own save does not come straight back as a change.
-    if (!app.watcher.Start(configPath, [hwnd = app.hwnd](agshot::WatchEvent event, const std::wstring& detail) {
+    if (const HRESULT watchHr = app.watcher.Start(configPath, [hwnd = app.hwnd](agshot::WatchEvent event, const std::wstring& detail) {
         OnConfigWatchEvent(hwnd, event, detail);
-    }))
+    }); FAILED(watchHr))
     {
         // Not fatal: the application still runs, but say so rather than leaving
         // the user to wonder why editing the file does nothing.
         agshot::ShowWarning(
-            agshot::DescribeWin32(L"ConfigWatcher::Start", GetLastError(), __FILEW__, __LINE__),
+            agshot::DescribeHresult(L"ConfigWatcher::Start", watchHr, __FILEW__, __LINE__),
             L"AGShot could not watch its settings file, so changes will only take effect after a restart.");
     }
 
@@ -642,8 +638,8 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
     }
 #else
     SetLastError(ERROR_SUCCESS);
-    HANDLE singleInstance = CreateMutexW(nullptr, FALSE, kSingleInstanceMutexName);
-    if (singleInstance == nullptr)
+    wil::unique_handle singleInstance{ CreateMutexW(nullptr, FALSE, kSingleInstanceMutexName) };
+    if (!singleInstance)
     {
         MessageBoxW(nullptr, L"AGShot could not check whether another instance is running.",
                     L"AGShot", MB_OK | MB_ICONERROR);
@@ -653,7 +649,6 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
         WakeExistingInstance();
-        CloseHandle(singleInstance);
         return 0;
     }
 
@@ -672,14 +667,13 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
 
     // Release the single-instance mutex before spawning the replacement process
     // so it never collides with this exiting instance.
-    CloseHandle(singleInstance);
+    singleInstance.reset();
     if (restartRequested)
     {
-        DWORD restartError = 0;
-        if (!LaunchSelfRestart(restartError))
+        if (const HRESULT restartHr = LaunchSelfRestart(); FAILED(restartHr))
         {
             agshot::ShowWarning(
-                agshot::DescribeWin32(L"CreateProcessW(restart)", restartError, __FILEW__, __LINE__),
+                agshot::DescribeHresult(L"CreateProcessW(restart)", restartHr, __FILEW__, __LINE__),
                 L"AGShot could not restart itself.");
         }
     }

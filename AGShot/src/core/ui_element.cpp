@@ -4,6 +4,7 @@
 
 #include <dwmapi.h>
 #include <uiautomation.h>
+#include <wil/resource.h>
 
 #include <algorithm>
 #include <limits>
@@ -19,12 +20,6 @@ namespace agshot
         constexpr std::size_t kMaxNodesPerWindow = 4096;
         constexpr std::size_t kMaxTotalNodes = 16384;
         constexpr std::size_t kMaxLadderRects = 12;
-
-        struct FlagReset
-        {
-            bool& flag;
-            ~FlagReset() { flag = false; }
-        };
 
         struct ChildNode
         {
@@ -237,7 +232,7 @@ namespace agshot
 
         ladder.clear();
         m_impl->querying = true;
-        const FlagReset resetQuery{ m_impl->querying };
+        auto resetQuery = wil::scope_exit([&] { m_impl->querying = false; });
         // EnumWindows preserved front-to-back order. Pick exactly one window before
         // asking UIA anything, so a covered application's element can never win.
         WindowSnapshot* window = nullptr;

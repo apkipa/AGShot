@@ -136,14 +136,13 @@ namespace agshot
         Stop();
     }
 
-    bool ConfigWatcher::Start(const std::filesystem::path& path, WatchCallback on_change)
+    HRESULT ConfigWatcher::Start(const std::filesystem::path& path, WatchCallback on_change)
     {
         Stop();
 
         if (path.filename().empty() || !on_change)
         {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return false;
+            return E_INVALIDARG;
         }
 
         // On a first run the directory may not exist yet, and a watch cannot be
@@ -156,89 +155,62 @@ namespace agshot
         }
         std::filesystem::create_directories(directory, ec);
 
-        const HANDLE directoryHandle = CreateFileW(
+        wil::unique_hfile directoryHandle{ CreateFileW(
             directory.c_str(),
             FILE_LIST_DIRECTORY,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-            nullptr);
-        if (directoryHandle == INVALID_HANDLE_VALUE)
+            nullptr) };
+        if (!directoryHandle)
         {
-            return false;
+            return LastErrorHresult();
         }
 
-        const HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (stopEvent == nullptr)
+        wil::unique_handle stopEvent{ CreateEventW(nullptr, TRUE, FALSE, nullptr) };
+        if (!stopEvent)
         {
-            CloseHandle(directoryHandle);
-            return false;
+            return LastErrorHresult();
         }
 
-        const HANDLE ioEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (ioEvent == nullptr)
+        wil::unique_handle ioEvent{ CreateEventW(nullptr, FALSE, FALSE, nullptr) };
+        if (!ioEvent)
         {
-            const DWORD error = GetLastError();
-            CloseHandle(stopEvent);
-            CloseHandle(directoryHandle);
-            SetLastError(error);
-            return false;
+            return LastErrorHresult();
         }
 
-        m_directory = directoryHandle;
-        m_stopEvent = stopEvent;
-        m_ioEvent = ioEvent;
+        m_directory = std::move(directoryHandle);
+        m_stopEvent = std::move(stopEvent);
+        m_ioEvent = std::move(ioEvent);
         m_fileName = path.filename().wstring();
         m_callback = std::move(on_change);
 
-        const HANDLE thread = CreateThread(nullptr, 0, &ConfigWatcher::ThreadMain, this, 0, nullptr);
-        if (thread == nullptr)
+        m_thread.reset(CreateThread(nullptr, 0, &ConfigWatcher::ThreadMain, this, 0, nullptr));
+        if (!m_thread)
         {
-            const DWORD error = GetLastError();
-            m_directory = nullptr;
-            m_stopEvent = nullptr;
-            m_ioEvent = nullptr;
-            m_fileName.clear();
-            m_callback = nullptr;
-            CloseHandle(ioEvent);
-            CloseHandle(stopEvent);
-            CloseHandle(directoryHandle);
-            SetLastError(error);
-            return false;
+            const HRESULT hr = LastErrorHresult();
+            Stop();
+            return hr;
         }
 
-        m_thread = thread;
-        return true;
+        return S_OK;
     }
 
     void ConfigWatcher::Stop() noexcept
     {
-        if (m_thread != nullptr)
+        if (m_thread)
         {
-            SetEvent(m_stopEvent);
-            WaitForSingleObject(m_thread, INFINITE);
-            CloseHandle(m_thread);
-            m_thread = nullptr;
+            SetEvent(m_stopEvent.get());
+            WaitForSingleObject(m_thread.get(), INFINITE);
+            m_thread.reset();
         }
 
         // Only once the thread has finished, so it cannot be using a handle that
         // has already been closed.
-        if (m_directory != nullptr)
-        {
-            CloseHandle(m_directory);
-            m_directory = nullptr;
-        }
-        if (m_ioEvent != nullptr)
-        {
-            CloseHandle(m_ioEvent);
-            m_ioEvent = nullptr;
-        }
-        if (m_stopEvent != nullptr)
-        {
-            CloseHandle(m_stopEvent);
-            m_stopEvent = nullptr;
-        }
+        m_directory.reset();
+        m_ioEvent.reset();
+        m_stopEvent.reset();
 
         m_fileName.clear();
         m_callback = nullptr;
@@ -262,11 +234,11 @@ namespace agshot
 
             // Sit on the directory until something names the file we were asked
             // about. Anything else in there is not our business.
-            Wait state = WaitOnce(m_directory, m_stopEvent, m_ioEvent, INFINITE,
+            Wait state = WaitOnce(m_directory.get(), m_stopEvent.get(), m_ioEvent.get(), INFINITE,
                                   buffer.data(), size, bytes, error);
             while (state == Wait::Changed && !NamesTarget(buffer.data(), bytes, m_fileName))
             {
-                state = WaitOnce(m_directory, m_stopEvent, m_ioEvent, INFINITE,
+                state = WaitOnce(m_directory.get(), m_stopEvent.get(), m_ioEvent.get(), INFINITE,
                                  buffer.data(), size, bytes, error);
             }
 
@@ -284,7 +256,7 @@ namespace agshot
             const ULONGLONG deadline = GetTickCount64() + kMaxSettleMs;
             for (;;)
             {
-                const Wait again = WaitOnce(m_directory, m_stopEvent, m_ioEvent, kSettleMs,
+                const Wait again = WaitOnce(m_directory.get(), m_stopEvent.get(), m_ioEvent.get(), kSettleMs,
                                             buffer.data(), size, bytes, error);
                 if (again == Wait::Quiet)
                 {

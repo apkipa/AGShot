@@ -5,6 +5,8 @@
 #include "core/error.h"
 #include "hud/spinner_effect.h"
 
+#include <wil/resource.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -600,30 +602,25 @@ namespace agshot
         {
             return false;
         }
+        auto closeClipboard = wil::scope_exit([] { CloseClipboard(); });
 
         if (EmptyClipboard())
         {
             const SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
-            HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
-            if (memory != nullptr)
+            wil::unique_hglobal memory{ GlobalAlloc(GMEM_MOVEABLE, bytes) };
+            if (memory)
             {
-                void* destination = GlobalLock(memory);
-                if (destination != nullptr)
+                if (void* destination = GlobalLock(memory.get()))
                 {
                     std::memcpy(destination, text.c_str(), bytes);
-                    GlobalUnlock(memory);
-                    if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr)
+                    GlobalUnlock(memory.get());
+                    if (SetClipboardData(CF_UNICODETEXT, memory.get()) != nullptr)
                     {
-                        GlobalFree(memory);
+                        memory.release();
                     }
-                }
-                else
-                {
-                    GlobalFree(memory);
                 }
             }
         }
-        CloseClipboard();
         return true;
     }
 
@@ -713,6 +710,7 @@ namespace agshot
             static_cast<float>(box.left), static_cast<float>(box.top),
             static_cast<float>(box.right), static_cast<float>(box.bottom));
         context->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        auto popClip = wil::scope_exit([&] { context->PopAxisAlignedClip(); });
         auto layout = TextLayout(box, dpi, dwrite, format);
 
         const std::size_t first = std::min(m_anchor, m_caret);
@@ -766,7 +764,7 @@ namespace agshot
             const D2D1_POINT_2F bottom{ caretLeft, top.y + std::max(1.0f, std::round(caret.height)) };
             context->DrawLine(top, bottom, brushes.accent.get(), ScaleByDpi(1, dpi));
         }
-        context->PopAxisAlignedClip();
+        popClip.reset();
 
         if (ScrollMaximum(box, dpi, dwrite, format) > 0.0f)
         {

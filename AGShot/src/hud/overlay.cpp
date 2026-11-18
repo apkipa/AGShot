@@ -4,6 +4,7 @@
 
 #include "core/error.h"
 
+#include <wil/resource.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -45,12 +46,6 @@ namespace agshot
             return RECT{ std::min(a.x, b.x), std::min(a.y, b.y),
                          std::max(a.x, b.x), std::max(a.y, b.y) };
         }
-
-        struct FlagReset
-        {
-            bool& flag;
-            ~FlagReset() { flag = false; }
-        };
 
         LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
         {
@@ -172,6 +167,7 @@ namespace agshot
     HRESULT Overlay::RecoverDeviceResources() noexcept
     {
         m_ocrPanel.InvalidateSpinner();
+        m_renderer.DiscardIndependentResources();
         const HRESULT hr = m_device.Recover(m_width, m_height);
         if (FAILED(hr))
         {
@@ -215,7 +211,7 @@ namespace agshot
         }
 
         m_beginning = true;
-        const FlagReset resetBeginning{ m_beginning };
+        auto resetBeginning = wil::scope_exit([&] { m_beginning = false; });
         m_failed = false;
 
         m_previousForeground = GetForegroundWindow();
@@ -247,7 +243,13 @@ namespace agshot
         HRESULT backgroundHr = m_device.UpdateBackgroundBitmap(m_image);
         if (RenderDevice::IsDeviceLost(backgroundHr))
         {
-            RecoverDeviceResources();
+            const HRESULT recoverHr = RecoverDeviceResources();
+            if (FAILED(recoverHr))
+            {
+                GiveUpRendering(recoverHr, L"Overlay::RecoverDeviceResources");
+                Cancel();
+                return;
+            }
             backgroundHr = S_OK;
         }
         AGSHOT_CHECK_HR(backgroundHr);
@@ -1158,6 +1160,7 @@ namespace agshot
         {
             return hr;
         }
+        auto abortFrame = wil::scope_exit([&] { m_device.AbortFrameDraw(); });
 
         ID2D1DeviceContext* context = m_device.d2dContext();
         if (m_device.hasBackground())
@@ -1209,6 +1212,7 @@ namespace agshot
         }
         m_stats.Draw(m_device, m_width);
 
+        abortFrame.release();
         const HRESULT endHr = m_device.EndFrameDraw();
         if (collectStats && SUCCEEDED(endHr))
         {

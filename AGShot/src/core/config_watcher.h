@@ -1,5 +1,6 @@
 #pragma once
 
+#include <wil/resource.h>
 #include <windows.h>
 
 #include <filesystem>
@@ -40,11 +41,11 @@ namespace agshot
         ConfigWatcher(const ConfigWatcher&) = delete;
         ConfigWatcher& operator=(const ConfigWatcher&) = delete;
 
-        // Returns false when the directory cannot be watched, leaving the last
-        // Win32 error set for the caller to report, exactly like StartTrayIcon.
-        // A configuration that cannot be watched is an inconvenience, not a
-        // reason to fail to start.
-        bool Start(const std::filesystem::path& path, WatchCallback on_change);
+        // Returns a failed HRESULT when the directory cannot be watched,
+        // leaving the caller to report it, like StartTrayIcon. A configuration
+        // that cannot be watched is an inconvenience, not a reason to fail to
+        // start.
+        HRESULT Start(const std::filesystem::path& path, WatchCallback on_change);
 
         // Idempotent. Signals the thread and waits for it, so no callback can
         // run once this returns.
@@ -57,10 +58,10 @@ namespace agshot
         // captureless lambda would not on a 32-bit build.
         static DWORD WINAPI ThreadMain(LPVOID parameter);
 
-        HANDLE m_thread{};
-        HANDLE m_stopEvent{};
-        HANDLE m_ioEvent{};
-        HANDLE m_directory{};
+        wil::unique_handle m_thread;
+        wil::unique_handle m_stopEvent;
+        wil::unique_handle m_ioEvent;
+        wil::unique_hfile m_directory;
         std::wstring m_fileName;
         WatchCallback m_callback;
     };

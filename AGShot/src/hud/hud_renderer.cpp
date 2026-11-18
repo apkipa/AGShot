@@ -5,6 +5,8 @@
 #include "core/error.h"
 #include "hud/ocr_text_panel.h"
 
+#include <wil/resource.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -37,24 +39,18 @@ namespace agshot
 
         winrt::com_ptr<IStream> CreateUtf8MemoryStream(std::string_view text)
         {
-            const HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, text.size());
+            wil::unique_hglobal memory{ GlobalAlloc(GMEM_MOVEABLE, text.size()) };
             AGSHOT_CHECK_WIN32(memory != nullptr);
-            void* locked = GlobalLock(memory);
-            if (locked == nullptr)
             {
-                GlobalFree(memory);
-                AGSHOT_CHECK_WIN32(false);
+                void* locked = GlobalLock(memory.get());
+                AGSHOT_CHECK_WIN32(locked != nullptr);
+                std::memcpy(locked, text.data(), text.size());
+                GlobalUnlock(memory.get());
             }
-            std::memcpy(locked, text.data(), text.size());
-            GlobalUnlock(memory);
 
             winrt::com_ptr<IStream> stream;
-            const HRESULT hr = CreateStreamOnHGlobal(memory, TRUE, stream.put());
-            if (FAILED(hr))
-            {
-                GlobalFree(memory);
-                AGSHOT_CHECK_HR(hr);
-            }
+            AGSHOT_CHECK_HR(CreateStreamOnHGlobal(memory.get(), TRUE, stream.put()));
+            memory.release();
             return stream;
         }
 
@@ -491,17 +487,6 @@ namespace agshot
         ID2D1DeviceContext* context = device.d2dContext();
         const HudBrushes& brushes = device.brushes();
 
-        struct LayerPop
-        {
-            ID2D1DeviceContext* ctx{};
-            ~LayerPop()
-            {
-                if (ctx != nullptr)
-                {
-                    ctx->PopLayer();
-                }
-            }
-        } layerPop;
         if (translucent)
         {
             const float layerExtent = measured(8.0f);
@@ -512,8 +497,14 @@ namespace agshot
                 layerBounds, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                 D2D1::IdentityMatrix(), 0.55f);
             context->PushLayer(layer, device.magnifierLayer());
-            layerPop.ctx = context;
         }
+        auto popLayer = wil::scope_exit([&]
+        {
+            if (translucent)
+            {
+                context->PopLayer();
+            }
+        });
 
         for (int spread = 6; spread >= 1; --spread)
         {

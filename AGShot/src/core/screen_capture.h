@@ -1,5 +1,6 @@
 #pragma once
 
+#include <wil/resource.h>
 #include <windows.h>
 
 #include <cstddef>
@@ -62,7 +63,7 @@ namespace agshot
         int m_height{};
         // The DIB section holds the picture; m_bits points into it and is valid
         // for exactly as long as m_bitmap is. BGRA, top-down.
-        HBITMAP m_bitmap{};
+        wil::unique_hbitmap m_bitmap;
         BYTE* m_bits{};
     };
 }

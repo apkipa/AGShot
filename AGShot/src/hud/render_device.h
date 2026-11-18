@@ -37,6 +37,7 @@ namespace agshot
 
         HRESULT BeginFrameDraw(UINT width, UINT height);
         HRESULT EndFrameDraw();
+        void AbortFrameDraw() noexcept;
 
         bool IsVideoMemoryTight() const noexcept;
         void TrimSurface() noexcept;
@@ -73,6 +74,7 @@ namespace agshot
         void CreateDeviceIndependentResources();
         void CreateDeviceResources();
         void CreateTextFormats();
+        void CloseFrameDraw(HRESULT& outDrawHr, HRESULT& outSurfaceHr) noexcept;
         void StartVramWatch() noexcept;
         void StopVramWatch() noexcept;
 

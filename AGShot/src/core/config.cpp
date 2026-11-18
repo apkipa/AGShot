@@ -13,6 +13,7 @@
 #include <utility>
 
 #include <shlobj.h>
+#include <wil/resource.h>
 
 namespace agshot
 {
@@ -46,14 +47,12 @@ namespace agshot
 
         std::filesystem::path RoamingAppData()
         {
-            PWSTR raw = nullptr;
-            if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &raw)))
+            wil::unique_cotaskmem_string raw;
+            if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, raw.put())))
             {
                 return {};
             }
-            std::filesystem::path result{ raw };
-            CoTaskMemFree(raw);
-            return result;
+            return std::filesystem::path{ raw.get() };
         }
 
         // Reads a window dimension. "absent" and "present but unusable" must not

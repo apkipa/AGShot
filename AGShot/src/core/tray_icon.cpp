@@ -6,6 +6,7 @@
 #include "core/tray_icon.h"
 
 #include <shellapi.h>
+#include <wil/resource.h>
 
 // The icon belongs to a window that is never shown, not to the application's
 // main window. A popup menu only dismisses correctly when its owner is
@@ -26,26 +27,6 @@ namespace agshot
         bool g_failed{};
         UINT g_taskbarCreated{};   // registered message; zero until registered
         TrayCallbacks g_callbacks{};
-
-        // Closes the menu on every exit path; the failure branches below would
-        // otherwise leak it.
-        struct MenuHandle
-        {
-            HMENU handle{};
-
-            MenuHandle() = default;
-            explicit MenuHandle(HMENU value) : handle{ value } {}
-            ~MenuHandle()
-            {
-                if (handle != nullptr)
-                {
-                    DestroyMenu(handle);
-                }
-            }
-
-            MenuHandle(const MenuHandle&) = delete;
-            MenuHandle& operator=(const MenuHandle&) = delete;
-        };
 
         bool AddIcon() noexcept
         {
@@ -94,8 +75,8 @@ namespace agshot
         {
             try
             {
-                MenuHandle menu{ CreatePopupMenu() };
-                if (menu.handle == nullptr)
+                const wil::unique_hmenu menu{ CreatePopupMenu() };
+                if (!menu)
                 {
                     ShowWarning(
                         DescribeWin32(L"CreatePopupMenu", GetLastError(), __FILEW__, __LINE__),
@@ -103,11 +84,11 @@ namespace agshot
                     return;
                 }
 
-                AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_SETTINGS, L"Settings...") != 0);
-                AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_RELOAD, L"Reload settings") != 0);
-                AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_SEPARATOR, 0, nullptr) != 0);
-                AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_RESTART, L"Restart") != 0);
-                AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_EXIT, L"Exit") != 0);
+                AGSHOT_CHECK_WIN32(AppendMenuW(menu.get(), MF_STRING, IDM_SETTINGS, L"Settings...") != 0);
+                AGSHOT_CHECK_WIN32(AppendMenuW(menu.get(), MF_STRING, IDM_RELOAD, L"Reload settings") != 0);
+                AGSHOT_CHECK_WIN32(AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr) != 0);
+                AGSHOT_CHECK_WIN32(AppendMenuW(menu.get(), MF_STRING, IDM_RESTART, L"Restart") != 0);
+                AGSHOT_CHECK_WIN32(AppendMenuW(menu.get(), MF_STRING, IDM_EXIT, L"Exit") != 0);
 
                 // Required so the menu dismisses when the user clicks elsewhere.
                 // Harmless here: the owner window has nothing to show, so nothing
@@ -118,7 +99,7 @@ namespace agshot
                 AGSHOT_CHECK_WIN32(GetCursorPos(&cursor));
 
                 const int command = TrackPopupMenu(
-                    menu.handle,
+                    menu.get(),
                     TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
                     cursor.x,
                     cursor.y,
@@ -246,7 +227,7 @@ namespace agshot
         }
     }
 
-    bool StartTrayIcon(HINSTANCE instance, HICON icon, const TrayCallbacks& callbacks)
+    HRESULT StartTrayIcon(HINSTANCE instance, HICON icon, const TrayCallbacks& callbacks)
     {
         g_icon = icon;
         g_callbacks = callbacks;
@@ -259,7 +240,7 @@ namespace agshot
         wc.lpszClassName = kWindowClass;
         if (RegisterClassExW(&wc) == 0)
         {
-            return false;
+            return LastErrorHresult();
         }
 
         // Never shown. It exists to receive the shell's notifications and to own
@@ -269,11 +250,11 @@ namespace agshot
             nullptr, nullptr, instance, nullptr);
         if (g_window == nullptr)
         {
-            return false;
+            return LastErrorHresult();
         }
 
         g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-        return AddIcon();
+        return AddIcon() ? S_OK : LastErrorHresult();
     }
 
     void StopTrayIcon() noexcept

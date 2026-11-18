@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include <commctrl.h>
+#include <wil/resource.h>
 
 namespace agshot
 {
@@ -113,32 +114,35 @@ namespace agshot
             {
                 return false;
             }
+            auto closeClipboard = wil::scope_exit([] { CloseClipboard(); });
 
             bool ok = false;
             if (EmptyClipboard())
             {
                 const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-                if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes))
+                wil::unique_hglobal memory{ GlobalAlloc(GMEM_MOVEABLE, bytes) };
+                if (memory)
                 {
-                    if (void* target = GlobalLock(memory))
+                    if (void* target = GlobalLock(memory.get()))
                     {
                         memcpy(target, text.data(), bytes);
-                        GlobalUnlock(memory);
-                        if (SetClipboardData(CF_UNICODETEXT, memory) != nullptr)
+                        GlobalUnlock(memory.get());
+                        if (SetClipboardData(CF_UNICODETEXT, memory.get()) != nullptr)
                         {
                             ok = true;
-                            memory = nullptr;   // the clipboard owns it now
+                            memory.release(); // the clipboard owns it now
                         }
-                    }
-                    if (memory != nullptr)
-                    {
-                        GlobalFree(memory);
                     }
                 }
             }
-            CloseClipboard();
             return ok;
         }
+    }
+
+    long LastErrorHresult() noexcept
+    {
+        const DWORD error = GetLastError();
+        return error != 0 ? HRESULT_FROM_WIN32(error) : E_FAIL;
     }
 
     Error::Error(Failure failure)

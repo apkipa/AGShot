@@ -32,6 +32,10 @@ namespace agshot
         std::string m_narrow;
     };
 
+    // Captures GetLastError() as a failed HRESULT, falling back to E_FAIL if
+    // the thread error code is zero.
+    long LastErrorHresult() noexcept;
+
     // "context" is normally the stringised failing expression.
     Failure DescribeWin32(std::wstring_view context, unsigned long code,
                           const wchar_t* file, int line);

@@ -328,14 +328,29 @@ namespace agshot
         return S_OK;
     }
 
+    void RenderDevice::CloseFrameDraw(HRESULT& outDrawHr, HRESULT& outSurfaceHr) noexcept
+    {
+        outDrawHr = S_OK;
+        outSurfaceHr = S_OK;
+        if (m_d2dContext)
+        {
+            m_d2dContext->PopAxisAlignedClip();
+            m_d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
+            outDrawHr = m_d2dContext->EndDraw();
+            m_d2dContext->SetTarget(nullptr);
+        }
+        m_frameTile = nullptr;
+        if (m_surface)
+        {
+            outSurfaceHr = m_surface->EndDraw();
+        }
+    }
+
     HRESULT RenderDevice::EndFrameDraw()
     {
-        m_d2dContext->PopAxisAlignedClip();
-        m_d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
-        const HRESULT drawHr = m_d2dContext->EndDraw();
-        m_d2dContext->SetTarget(nullptr);
-        m_frameTile = nullptr;
-        const HRESULT surfaceHr = m_surface->EndDraw();
+        HRESULT drawHr = S_OK;
+        HRESULT surfaceHr = S_OK;
+        CloseFrameDraw(drawHr, surfaceHr);
         if (FAILED(drawHr))
         {
             return drawHr;
@@ -346,6 +361,17 @@ namespace agshot
         }
         m_surfaceTrimmed = false;
         return m_composition->Commit();
+    }
+
+    void RenderDevice::AbortFrameDraw() noexcept
+    {
+        HRESULT drawHr = S_OK;
+        HRESULT surfaceHr = S_OK;
+        CloseFrameDraw(drawHr, surfaceHr);
+        if (FAILED(drawHr) || FAILED(surfaceHr))
+        {
+            DiscardDeviceResources();
+        }
     }
 
     VOID CALLBACK RenderDevice::VramWaitCallback(PVOID context, BOOLEAN)

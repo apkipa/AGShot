@@ -18,10 +18,11 @@ namespace agshot
     };
 
     // Creates the hidden owner window and installs the icon. "icon" is borrowed
-    // and must outlive StopTrayIcon(). Returns false if the shell refused the
-    // icon or the window could not be created, in which case the caller decides
-    // what to say about it; StopTrayIcon() is safe to call either way.
-    bool StartTrayIcon(HINSTANCE instance, HICON icon, const TrayCallbacks& callbacks);
+    // and must outlive StopTrayIcon(). Returns S_OK on success or a failed
+    // HRESULT if the shell refused the icon or the window could not be created,
+    // in which case the caller decides what to say about it; StopTrayIcon() is
+    // safe to call either way.
+    HRESULT StartTrayIcon(HINSTANCE instance, HICON icon, const TrayCallbacks& callbacks);
 
     // Idempotent. Removes the icon and destroys the hidden window.
     void StopTrayIcon() noexcept;
