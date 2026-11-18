@@ -12,6 +12,7 @@ namespace agshot
         void (*activate)(void* context) = nullptr; // left click: surface the main window
         void (*settings)(void* context) = nullptr; // Settings chosen from the menu
         void (*reload)(void* context) = nullptr;   // Reload settings chosen from the menu
+        void (*restart)(void* context) = nullptr;  // Restart chosen from the menu
         void (*exit)(void* context) = nullptr;     // Exit chosen from the menu
         void (*fatal)(void* context) = nullptr;    // unrecoverable failure in the tray window
     };

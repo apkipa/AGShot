@@ -106,6 +106,7 @@ namespace agshot
                 AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_SETTINGS, L"Settings...") != 0);
                 AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_RELOAD, L"Reload settings") != 0);
                 AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_SEPARATOR, 0, nullptr) != 0);
+                AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_RESTART, L"Restart") != 0);
                 AGSHOT_CHECK_WIN32(AppendMenuW(menu.handle, MF_STRING, IDM_EXIT, L"Exit") != 0);
 
                 // Required so the menu dismisses when the user clicks elsewhere.
@@ -144,6 +145,13 @@ namespace agshot
                     if (g_callbacks.reload != nullptr)
                     {
                         g_callbacks.reload(g_callbacks.context);
+                    }
+                    break;
+
+                case IDM_RESTART:
+                    if (g_callbacks.restart != nullptr)
+                    {
+                        g_callbacks.restart(g_callbacks.context);
                     }
                     break;
 

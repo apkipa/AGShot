@@ -99,6 +99,7 @@ namespace
         std::wstring reportedConfigError;
         bool hotkeyRegistered{};
         bool fatal{};
+        bool* restartRequested{};
         HICON trayIcon{};
         HWND hwnd{};
         agshot::Overlay overlay;
@@ -141,6 +142,19 @@ namespace
     void ExitFromTray(void* context)
     {
         auto& app = *static_cast<AppHost*>(context);
+        if (app.hwnd != nullptr)
+        {
+            DestroyWindow(app.hwnd);
+        }
+    }
+
+    void RestartFromTray(void* context)
+    {
+        auto& app = *static_cast<AppHost*>(context);
+        if (app.restartRequested != nullptr)
+        {
+            *app.restartRequested = true;
+        }
         if (app.hwnd != nullptr)
         {
             DestroyWindow(app.hwnd);
@@ -427,9 +441,43 @@ namespace
         }
         return false;
     }
+    bool LaunchSelfRestart(DWORD& outError) noexcept
+    {
+        std::wstring path(MAX_PATH, L'\0');
+        for (;;)
+        {
+            const DWORD written = GetModuleFileNameW(
+                nullptr, path.data(), static_cast<DWORD>(path.size()));
+            if (written == 0)
+            {
+                outError = GetLastError();
+                return false;
+            }
+            if (written < path.size())
+            {
+                path.resize(written);
+                break;
+            }
+            path.resize(path.size() * 2);
+        }
+
+        std::wstring commandLine = L"\"" + path + L"\"";
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        if (!CreateProcessW(path.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
+                            0, nullptr, nullptr, &startup, &process))
+        {
+            outError = GetLastError();
+            return false;
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return true;
+    }
 }
 
-int RunApp(HINSTANCE instance, int showCommand)
+int RunApp(HINSTANCE instance, int showCommand, bool& restartRequested)
 {
     (void)showCommand;
 
@@ -445,6 +493,7 @@ int RunApp(HINSTANCE instance, int showCommand)
     // What the running application is using, so that a reload can tell a real
     // change from a rewrite of the same values.
     AppHost app;
+    app.restartRequested = &restartRequested;
     app.configPath = configPath;
     app.config = config.config;
     // The startup warning below covers this problem already, so do not repeat it
@@ -530,7 +579,7 @@ int RunApp(HINSTANCE instance, int showCommand)
     ApplyConfig(app, app.config);
 
     const agshot::TrayCallbacks trayCallbacks{
-        &app, CaptureFromTray, SettingsFromTray, ReloadFromTray, ExitFromTray, FatalFromTray };
+        &app, CaptureFromTray, SettingsFromTray, ReloadFromTray, RestartFromTray, ExitFromTray, FatalFromTray };
     if (!agshot::StartTrayIcon(instance, app.trayIcon, trayCallbacks))
     {
         // Not fatal: the hotkey still works, but say so rather than leaving the
@@ -609,18 +658,31 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
     }
 
     int result = 1;
+    bool restartRequested = false;
     // The one place that catches everything escaping startup or the message
     // loop, so no failure can leave a silently dead process behind.
     try
     {
-        result = RunApp(instance, showCommand);
+        result = RunApp(instance, showCommand, restartRequested);
     }
     catch (...)
     {
         agshot::ReportCurrentException(__FILEW__, __LINE__);
     }
 
+    // Release the single-instance mutex before spawning the replacement process
+    // so it never collides with this exiting instance.
     CloseHandle(singleInstance);
+    if (restartRequested)
+    {
+        DWORD restartError = 0;
+        if (!LaunchSelfRestart(restartError))
+        {
+            agshot::ShowWarning(
+                agshot::DescribeWin32(L"CreateProcessW(restart)", restartError, __FILEW__, __LINE__),
+                L"AGShot could not restart itself.");
+        }
+    }
     return result;
 #endif
 }
