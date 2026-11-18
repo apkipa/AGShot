@@ -154,6 +154,7 @@ namespace agshot
         m_background = nullptr;
         m_brushes.Release();
         m_magnifierLayer = nullptr;
+        m_frameTile = nullptr;
         m_surface = nullptr;
         m_surfaceTrimmed = false;
         m_visual = nullptr;
@@ -289,15 +290,14 @@ namespace agshot
         }
     }
 
-    HRESULT RenderDevice::BeginFrameDraw(
-        UINT width, UINT height,
-        winrt::com_ptr<ID2D1Bitmap1>& outTile, POINT& outOffset)
+    HRESULT RenderDevice::BeginFrameDraw(UINT width, UINT height)
     {
-        outTile = nullptr;
+        m_frameTile = nullptr;
         const RECT update{ 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
         winrt::com_ptr<IDXGISurface> updateSurface;
+        POINT offset{};
         HRESULT hr = m_surface->BeginDraw(
-            &update, __uuidof(IDXGISurface), updateSurface.put_void(), &outOffset);
+            &update, __uuidof(IDXGISurface), updateSurface.put_void(), &offset);
         if (FAILED(hr))
         {
             return hr;
@@ -311,23 +311,30 @@ namespace agshot
             96.0f);
 
         hr = m_d2dContext->CreateBitmapFromDxgiSurface(
-            updateSurface.get(), &properties, outTile.put());
+            updateSurface.get(), &properties, m_frameTile.put());
         if (FAILED(hr))
         {
             m_surface->EndDraw();
             return hr;
         }
 
-        m_d2dContext->SetTarget(outTile.get());
+        m_d2dContext->SetTarget(m_frameTile.get());
         m_d2dContext->BeginDraw();
         m_d2dContext->SetTransform(D2D1::Matrix3x2F::Translation(
-            static_cast<float>(outOffset.x), static_cast<float>(outOffset.y)));
+            static_cast<float>(offset.x), static_cast<float>(offset.y)));
+        m_d2dContext->PushAxisAlignedClip(
+            D2D1::RectF(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)),
+            D2D1_ANTIALIAS_MODE_ALIASED);
         return S_OK;
     }
 
-    HRESULT RenderDevice::EndFrameDraw(HRESULT drawHr)
+    HRESULT RenderDevice::EndFrameDraw()
     {
+        m_d2dContext->PopAxisAlignedClip();
+        m_d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
+        const HRESULT drawHr = m_d2dContext->EndDraw();
         m_d2dContext->SetTarget(nullptr);
+        m_frameTile = nullptr;
         const HRESULT surfaceHr = m_surface->EndDraw();
         if (FAILED(drawHr))
         {
@@ -442,9 +449,8 @@ namespace agshot
         return false;
     }
 
-    void RenderDevice::TrimGpuCaches() noexcept
+    void RenderDevice::TrimSurface() noexcept
     {
-        m_background = nullptr;
         if (!m_surfaceTrimmed && m_surface && m_composition)
         {
             if (SUCCEEDED(m_surface->Trim(nullptr, 0)))
@@ -453,6 +459,12 @@ namespace agshot
             }
             m_surfaceTrimmed = true;
         }
+    }
+
+    void RenderDevice::TrimGpuCaches() noexcept
+    {
+        m_background = nullptr;
+        TrimSurface();
         if (auto dxgiDevice3 = m_dxgiDevice.try_as<IDXGIDevice3>())
         {
             dxgiDevice3->Trim();

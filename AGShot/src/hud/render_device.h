@@ -35,12 +35,11 @@ namespace agshot
         void DiscardDeviceResources() noexcept;
         HRESULT UpdateBackgroundBitmap(const ScreenImage& image);
 
-        HRESULT BeginFrameDraw(UINT width, UINT height,
-                               winrt::com_ptr<ID2D1Bitmap1>& outTile,
-                               POINT& outOffset);
-        HRESULT EndFrameDraw(HRESULT drawHr);
+        HRESULT BeginFrameDraw(UINT width, UINT height);
+        HRESULT EndFrameDraw();
 
         bool IsVideoMemoryTight() const noexcept;
+        void TrimSurface() noexcept;
         void TrimGpuCaches() noexcept;
 
         static bool IsDeviceLost(HRESULT hr) noexcept;
@@ -103,6 +102,7 @@ namespace agshot
         winrt::com_ptr<IDCompositionTarget> m_target;
         winrt::com_ptr<IDCompositionVisual> m_visual;
         winrt::com_ptr<IDCompositionVirtualSurface> m_surface;
+        winrt::com_ptr<ID2D1Bitmap1> m_frameTile;
         winrt::com_ptr<ID2D1Bitmap> m_background;
         HudBrushes m_brushes;
 

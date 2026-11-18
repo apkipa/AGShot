@@ -316,11 +316,14 @@ namespace agshot
         m_toolbar.hovered = ToolbarButton::None;
 
         // Always drop cross-process UIA element proxies and per-session text
-        // state, while keeping the capture bitmap, background texture, surface,
-        // and loaded NPU OCR engine warm unless memory or VRAM is tight.
+        // state, and trim the virtual surface back to uncommitted so stale
+        // pixels cannot flash on the next F1, while keeping the capture bitmap,
+        // background texture, and loaded NPU OCR engine warm unless memory or
+        // VRAM is tight.
         m_picker.Clear();
         m_ladder.clear();
         m_ocrPanel.CancelSession(m_window);
+        m_device.TrimSurface();
         ReconcileMemoryState();
 
         if (m_previousForeground != nullptr && IsWindow(m_previousForeground))
@@ -412,14 +415,10 @@ namespace agshot
     // full client area, never a sub-rectangle.
     void Overlay::RequestRender()
     {
-        if (m_window == nullptr)
+        // Never commit frames while hidden or without a captured desktop:
+        // Begin() renders synchronously once the background bitmap is ready.
+        if (m_window == nullptr || !IsWindowVisible(m_window) || !m_device.hasBackground())
         {
-            return;
-        }
-
-        if (!IsWindowVisible(m_window))
-        {
-            Render();
             return;
         }
 
@@ -1147,14 +1146,6 @@ namespace agshot
 
     HRESULT Overlay::RenderFrame()
     {
-        winrt::com_ptr<ID2D1Bitmap1> tile;
-        POINT updateOffset{};
-        HRESULT hr = m_device.BeginFrameDraw(m_width, m_height, tile, updateOffset);
-        if (FAILED(hr))
-        {
-            return hr;
-        }
-
         const bool collectStats = m_stats.enabled();
         LARGE_INTEGER renderStart{};
         if (collectStats)
@@ -1162,9 +1153,13 @@ namespace agshot
             QueryPerformanceCounter(&renderStart);
         }
 
-        ID2D1DeviceContext* context = m_device.d2dContext();
-        context->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f));
+        HRESULT hr = m_device.BeginFrameDraw(m_width, m_height);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
 
+        ID2D1DeviceContext* context = m_device.d2dContext();
         if (m_device.hasBackground())
         {
             context->DrawBitmap(
@@ -1173,6 +1168,10 @@ namespace agshot
                             static_cast<float>(m_width), static_cast<float>(m_height)),
                 1.0f,
                 D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+        }
+        else
+        {
+            context->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f));
         }
 
         const RECT activeSelection = m_smart ? m_displaySelection : m_selection;
@@ -1210,15 +1209,14 @@ namespace agshot
         }
         m_stats.Draw(m_device, m_width);
 
-        context->SetTransform(D2D1::Matrix3x2F::Identity());
-        const HRESULT drawHr = context->EndDraw();
-        if (collectStats && SUCCEEDED(drawHr))
+        const HRESULT endHr = m_device.EndFrameDraw();
+        if (collectStats && SUCCEEDED(endHr))
         {
+            // Draw() must run before EndDraw()/Commit(), so record the full
+            // frame draw-and-commit duration here for display on the next frame.
             m_stats.RecordFrameDuration(renderStart.QuadPart);
         }
-
-        tile = nullptr;
-        return m_device.EndFrameDraw(drawHr);
+        return endHr;
     }
 
 #ifdef AGSHOT_TOOLBAR_PROOF
@@ -1324,13 +1322,8 @@ namespace agshot
             return 0;
 
         case WM_PAINT:
-        {
-            PAINTSTRUCT ps{};
-            BeginPaint(hwnd, &ps);
-            EndPaint(hwnd, &ps);
-            RequestRender();
+            ValidateRect(hwnd, nullptr);
             return 0;
-        }
 
         case WM_ERASEBKGND:
             return 1;
