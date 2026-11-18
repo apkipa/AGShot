@@ -2,8 +2,6 @@
 
 #include "core/hotkey.h"
 
-#include <cstddef>
-
 namespace agshot
 {
     namespace

@@ -5,14 +5,6 @@
 #include "core/error.h"
 #include "hud/ocr_text_panel.h"
 
-#include <wil/resource.h>
-
-#include <algorithm>
-#include <cstdio>
-#include <cstring>
-#include <cwchar>
-#include <string_view>
-
 namespace agshot
 {
     namespace

@@ -48,6 +48,7 @@ namespace agshot
                    const std::filesystem::path& cache);
         bool available() const noexcept;
         bool hasLoadedEngine() const noexcept;
+        bool hasInitializationError() const noexcept;
 
         // Copies the cropped BGRA rows out of the frozen capture and converts
         // to 24bpp BGR on the worker thread before calling the NPU engine.
@@ -109,6 +110,7 @@ namespace agshot
         bool m_initializationAttempted{};
         std::wstring m_initializationError;
         std::atomic<bool> m_hasLoadedEngine{};
+        std::atomic<bool> m_hasInitError{};
 
         // Touched only by the owning thread (Start, Submit, Shutdown).
         PTP_WORK m_work{};

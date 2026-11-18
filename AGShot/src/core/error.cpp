@@ -3,12 +3,6 @@
 #include "core/error.h"
 #include "core/text.h"
 
-#include <iomanip>
-#include <sstream>
-
-#include <commctrl.h>
-#include <wil/resource.h>
-
 namespace agshot
 {
     namespace

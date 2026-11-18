@@ -3,25 +3,13 @@
 #include "core/config.h"
 #include "core/text.h"
 
+// TODO: Replace toml++ with a minimal [section] + int64/bool/string subset parser/writer to drop ~185-190 KB of Release overhead (~72 KB toml++ code/data plus ~120 KB MSVC <charconv> double Ryu tables pulled in by float formatting/parsing that AGShot never uses).
 #include <toml++/toml.hpp>
-
-#include <cstdint>
-#include <fstream>
-#include <sstream>
-#include <string_view>
-#include <system_error>
-#include <utility>
-
-#include <shlobj.h>
-#include <wil/resource.h>
 
 namespace agshot
 {
-    // Where the executable lives. Data that ships with the application goes
-    // next to it - the portable config file and the OCR model payload both work
-    // this way - so the search is always relative to the binary and never to the
-    // build layout or to whatever directory the process was started from.
-    std::filesystem::path ExecutableDirectory()
+    // Full path to the running executable, preserving GetLastError() on failure.
+    std::filesystem::path ExecutableFilePath()
     {
         std::wstring buffer(MAX_PATH, L'\0');
         for (;;)
@@ -30,81 +18,165 @@ namespace agshot
                 nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
             if (written == 0)
             {
+                const DWORD error = GetLastError();
+                buffer = {};
+                SetLastError(error);
                 return {};
             }
             if (written < buffer.size())
             {
                 buffer.resize(written);
-                break;
+                return std::filesystem::path{ std::move(buffer) };
             }
             buffer.resize(buffer.size() * 2);   // truncated: try again bigger
         }
-        return std::filesystem::path{ buffer }.parent_path();
+    }
+
+    // Where the executable lives. Data that ships with the application goes
+    // next to it - the portable config file and the OCR model payload both work
+    // this way - so the search is always relative to the binary and never to the
+    // build layout or to whatever directory the process was started from.
+    std::filesystem::path ExecutableDirectory()
+    {
+        return ExecutableFilePath().parent_path();
     }
 
     namespace
     {
-
-        std::filesystem::path RoamingAppData()
+        std::filesystem::path KnownFolderPath(REFKNOWNFOLDERID folderId)
         {
             wil::unique_cotaskmem_string raw;
-            if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, raw.put())))
+            if (FAILED(SHGetKnownFolderPath(folderId, 0, nullptr, raw.put())))
             {
                 return {};
             }
             return std::filesystem::path{ raw.get() };
         }
 
-        // Reads a window dimension. "absent" and "present but unusable" must not
-        // be conflated: value_or() reports both as the fallback, which would make
-        // a corrupted setting look exactly like a deliberate one.
-        bool ReadWindowSize(const toml::table& window, std::string_view key,
-                            int& target, std::wstring& error)
+        bool IsPortableForDir(const std::filesystem::path& exeDir)
         {
-            const auto* node = window.get(key);
-            if (node == nullptr)
+            if (exeDir.empty())
             {
-                return true;    // absent: the default stands
-            }
-
-            const auto value = node->value_exact<int64_t>();
-            if (!value)
-            {
-                error = L"window." + FromUtf8(key) + L" must be an integer";
                 return false;
             }
-            if (*value < kMinWindowSize || *value > kMaxWindowSize)
-            {
-                error = L"window." + FromUtf8(key) + L" must be between "
-                    + std::to_wstring(kMinWindowSize) + L" and "
-                    + std::to_wstring(kMaxWindowSize);
-                return false;
-            }
-
-            target = static_cast<int>(*value);
-            return true;
+            std::error_code ec;
+            return (std::filesystem::exists(exeDir / L"AGShot.portable", ec) && !ec)
+                || (std::filesystem::is_regular_file(exeDir / L"config.toml", ec) && !ec);
         }
+
+        enum class ReadFileStatus
+        {
+            Ok,
+            TooLarge,
+            OpenFailed,
+        };
+
+        ReadFileStatus ReadFileWithLimit(const std::filesystem::path& path,
+                                         std::uintmax_t maxBytes,
+                                         std::string& out)
+        {
+            std::error_code ec;
+            if (const auto size = std::filesystem::file_size(path, ec); !ec && size > maxBytes)
+            {
+                return ReadFileStatus::TooLarge;
+            }
+
+            std::ifstream file{ path, std::ios::binary };
+            if (!file)
+            {
+                return ReadFileStatus::OpenFailed;
+            }
+            std::ostringstream buffer;
+            buffer << file.rdbuf();
+            out = buffer.str();
+            return ReadFileStatus::Ok;
+        }
+
+        void AtomicWriteFile(const std::filesystem::path& path, std::string_view text)
+        {
+            if (!path.parent_path().empty())
+            {
+                std::filesystem::create_directories(path.parent_path());
+            }
+
+            const std::filesystem::path temp{ path.wstring() + L".tmp" };
+            {
+                std::ofstream file{ temp, std::ios::binary | std::ios::trunc };
+                if (!file)
+                {
+                    throw std::system_error{ errno, std::system_category(), "cannot write " + ToUtf8(temp.wstring()) };
+                }
+                file.write(text.data(), static_cast<std::streamsize>(text.size()));
+                file.flush();
+                if (!file)
+                {
+                    throw std::system_error{ errno, std::system_category(), "cannot write " + ToUtf8(temp.wstring()) };
+                }
+            }
+
+            if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+            {
+                throw std::system_error{ static_cast<int>(GetLastError()), std::system_category(),
+                                         "cannot replace " + ToUtf8(path.wstring()) };
+            }
+        }
+    }
+
+    bool IsPortableMode()
+    {
+        return IsPortableForDir(ExecutableDirectory());
+    }
+
+    std::filesystem::path DataDirectory()
+    {
+        const auto exeDir = ExecutableDirectory();
+        if (IsPortableForDir(exeDir))
+        {
+            return exeDir;
+        }
+
+        if (const auto roaming = KnownFolderPath(FOLDERID_RoamingAppData); !roaming.empty())
+        {
+            return roaming / L"AGShot";
+        }
+
+        return exeDir;
+    }
+
+    std::filesystem::path LocalDataDirectory()
+    {
+        const auto exeDir = ExecutableDirectory();
+        if (IsPortableForDir(exeDir))
+        {
+            return exeDir;
+        }
+
+        if (const auto local = KnownFolderPath(FOLDERID_LocalAppData); !local.empty())
+        {
+            return local / L"AGShot";
+        }
+
+        return DataDirectory();
+    }
+
+    std::filesystem::path WebView2UserDataDirectory()
+    {
+        return LocalDataDirectory() / L"WebView2";
+    }
+
+    std::filesystem::path OcrCacheDirectory()
+    {
+        return DataDirectory() / L"cache";
     }
 
     std::filesystem::path ConfigPath()
     {
-        const auto exeDir = ExecutableDirectory();
-        if (!exeDir.empty())
-        {
-            std::error_code ec;
-            if ((std::filesystem::exists(exeDir / L"AGShot.portable", ec) && !ec)
-                || (std::filesystem::is_regular_file(exeDir / L"config.toml", ec) && !ec))
-            {
-                return exeDir / L"config.toml";
-            }
-        }
+        return DataDirectory() / L"config.toml";
+    }
 
-        if (const auto roaming = RoamingAppData(); !roaming.empty())
-        {
-            return roaming / L"AGShot" / L"config.toml";
-        }
-
-        return exeDir / L"config.toml";   // last resort: keep it beside the exe
+    std::filesystem::path StatePath()
+    {
+        return LocalDataDirectory() / L"state.toml";
     }
 
     ConfigLoad LoadConfig(const std::filesystem::path& path)
@@ -121,22 +193,20 @@ namespace agshot
         // A configuration file is a few hundred bytes. Anything much larger is
         // not our file, and slurping it into memory would be the bug.
         constexpr std::uintmax_t kMaxConfigBytes = 1024 * 1024;
-        if (const auto size = std::filesystem::file_size(path, ec); !ec && size > kMaxConfigBytes)
+        std::string content;
+        switch (ReadFileWithLimit(path, kMaxConfigBytes, content))
         {
+        case ReadFileStatus::TooLarge:
             result.ok = false;
             result.error = L"the file is larger than 1 MB, so it is not an AGShot configuration";
             return result;
-        }
-
-        std::ifstream file{ path, std::ios::binary };
-        if (!file)
-        {
+        case ReadFileStatus::OpenFailed:
             result.ok = false;
             result.error = L"could not open " + path.wstring();
             return result;
+        case ReadFileStatus::Ok:
+            break;
         }
-        std::ostringstream buffer;
-        buffer << file.rdbuf();
 
         // Parsed into a local so that a file rejected half way through cannot
         // leave some of its values behind: ok == false has to mean the defaults
@@ -145,7 +215,7 @@ namespace agshot
 
         try
         {
-            const auto table = toml::parse(buffer.str(), ToUtf8(path.wstring()));
+            const auto table = toml::parse(content, ToUtf8(path.wstring()));
 
             // "absent" and "present but not an integer" must not be conflated:
             // value_or() reports both as the fallback, which would make a
@@ -160,24 +230,6 @@ namespace agshot
                     return result;
                 }
                 parsed.version = static_cast<int>(*value);
-            }
-
-            if (const auto* node = table.get("window"))
-            {
-                const auto* window = node->as_table();
-                if (window == nullptr)
-                {
-                    result.ok = false;
-                    result.error = L"window must be a table";
-                    return result;
-                }
-
-                if (!ReadWindowSize(*window, "width", parsed.windowWidth, result.error)
-                    || !ReadWindowSize(*window, "height", parsed.windowHeight, result.error))
-                {
-                    result.ok = false;
-                    return result;
-                }
             }
 
             if (const auto* node = table.get("debug"))
@@ -285,15 +337,6 @@ namespace agshot
 
     void SaveConfig(const Config& config, const std::filesystem::path& path)
     {
-        if (!path.parent_path().empty())
-        {
-            std::filesystem::create_directories(path.parent_path());
-        }
-
-        toml::table window;
-        window.insert("width", config.windowWidth);
-        window.insert("height", config.windowHeight);
-
         toml::table screenshot;
         screenshot.insert("hotkey", ToUtf8(FormatHotkey(config.screenshotHotkey)));
 
@@ -302,7 +345,6 @@ namespace agshot
 
         toml::table table;
         table.insert("version", config.version);
-        table.insert("window", std::move(window));
         table.insert("screenshot", std::move(screenshot));
         table.insert("debug", std::move(debug));
 
@@ -327,25 +369,78 @@ namespace agshot
             "\n";
         text += body.str();
 
-        const std::filesystem::path temp{ path.wstring() + L".tmp" };
+        AtomicWriteFile(path, text);
+    }
+
+    SettingsWindowState LoadSettingsState(const std::filesystem::path& path)
+    {
+        SettingsWindowState state;
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec) || ec)
         {
-            std::ofstream file{ temp, std::ios::binary | std::ios::trunc };
-            if (!file)
-            {
-                throw std::system_error{ errno, std::system_category(), "cannot write " + ToUtf8(temp.wstring()) };
-            }
-            file << text;
-            file.flush();
-            if (!file)
-            {
-                throw std::system_error{ errno, std::system_category(), "cannot write " + ToUtf8(temp.wstring()) };
-            }
+            return state;
+        }
+        std::string content;
+        if (ReadFileWithLimit(path, 64 * 1024, content) != ReadFileStatus::Ok)
+        {
+            return state;
         }
 
-        if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+        try
         {
-            throw std::system_error{ static_cast<int>(GetLastError()), std::system_category(),
-                                     "cannot replace " + ToUtf8(path.wstring()) };
+            const auto table = toml::parse(content, ToUtf8(path.wstring()));
+            const auto* win = table["settings_window"].as_table();
+            if (win == nullptr)
+            {
+                return state;
+            }
+            const auto x = win->get("x") ? win->get("x")->value_exact<int64_t>() : std::nullopt;
+            const auto y = win->get("y") ? win->get("y")->value_exact<int64_t>() : std::nullopt;
+            const auto w = win->get("width") ? win->get("width")->value_exact<int64_t>() : std::nullopt;
+            const auto h = win->get("height") ? win->get("height")->value_exact<int64_t>() : std::nullopt;
+            if (x && y && w && h && *w >= 400 && *w <= 16384 && *h >= 300 && *h <= 16384)
+            {
+                state.hasPlacement = true;
+                state.x = static_cast<int>(*x);
+                state.y = static_cast<int>(*y);
+                state.width = static_cast<int>(*w);
+                state.height = static_cast<int>(*h);
+            }
+            if (const auto maximized = win->get("maximized")
+                    ? win->get("maximized")->value_exact<bool>()
+                    : std::nullopt)
+            {
+                state.maximized = *maximized;
+            }
         }
+        catch (...)
+        {
+            return SettingsWindowState{};
+        }
+        return state;
+    }
+
+    void SaveSettingsState(const SettingsWindowState& state, const std::filesystem::path& path)
+    {
+        toml::table win;
+        if (state.hasPlacement)
+        {
+            win.insert("x", state.x);
+            win.insert("y", state.y);
+            win.insert("width", state.width);
+            win.insert("height", state.height);
+        }
+        win.insert("maximized", state.maximized);
+
+        toml::table table;
+        table.insert("settings_window", std::move(win));
+
+        toml::toml_formatter formatter{ table };
+        std::ostringstream body;
+        body << formatter;
+
+        std::string text = "# AGShot local UI state.\n\n";
+        text += body.str();
+        AtomicWriteFile(path, text);
     }
 }

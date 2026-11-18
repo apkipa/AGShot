@@ -5,12 +5,6 @@
 #include "core/error.h"
 #include "hud/spinner_effect.h"
 
-#include <wil/resource.h>
-
-#include <algorithm>
-#include <cmath>
-#include <cstring>
-
 namespace agshot
 {
     namespace

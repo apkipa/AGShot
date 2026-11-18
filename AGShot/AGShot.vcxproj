@@ -13,6 +13,7 @@
     <RootNamespace>AGShot</RootNamespace>
     <WindowsTargetPlatformVersion Condition=" '$(WindowsTargetPlatformVersion)' == '' ">10.0.26100.0</WindowsTargetPlatformVersion>
     <WindowsTargetPlatformMinVersion>10.0.18362.0</WindowsTargetPlatformMinVersion>
+    <WebView2LoaderPreference>Static</WebView2LoaderPreference>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <ItemGroup Label="ProjectConfigurations">
@@ -71,7 +72,7 @@
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <PrecompiledHeaderOutputFile>$(IntDir)pch.pch</PrecompiledHeaderOutputFile>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir);$(IntDir)generated;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_CONSOLE;WIN32_LEAN_AND_MEAN;WINRT_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <AdditionalOptions>%(AdditionalOptions) /permissive- /bigobj</AdditionalOptions>
@@ -83,8 +84,11 @@
       <GenerateWindowsMetadata>false</GenerateWindowsMetadata>
       <!-- windowscodecs and psapi come from OcrEngine: it decodes images through
            WIC and reports process memory through PSAPI. -->
-      <AdditionalDependencies>d2d1.lib;d3d11.lib;dcomp.lib;dwrite.lib;dxgi.lib;shell32.lib;comctl32.lib;ole32.lib;gdi32.lib;dwmapi.lib;uiautomationcore.lib;windowscodecs.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d2d1.lib;d3d11.lib;dcomp.lib;dwrite.lib;dxgi.lib;shell32.lib;comctl32.lib;ole32.lib;gdi32.lib;dwmapi.lib;uiautomationcore.lib;windowscodecs.lib;psapi.lib;cabinet.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(IntDir)frontend;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
@@ -112,6 +116,7 @@
   <ItemGroup>
     <ClInclude Include="resource.h" />
     <ClInclude Include="src\pch.h" />
+    <ClInclude Include="src\core\app_ipc.h" />
     <ClInclude Include="src\core\config.h" />
     <ClInclude Include="src\core\config_watcher.h" />
     <ClInclude Include="src\core\memory_watch.h" />
@@ -132,6 +137,7 @@
     <ClInclude Include="src\hud\selection.h" />
     <ClInclude Include="src\hud\spinner_effect.h" />
     <ClInclude Include="src\hud\toolbar.h" />
+    <ClInclude Include="src\settings\settings_window.h" />
     <ClCompile Include="src\core\config.cpp" />
     <ClCompile Include="src\core\config_watcher.cpp" />
     <ClCompile Include="src\core\memory_watch.cpp" />
@@ -151,6 +157,7 @@
     <ClCompile Include="src\hud\selection.cpp" />
     <ClCompile Include="src\hud\spinner_effect.cpp" />
     <ClCompile Include="src\hud\toolbar.cpp" />
+    <ClCompile Include="src\settings\settings_window.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
@@ -160,6 +167,17 @@
     <Manifest Include="AGShot.exe.manifest" />
     <None Include="packages.config" />
     <None Include="PropertySheet.props" />
+    <None Include="scripts\compress_mszip.ps1" />
+    <None Include="scripts\gen_build_info.ps1" />
+    <None Include="frontend\index.html" />
+    <None Include="frontend\package.json" />
+    <None Include="frontend\pnpm-lock.yaml" />
+    <None Include="frontend\tsconfig.json" />
+    <None Include="frontend\vite.config.ts" />
+    <None Include="frontend\src\app.css" />
+    <None Include="frontend\src\main.ts" />
+    <None Include="frontend\src\ToastDeck.ts" />
+    <None Include="frontend\src\types.ts" />
     <Text Include="readme.txt">
       <DeploymentContent>false</DeploymentContent>
     </Text>
@@ -172,7 +190,25 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="..\packages\Microsoft.Windows.CppWinRT.3.0.260818.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('..\packages\Microsoft.Windows.CppWinRT.3.0.260818.1\build\native\Microsoft.Windows.CppWinRT.targets')" />
+    <Import Project="..\packages\Microsoft.Web.WebView2.1.0.4314.35\build\native\Microsoft.Web.WebView2.targets" Condition="Exists('..\packages\Microsoft.Web.WebView2.1.0.4314.35\build\native\Microsoft.Web.WebView2.targets')" />
   </ImportGroup>
+  <ItemGroup>
+    <SettingsUiInput Include="frontend\index.html;frontend\package.json;frontend\pnpm-lock.yaml;frontend\tsconfig.json;frontend\vite.config.ts;frontend\src\**\*;scripts\compress_mszip.ps1" />
+  </ItemGroup>
+  <Target Name="GenerateBuildInfo" BeforeTargets="ClCompile">
+    <MakeDir Directories="$(IntDir)generated" />
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\gen_build_info.ps1&quot; -RepoRoot &quot;$([System.IO.Path]::GetFullPath('$(SolutionDir).'))&quot; -OutputPath &quot;$([System.IO.Path]::GetFullPath('$(IntDir)generated\build_info.h'))&quot;"
+          StandardOutputImportance="low" />
+  </Target>
+  <Target Name="BuildSettingsUi"
+          BeforeTargets="ResourceCompile"
+          Inputs="@(SettingsUiInput)"
+          Outputs="$(IntDir)frontend\settings.mszip">
+    <MakeDir Directories="$(IntDir)frontend" />
+    <Exec Command="if not exist &quot;$(ProjectDir)frontend\node_modules\vite\bin\vite.js&quot; pnpm --dir &quot;$(ProjectDir)frontend&quot; install --frozen-lockfile" />
+    <Exec Command="pnpm --dir &quot;$(ProjectDir)frontend&quot; exec vite build --outDir &quot;$([System.IO.Path]::GetFullPath('$(IntDir)frontend\raw'))&quot;" />
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\compress_mszip.ps1&quot; -InputPath &quot;$([System.IO.Path]::GetFullPath('$(IntDir)frontend\raw\index.html'))&quot; -OutputPath &quot;$([System.IO.Path]::GetFullPath('$(IntDir)frontend\settings.mszip'))&quot;" />
+  </Target>
   <!-- The OCR models live in the project tree, not in the build output: bin\ is
        cleaned and rebuilt, and a payload kept there would go with it. AGShot
        looks for models\ beside the executable and one level above it, so the
@@ -193,5 +229,6 @@
     </PropertyGroup>
     <Error Condition="!Exists('..\packages\Microsoft.Windows.CppWinRT.3.0.260818.1\build\native\Microsoft.Windows.CppWinRT.props')" Text="$([System.String]::Format('$(ErrorText)', '..\packages\Microsoft.Windows.CppWinRT.3.0.260818.1\build\native\Microsoft.Windows.CppWinRT.props'))" />
     <Error Condition="!Exists('..\packages\Microsoft.Windows.CppWinRT.3.0.260818.1\build\native\Microsoft.Windows.CppWinRT.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\packages\Microsoft.Windows.CppWinRT.3.0.260818.1\build\native\Microsoft.Windows.CppWinRT.targets'))" />
+    <Error Condition="!Exists('..\packages\Microsoft.Web.WebView2.1.0.4314.35\build\native\Microsoft.Web.WebView2.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\packages\Microsoft.Web.WebView2.1.0.4314.35\build\native\Microsoft.Web.WebView2.targets'))" />
   </Target>
 </Project>

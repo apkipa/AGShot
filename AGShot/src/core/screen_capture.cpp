@@ -3,8 +3,6 @@
 #include "core/error.h"
 #include "core/screen_capture.h"
 
-#include <cstring>
-
 namespace agshot
 {
     namespace

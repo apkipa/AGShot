@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "resource.h"
+#include "core/app_ipc.h"
 #include "core/config.h"
 #include "core/ocr_manifest.h"
 #include "core/ocr_runtime.h"
@@ -7,82 +8,13 @@
 #include "core/error.h"
 #include "core/tray_icon.h"
 #include "hud/overlay.h"
-
-#include <cstdio>
-#include <filesystem>
-#include <memory>
-#include <new>
-
-#include <shellapi.h>
-#include <wil/resource.h>
+#include "settings/settings_window.h"
 
 using namespace winrt;
 
 namespace
 {
-    // The application's own window, and the only one it creates that is never
-    // seen. It exists to receive the hotkey and the watcher's notifications:
-    // both need a window to be posted to, and neither needs a screen.
-    constexpr wchar_t kMessageClass[] = L"AGShot.MessageWindow";
-
-    // Models are kept external under models/ocr/. Search the user data
-    // directory first (%APPDATA%\AGShot, or beside the exe in portable mode),
-    // then next to the executable, then the working directory. Prefer a pack
-    // whose pack_format matches this build; fall back to any present pack so
-    // an unsupported version still surfaces its exact manifest diagnostic.
-    std::filesystem::path FindLocalOcrModels(const std::filesystem::path& dataDirectory)
-    {
-        std::filesystem::path candidates[3];
-        std::size_t count = 0;
-        const auto addCandidate = [&](std::filesystem::path root) {
-            if (root.empty())
-            {
-                return;
-            }
-            root = root.lexically_normal();
-            for (std::size_t i = 0; i < count; ++i)
-            {
-                std::error_code eqEc;
-                if (candidates[i] == root || (std::filesystem::equivalent(candidates[i], root, eqEc) && !eqEc))
-                {
-                    return;
-                }
-            }
-            candidates[count++] = std::move(root);
-        };
-
-        addCandidate(dataDirectory);
-        addCandidate(agshot::ExecutableDirectory());
-        std::error_code cwdEc;
-        if (const auto cwd = std::filesystem::current_path(cwdEc); !cwdEc)
-        {
-            addCandidate(cwd);
-        }
-
-        std::filesystem::path fallback;
-        for (std::size_t i = 0; i < count; ++i)
-        {
-            const auto found = agshot::FindOcrModelDirectory(candidates[i]);
-            if (found.empty())
-            {
-                continue;
-            }
-            if (agshot::HasSupportedOcrPackFormat(found))
-            {
-                return found;
-            }
-            if (fallback.empty())
-            {
-                fallback = found;
-            }
-        }
-        return fallback;
-    }
-
-    constexpr UINT kConfigChangedMessage = WM_APP + 1;
-    constexpr UINT kConfigWatchLostMessage = WM_APP + 2;
-    constexpr UINT kWakeExistingMessage = WM_APP + 3;
-    constexpr wchar_t kSingleInstanceMutexName[] = L"Local\\AGShot.SingleInstance";
+    constexpr UINT kSettingsExitedMessage = WM_APP + 9;
 
     // Names the capture combination in WM_HOTKEY. AGShot registers exactly one,
     // so the number only has to be distinct within this window.
@@ -99,31 +31,84 @@ namespace
         std::filesystem::path configPath;
         std::wstring reportedConfigError;
         bool hotkeyRegistered{};
+        bool hotkeyPaused{};
         bool fatal{};
         bool* restartRequested{};
         wil::unique_hicon trayIcon;
         HWND hwnd{};
         agshot::Overlay overlay;
         agshot::ConfigWatcher watcher;
+        wil::unique_handle settingsJob;
+        wil::unique_handle settingsProcess;
+        DWORD settingsProcessId{};
+        HANDLE settingsWait{};
 
-        ~AppHost()
+        ~AppHost();
+    };
+
+    void ReleaseSettingsWait(AppHost& app, bool waitForCallback) noexcept
+    {
+        if (app.settingsWait != nullptr)
         {
-            watcher.Stop();
-            agshot::StopTrayIcon();
-            overlay.Destroy();
+            UnregisterWaitEx(app.settingsWait, waitForCallback ? INVALID_HANDLE_VALUE : nullptr);
+            app.settingsWait = nullptr;
+        }
+    }
 
-            if (hotkeyRegistered && hwnd != nullptr)
+    bool IsSettingsProcessRunning(const AppHost& app) noexcept
+    {
+        return app.settingsProcess
+            && WaitForSingleObject(app.settingsProcess.get(), 0) == WAIT_TIMEOUT;
+    }
+
+    void ClearSettingsProcess(AppHost& app, bool waitForCallback) noexcept
+    {
+        ReleaseSettingsWait(app, waitForCallback);
+        app.settingsProcess.reset();
+        app.settingsProcessId = 0;
+    }
+
+    void ShutdownSettingsChild(AppHost& app) noexcept
+    {
+        ReleaseSettingsWait(app, true);
+
+        if (IsSettingsProcessRunning(app))
+        {
+            if (const HWND settingsHwnd = FindWindowW(agshot::kSettingsWindowClass, nullptr);
+                settingsHwnd != nullptr)
             {
-                UnregisterHotKey(hwnd, kScreenshotHotkeyId);
-                hotkeyRegistered = false;
-            }
-            if (hwnd != nullptr && IsWindow(hwnd))
-            {
-                DestroyWindow(hwnd);
-                hwnd = nullptr;
+                DWORD pid = 0;
+                GetWindowThreadProcessId(settingsHwnd, &pid);
+                if (pid == app.settingsProcessId)
+                {
+                    PostMessageW(settingsHwnd, WM_CLOSE, 0, 0);
+                    WaitForSingleObject(app.settingsProcess.get(), 500);
+                }
             }
         }
-    };
+
+        ClearSettingsProcess(app, false);
+        app.settingsJob.reset();
+    }
+
+    AppHost::~AppHost()
+    {
+        ShutdownSettingsChild(*this);
+        watcher.Stop();
+        agshot::StopTrayIcon();
+        overlay.Destroy();
+
+        if (hotkeyRegistered && hwnd != nullptr)
+        {
+            UnregisterHotKey(hwnd, kScreenshotHotkeyId);
+            hotkeyRegistered = false;
+        }
+        if (hwnd != nullptr && IsWindow(hwnd))
+        {
+            DestroyWindow(hwnd);
+            hwnd = nullptr;
+        }
+    }
 
     void ShowSettings(AppHost& app);
     void ReloadConfig(AppHost& app, bool force);
@@ -215,55 +200,117 @@ namespace
 
     // Everything a live setting has to touch goes here, so that there is exactly
     // one place where the running application is brought in line with the file.
-    //
-    // [window] is deliberately not applied: it sized the main window, and there
-    // is no main window at the moment. The keys stay in the file so that they are
-    // still there when it comes back.
     void ApplyConfig(AppHost& app, const agshot::Config& config)
     {
-        ApplyHotkey(app, config.screenshotHotkey);
+        if (!app.hotkeyPaused)
+        {
+            ApplyHotkey(app, config.screenshotHotkey);
+        }
         app.overlay.SetDebugStats(config.debugShowStats);
     }
 
-    // Opens the settings file in whatever the user has associated with it.
-    //
-    // This stands in for the settings window, which will edit these values
-    // itself. Until then the file is the settings, so the useful thing this item
-    // can do is put the file in front of the user rather than describe it.
+    void CALLBACK OnSettingsProcessExited(PVOID context, BOOLEAN) noexcept
+    {
+        auto* hwnd = static_cast<HWND>(context);
+        if (hwnd != nullptr)
+        {
+            PostMessageW(hwnd, kSettingsExitedMessage, 0, 0);
+        }
+    }
+
+    bool FocusExistingSettingsWindow() noexcept
+    {
+        const HWND existing = FindWindowW(agshot::kSettingsWindowClass, nullptr);
+        if (existing == nullptr)
+        {
+            return false;
+        }
+        if (IsIconic(existing))
+        {
+            ShowWindow(existing, SW_RESTORE);
+        }
+        SetForegroundWindow(existing);
+        return true;
+    }
+
+    // Launches `AGShot.exe --settings` bound to a kill-on-close Job Object so
+    // WebView2 lives only while the settings window is open and cleans up if
+    // the tray host exits.
     void ShowSettings(AppHost& app)
     {
-        // The file is written at startup when it is missing, so this is only
-        // reachable if something removed it while the application was running.
-        std::error_code ec;
-        if (!std::filesystem::exists(app.configPath, ec))
+        if (FocusExistingSettingsWindow())
         {
-            try
+            return;
+        }
+
+        if (IsSettingsProcessRunning(app))
+        {
+            return; // Child process is still starting up.
+        }
+        if (app.settingsProcess)
+        {
+            ClearSettingsProcess(app, true);
+        }
+
+        if (!app.settingsJob)
+        {
+            wil::unique_handle job{ CreateJobObjectW(nullptr, nullptr) };
+            if (job)
             {
-                agshot::SaveConfig(app.config, app.configPath);
-            }
-            catch (const std::exception& error)
-            {
-                agshot::ShowWarning(
-                    agshot::DescribeException(error, __FILEW__, __LINE__),
-                    L"The settings file could not be created.");
-                return;
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if (SetInformationJobObject(
+                        job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)))
+                {
+                    app.settingsJob = std::move(job);
+                }
             }
         }
 
-        // ShellExecuteW rather than a hard-coded editor: which program opens a
-        // .toml file is the user's choice, not this application's.
-        const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
-            nullptr, L"open", app.configPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
-
-        // ShellExecuteW reports success by returning a value above 32; anything
-        // at or below that is an error code, not a handle.
-        if (result <= 32)
+        const auto exePath = agshot::ExecutableFilePath();
+        if (exePath.empty())
         {
             agshot::ShowWarning(
-                agshot::DescribeWin32(L"ShellExecuteW(open config)", static_cast<unsigned long>(result),
-                                      __FILEW__, __LINE__),
-                L"The settings file could not be opened.");
+                agshot::DescribeHresult(L"GetModuleFileNameW(settings)", agshot::LastErrorHresult(), __FILEW__, __LINE__),
+                L"The settings window could not be launched.");
+            return;
         }
+
+        std::wstring commandLine = L"\"" + exePath.wstring() + L"\" ";
+        commandLine += agshot::kSettingsArg;
+
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        if (!CreateProcessW(
+                exePath.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
+                CREATE_SUSPENDED, nullptr, nullptr, &startup, &process))
+        {
+            agshot::ShowWarning(
+                agshot::DescribeWin32(L"CreateProcessW(settings)", GetLastError(), __FILEW__, __LINE__),
+                L"The settings window could not be launched.");
+            return;
+        }
+
+        wil::unique_handle childThread{ process.hThread };
+        wil::unique_handle childProcess{ process.hProcess };
+
+        if (app.settingsJob)
+        {
+            AssignProcessToJobObject(app.settingsJob.get(), childProcess.get());
+        }
+
+        ResumeThread(childThread.get());
+
+        app.settingsProcess = std::move(childProcess);
+        app.settingsProcessId = process.dwProcessId;
+        RegisterWaitForSingleObject(
+            &app.settingsWait,
+            app.settingsProcess.get(),
+            OnSettingsProcessExited,
+            app.hwnd,
+            INFINITE,
+            WT_EXECUTEONLYONCE);
     }
 
     // Reads the settings file again and applies whatever changed. Runs on the UI
@@ -314,7 +361,7 @@ namespace
 
         if (event == agshot::WatchEvent::Changed)
         {
-            PostMessageW(hwnd, kConfigChangedMessage, 0, 0);
+            PostMessageW(hwnd, agshot::kConfigChangedMessage, 0, 0);
             return;
         }
 
@@ -323,7 +370,7 @@ namespace
         // user editing a file that nothing is listening to.
         auto* text = new (std::nothrow) std::wstring{ detail };
         if (text != nullptr
-            && !PostMessageW(hwnd, kConfigWatchLostMessage, 0, reinterpret_cast<LPARAM>(text)))
+            && !PostMessageW(hwnd, agshot::kConfigWatchLostMessage, 0, reinterpret_cast<LPARAM>(text)))
         {
             delete text;
         }
@@ -333,15 +380,63 @@ namespace
     {
         switch (message)
         {
-        case kWakeExistingMessage:
+        case agshot::kWakeExistingMessage:
             app.overlay.Begin();
             return 0;
 
-        case kConfigChangedMessage:
+        case agshot::kConfigChangedMessage:
             ReloadConfig(app, false);
             return 0;
 
-        case kConfigWatchLostMessage:
+        case agshot::kReloadConfigMessage:
+            ReloadConfig(app, true);
+            return 1;
+
+        case agshot::kPauseHotkeyMessage:
+            app.hotkeyPaused = true;
+            if (app.hotkeyRegistered)
+            {
+                UnregisterHotKey(hwnd, kScreenshotHotkeyId);
+                app.hotkeyRegistered = false;
+            }
+            return 1;
+
+        case agshot::kResumeHotkeyMessage:
+            app.hotkeyPaused = false;
+            ReloadConfig(app, true);
+            return app.hotkeyRegistered ? 1 : 0;
+
+        case agshot::kQueryStatusMessage:
+        {
+            LRESULT bits = 0;
+            if (app.ocrRuntime.available()) bits |= agshot::kStatusOcrAvailable;
+            if (app.ocrRuntime.hasLoadedEngine()) bits |= agshot::kStatusOcrLoaded;
+            if (app.ocrRuntime.hasInitializationError()) bits |= agshot::kStatusOcrError;
+            if (app.hotkeyRegistered) bits |= agshot::kStatusHotkeyRegistered;
+            if (app.hotkeyPaused) bits |= agshot::kStatusHotkeyPaused;
+            return bits;
+        }
+
+        case agshot::kTrimOcrMemoryMessage:
+            app.ocrRuntime.Trim();
+            return 1;
+
+        case kSettingsExitedMessage:
+            // If ShowSettings already replaced a just-exited child before this
+            // queued notification was pumped, the current handle is still alive.
+            if (IsSettingsProcessRunning(app))
+            {
+                return 0;
+            }
+            ClearSettingsProcess(app, false);
+            if (app.hotkeyPaused)
+            {
+                app.hotkeyPaused = false;
+                ApplyHotkey(app, app.config.screenshotHotkey);
+            }
+            return 0;
+
+        case agshot::kConfigWatchLostMessage:
         {
             // The watcher handed the reason over as a heap string; take it back.
             const std::unique_ptr<std::wstring> detail{ reinterpret_cast<std::wstring*>(lparam) };
@@ -419,7 +514,7 @@ namespace
     {
         for (int attempt = 0; attempt < 150; ++attempt)
         {
-            const HWND hwnd = FindWindowExW(HWND_MESSAGE, nullptr, kMessageClass, nullptr);
+            const HWND hwnd = FindWindowExW(HWND_MESSAGE, nullptr, agshot::kMessageClass, nullptr);
             if (hwnd != nullptr)
             {
                 DWORD processId{};
@@ -428,7 +523,7 @@ namespace
                 {
                     AllowSetForegroundWindow(processId);
                 }
-                if (PostMessageW(hwnd, kWakeExistingMessage, 0, 0))
+                if (PostMessageW(hwnd, agshot::kWakeExistingMessage, 0, 0))
                 {
                     return true;
                 }
@@ -440,24 +535,13 @@ namespace
 
     HRESULT LaunchSelfRestart() noexcept
     {
-        std::wstring path(MAX_PATH, L'\0');
-        for (;;)
+        const auto path = agshot::ExecutableFilePath();
+        if (path.empty())
         {
-            const DWORD written = GetModuleFileNameW(
-                nullptr, path.data(), static_cast<DWORD>(path.size()));
-            if (written == 0)
-            {
-                return agshot::LastErrorHresult();
-            }
-            if (written < path.size())
-            {
-                path.resize(written);
-                break;
-            }
-            path.resize(path.size() * 2);
+            return agshot::LastErrorHresult();
         }
 
-        std::wstring commandLine = L"\"" + path + L"\"";
+        std::wstring commandLine = L"\"" + path.wstring() + L"\"";
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         PROCESS_INFORMATION process{};
@@ -501,7 +585,8 @@ int RunApp(HINSTANCE instance, int showCommand, bool& restartRequested)
     // Model distribution is intentionally external. Detect the local payload at
     // startup, but never attempt a model load on the UI thread.
     const auto dataDirectory = configPath.parent_path();
-    const auto ocrModels = FindLocalOcrModels(dataDirectory);
+    const auto ocrModels = agshot::FindLocalOcrModelDirectory(
+        dataDirectory, agshot::ExecutableDirectory());
     if (ocrModels.empty()) {
         const auto appDataHint = dataDirectory / L"models" / L"ocr";
         const std::wstring detail = (dataDirectory == agshot::ExecutableDirectory())
@@ -511,7 +596,7 @@ int RunApp(HINSTANCE instance, int showCommand, bool& restartRequested)
             agshot::Failure{ {}, detail },
             L"AGShot OCR models are unavailable.");
     }
-    const auto ocrCache = dataDirectory / L"cache";
+    const auto ocrCache = agshot::OcrCacheDirectory();
     std::error_code ocrCacheError;
     std::filesystem::create_directories(ocrCache, ocrCacheError);
     // Start() refuses an empty models path, so a missing payload leaves the
@@ -545,14 +630,14 @@ int RunApp(HINSTANCE instance, int showCommand, bool& restartRequested)
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = instance;
-    wc.lpszClassName = kMessageClass;
+    wc.lpszClassName = agshot::kMessageClass;
     AGSHOT_CHECK_WIN32(RegisterClassExW(&wc) != 0);
 
     // HWND_MESSAGE makes it a message-only window: no screen, no taskbar, no
     // Alt+Tab, and no pixels to keep in sync. It is here for the hotkey and the
     // watcher, nothing else.
     app.hwnd = CreateWindowExW(
-        0, kMessageClass, L"AGShot", 0, 0, 0, 0, 0,
+        0, agshot::kMessageClass, L"AGShot", 0, 0, 0, 0, 0,
         HWND_MESSAGE, nullptr, instance, &app);
     AGSHOT_CHECK_WIN32(app.hwnd != nullptr);
 
@@ -638,7 +723,54 @@ int __stdcall wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand)
     }
 #else
     SetLastError(ERROR_SUCCESS);
-    wil::unique_handle singleInstance{ CreateMutexW(nullptr, FALSE, kSingleInstanceMutexName) };
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    bool isSettingsMode = false;
+    if (argv != nullptr)
+    {
+        for (int i = 1; i < argc; ++i)
+        {
+            if (_wcsicmp(argv[i], agshot::kSettingsArg) == 0)
+            {
+                isSettingsMode = true;
+                break;
+            }
+        }
+        LocalFree(argv);
+    }
+
+    if (isSettingsMode)
+    {
+        wil::unique_handle settingsMutex{
+            CreateMutexW(nullptr, FALSE, agshot::kSettingsInstanceMutexName)
+        };
+        if (!settingsMutex)
+        {
+            MessageBoxW(nullptr, L"AGShot could not open the settings instance lock.",
+                        L"AGShot Settings", MB_OK | MB_ICONERROR);
+            return 1;
+        }
+        if (GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            FocusExistingSettingsWindow();
+            return 0;
+        }
+
+        EnableMouseInPointer(true);
+        init_apartment(apartment_type::single_threaded);
+
+        try
+        {
+            return agshot::RunSettingsProcess(instance, showCommand);
+        }
+        catch (...)
+        {
+            agshot::ReportCurrentException(__FILEW__, __LINE__);
+            return 1;
+        }
+    }
+
+    wil::unique_handle singleInstance{ CreateMutexW(nullptr, FALSE, agshot::kSingleInstanceMutexName) };
     if (!singleInstance)
     {
         MessageBoxW(nullptr, L"AGShot could not check whether another instance is running.",

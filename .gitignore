@@ -27,6 +27,10 @@ Generated Files/
 # ---- NuGet ----
 /packages/
 
+# ---- Frontend toolchain ----
+node_modules/
+AGShot/frontend/dist/
+
 # ---- Certificates ----
 *_TemporaryKey.pfx
 

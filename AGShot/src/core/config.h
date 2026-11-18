@@ -17,17 +17,9 @@ namespace agshot
     // that changes an existing key's meaning.
     inline constexpr int kConfigVersion = 1;
 
-    // A window size is a client area in DIPs at 96 DPI, so the same file gives
-    // the same apparent size on any monitor. The upper bound is the largest
-    // dimension Win32 accepts for a window.
-    inline constexpr int kMinWindowSize = 1;
-    inline constexpr int kMaxWindowSize = 32767;
-
     struct Config
     {
         int version = kConfigVersion;
-        int windowWidth = 800;
-        int windowHeight = 450;
 
         // The key that starts a capture. The file stores it as text - "F1",
         // "Ctrl+Shift+A" - and it is kept here already parsed, because that is
@@ -45,8 +37,6 @@ namespace agshot
     inline bool operator==(const Config& left, const Config& right) noexcept
     {
         return left.version == right.version
-            && left.windowWidth == right.windowWidth
-            && left.windowHeight == right.windowHeight
             && left.screenshotHotkey == right.screenshotHotkey
             && left.debugShowStats == right.debugShowStats;
     }
@@ -56,15 +46,68 @@ namespace agshot
         return !(left == right);
     }
 
+    struct SettingsWindowState
+    {
+        bool hasPlacement = false;
+        int x = 0;
+        int y = 0;
+        int width = 820;
+        int height = 620;
+        bool maximized = false;
+    };
+
+    inline bool operator==(const SettingsWindowState& left, const SettingsWindowState& right) noexcept
+    {
+        return left.hasPlacement == right.hasPlacement
+            && left.x == right.x
+            && left.y == right.y
+            && left.width == right.width
+            && left.height == right.height
+            && left.maximized == right.maximized;
+    }
+
+    inline bool operator!=(const SettingsWindowState& left, const SettingsWindowState& right) noexcept
+    {
+        return !(left == right);
+    }
+
+    // Full path to the running executable, or empty if it cannot be determined.
+    std::filesystem::path ExecutableFilePath();
+
     // The directory holding the running executable, or empty if it cannot be
     // determined. Anything that ships beside the binary is found through this.
     std::filesystem::path ExecutableDirectory();
 
-    // %APPDATA%\AGShot\config.toml normally. If AGShot.portable or an existing
-    // config.toml sits next to the executable, <exe dir>\config.toml is used
-    // instead, which is what you want when running from a USB stick, portable
-    // zip, or build output folder.
+    // True when AGShot.portable or an existing config.toml sits next to the
+    // executable so settings and state stay beside the binary.
+    bool IsPortableMode();
+
+    // Roaming app data directory (%APPDATA%\AGShot normally, or ExecutableDirectory()
+    // in portable mode). Holds user-visible configuration.
+    std::filesystem::path DataDirectory();
+
+    // Machine-local app data directory (%LOCALAPPDATA%\AGShot normally, or
+    // ExecutableDirectory() in portable mode). Holds UI state and caches.
+    std::filesystem::path LocalDataDirectory();
+
+    // WebView2 UserDataFolder (%LOCALAPPDATA%\AGShot\WebView2 normally, or
+    // <exe dir>\WebView2 in portable mode).
+    std::filesystem::path WebView2UserDataDirectory();
+
+    // OCR compiled NPU blob cache directory (%APPDATA%\AGShot\cache normally,
+    // or <exe dir>\cache in portable mode).
+    std::filesystem::path OcrCacheDirectory();
+
+    // %APPDATA%\AGShot\config.toml normally, or <exe dir>\config.toml in
+    // portable mode.
     std::filesystem::path ConfigPath();
+
+    // Local UI state file (window placement, etc.), kept separate from config.toml
+    // so dragging windows never triggers live config reloads.
+    std::filesystem::path StatePath();
+
+    SettingsWindowState LoadSettingsState(const std::filesystem::path& path);
+    void SaveSettingsState(const SettingsWindowState& state, const std::filesystem::path& path);
 
     struct ConfigLoad
     {

@@ -4,13 +4,6 @@
 #include "core/ocr_manifest.h"
 #include "../../../OcrEngine/src/ocr_engine.hpp"
 
-#include <algorithm>
-#include <cstring>
-#include <exception>
-#include <new>
-#include <string>
-#include <utility>
-
 namespace agshot
 {
     namespace
@@ -84,6 +77,7 @@ namespace agshot
         // zeMemFree after that engine's own teardown.
         m_engine.reset();
         m_hasLoadedEngine.store(false, std::memory_order_release);
+        m_hasInitError.store(false, std::memory_order_release);
     }
 
     void OcrRuntime::Start(const std::filesystem::path& models,
@@ -106,6 +100,11 @@ namespace agshot
     bool OcrRuntime::hasLoadedEngine() const noexcept
     {
         return m_hasLoadedEngine.load(std::memory_order_acquire);
+    }
+
+    bool OcrRuntime::hasInitializationError() const noexcept
+    {
+        return m_hasInitError.load(std::memory_order_acquire);
     }
 
     void OcrRuntime::Trim() noexcept
@@ -207,15 +206,18 @@ namespace agshot
             auto engine = std::make_unique<ppocr::OcrEngine>();
             engine->initialize(options);
             m_engine = std::move(engine);
+            m_hasInitError.store(false, std::memory_order_release);
             m_hasLoadedEngine.store(true, std::memory_order_release);
         }
         catch (const std::exception& error)
         {
             m_initializationError = ErrorText(error);
+            m_hasInitError.store(true, std::memory_order_release);
         }
         catch (...)
         {
             m_initializationError = L"Unknown OCR initialization failure.";
+            m_hasInitError.store(true, std::memory_order_release);
         }
         return m_initializationError;
     }
@@ -227,6 +229,7 @@ namespace agshot
         if (!m_engine) return;
         m_engine.reset();
         m_hasLoadedEngine.store(false, std::memory_order_release);
+        m_hasInitError.store(false, std::memory_order_release);
         m_initializationAttempted = false;
         m_initializationError.clear();
     }

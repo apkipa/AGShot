@@ -4,12 +4,6 @@
 
 #include "core/error.h"
 
-#include <wil/resource.h>
-#include <windowsx.h>
-
-#include <algorithm>
-#include <memory>
-
 namespace agshot
 {
     namespace

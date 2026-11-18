@@ -2,13 +2,6 @@
 
 #include "core/ui_element.h"
 
-#include <dwmapi.h>
-#include <uiautomation.h>
-#include <wil/resource.h>
-
-#include <algorithm>
-#include <limits>
-
 namespace agshot
 {
     namespace

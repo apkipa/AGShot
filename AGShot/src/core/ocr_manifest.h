@@ -36,6 +36,11 @@ namespace agshot
     // external folder swap left it behind) when a manifest is present.
     std::filesystem::path FindOcrModelDirectory(const std::filesystem::path& rootDirectory) noexcept;
 
+    // Searches dataDirectory, executableDirectory, and current working directory
+    // in order, preferring a pack whose pack_format matches kSupportedOcrPackFormat.
+    std::filesystem::path FindLocalOcrModelDirectory(const std::filesystem::path& dataDirectory,
+                                                     const std::filesystem::path& executableDirectory) noexcept;
+
     // Reads and validates `<ocrDirectory>/manifest.toml` (pack_format, asset
     // filenames, and SHA-256 format). Throws std::runtime_error with a clear
     // diagnostic message on mismatch.

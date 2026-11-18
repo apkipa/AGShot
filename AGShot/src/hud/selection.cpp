@@ -2,8 +2,6 @@
 
 #include "hud/selection.h"
 
-#include <algorithm>
-
 namespace agshot
 {
     namespace

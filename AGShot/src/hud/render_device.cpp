@@ -4,8 +4,6 @@
 
 #include "core/error.h"
 
-#include <d3d11.h>
-
 namespace agshot
 {
     namespace

@@ -2,11 +2,6 @@
 
 #include "hud/spinner_effect.h"
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <vector>
-
 namespace agshot
 {
     HRESULT CreateSpinnerBitmap(ID2D1DeviceContext* context,

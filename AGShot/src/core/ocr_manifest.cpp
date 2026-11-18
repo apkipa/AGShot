@@ -5,14 +5,6 @@
 
 #include <toml++/toml.hpp>
 
-#include <algorithm>
-#include <cctype>
-#include <fstream>
-#include <sstream>
-#include <stdexcept>
-#include <string_view>
-#include <system_error>
-
 namespace agshot
 {
     namespace
@@ -95,6 +87,37 @@ namespace agshot
 
             return asset;
         }
+
+        toml::table ParseManifestTable(const std::filesystem::path& ocrDirectory)
+        {
+            const std::filesystem::path manifestPath = ocrDirectory / kManifestName;
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(manifestPath, ec) || ec)
+            {
+                throw std::runtime_error(
+                    "OCR manifest not found: " + ToUtf8(manifestPath.wstring()));
+            }
+            if (const auto size = std::filesystem::file_size(manifestPath, ec); !ec && size > kMaxManifestBytes)
+            {
+                throw std::runtime_error("OCR manifest exceeds 1 MB limit");
+            }
+
+            std::ifstream file{ manifestPath, std::ios::binary };
+            if (!file)
+            {
+                throw std::runtime_error(
+                    "Could not open OCR manifest: " + ToUtf8(manifestPath.wstring()));
+            }
+            std::ostringstream buffer;
+            buffer << file.rdbuf();
+            return toml::parse(buffer.str(), ToUtf8(manifestPath.wstring()));
+        }
+
+        std::optional<std::int64_t> ReadPackFormat(const toml::table& root)
+        {
+            const auto* node = root.get("pack_format");
+            return node ? node->value_exact<std::int64_t>() : std::nullopt;
+        }
     }
 
     bool HasOcrModelPack(const std::filesystem::path& ocrDirectory) noexcept
@@ -107,28 +130,8 @@ namespace agshot
     {
         try
         {
-            const std::filesystem::path manifestPath = ocrDirectory / kManifestName;
-            std::error_code ec;
-            if (!std::filesystem::is_regular_file(manifestPath, ec) || ec)
-            {
-                return false;
-            }
-            if (const auto size = std::filesystem::file_size(manifestPath, ec); ec || size > kMaxManifestBytes)
-            {
-                return false;
-            }
-
-            std::ifstream file{ manifestPath, std::ios::binary };
-            if (!file)
-            {
-                return false;
-            }
-            std::ostringstream buffer;
-            buffer << file.rdbuf();
-            const auto root = toml::parse(buffer.str(), ToUtf8(manifestPath.wstring()));
-            const auto packFormat = root.get("pack_format")
-                ? root.get("pack_format")->value_exact<std::int64_t>()
-                : std::nullopt;
+            const auto root = ParseManifestTable(ocrDirectory);
+            const auto packFormat = ReadPackFormat(root);
             return packFormat && *packFormat == kSupportedOcrPackFormat;
         }
         catch (...)
@@ -160,34 +163,60 @@ namespace agshot
         return {};
     }
 
+    std::filesystem::path FindLocalOcrModelDirectory(const std::filesystem::path& dataDirectory,
+                                                     const std::filesystem::path& executableDirectory) noexcept
+    {
+        std::filesystem::path candidates[3];
+        std::size_t count = 0;
+        const auto addCandidate = [&](std::filesystem::path root) {
+            if (root.empty())
+            {
+                return;
+            }
+            root = root.lexically_normal();
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                std::error_code eqEc;
+                if (candidates[i] == root || (std::filesystem::equivalent(candidates[i], root, eqEc) && !eqEc))
+                {
+                    return;
+                }
+            }
+            candidates[count++] = std::move(root);
+        };
+
+        addCandidate(dataDirectory);
+        addCandidate(executableDirectory);
+        std::error_code cwdEc;
+        if (const auto cwd = std::filesystem::current_path(cwdEc); !cwdEc)
+        {
+            addCandidate(cwd);
+        }
+
+        std::filesystem::path fallback;
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const auto found = FindOcrModelDirectory(candidates[i]);
+            if (found.empty())
+            {
+                continue;
+            }
+            if (HasSupportedOcrPackFormat(found))
+            {
+                return found;
+            }
+            if (fallback.empty())
+            {
+                fallback = found;
+            }
+        }
+        return fallback;
+    }
+
     OcrModelPack LoadOcrModelManifest(const std::filesystem::path& ocrDirectory)
     {
-        const std::filesystem::path manifestPath = ocrDirectory / kManifestName;
-        std::error_code ec;
-        if (!std::filesystem::is_regular_file(manifestPath, ec) || ec)
-        {
-            throw std::runtime_error(
-                "OCR manifest not found: " + ToUtf8(manifestPath.wstring()));
-        }
-        if (const auto size = std::filesystem::file_size(manifestPath, ec); !ec && size > kMaxManifestBytes)
-        {
-            throw std::runtime_error("OCR manifest exceeds 1 MB limit");
-        }
-
-        std::ifstream file{ manifestPath, std::ios::binary };
-        if (!file)
-        {
-            throw std::runtime_error(
-                "Could not open OCR manifest: " + ToUtf8(manifestPath.wstring()));
-        }
-        std::ostringstream buffer;
-        buffer << file.rdbuf();
-
-        const auto root = toml::parse(buffer.str(), ToUtf8(manifestPath.wstring()));
-
-        const auto packFormat = root.get("pack_format")
-            ? root.get("pack_format")->value_exact<std::int64_t>()
-            : std::nullopt;
+        const auto root = ParseManifestTable(ocrDirectory);
+        const auto packFormat = ReadPackFormat(root);
         if (!packFormat)
         {
             throw std::runtime_error("manifest.toml missing integer pack_format");

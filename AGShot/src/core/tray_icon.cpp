@@ -5,9 +5,6 @@
 #include "core/error.h"
 #include "core/tray_icon.h"
 
-#include <shellapi.h>
-#include <wil/resource.h>
-
 // The icon belongs to a window that is never shown, not to the application's
 // main window. A popup menu only dismisses correctly when its owner is
 // foreground, and making the main window foreground would drag AGShot in front

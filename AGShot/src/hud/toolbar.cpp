@@ -2,8 +2,6 @@
 
 #include "hud/toolbar.h"
 
-#include <algorithm>
-
 namespace agshot
 {
     namespace
