@@ -208,9 +208,6 @@
     <None Include="frontend\src\main.ts" />
     <None Include="frontend\src\ToastDeck.ts" />
     <None Include="frontend\src\types.ts" />
-    <Text Include="readme.txt">
-      <DeploymentContent>false</DeploymentContent>
-    </Text>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\OcrEngine\OcrEngine.vcxproj">

@@ -252,9 +252,6 @@
     </None>
   </ItemGroup>
   <ItemGroup>
-    <Text Include="readme.txt" />
-  </ItemGroup>
-  <ItemGroup>
     <Manifest Include="AGShot.exe.manifest" />
   </ItemGroup>
   <ItemGroup>

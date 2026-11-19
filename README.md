@@ -1,23 +1,20 @@
 # AGShot
 
-一个 Windows 截图工具，使用 C++/Win32 与 Direct2D 绘制截图浮层，并用 Intel NPU 完成离线文字识别。
+一个 Windows 截图工具，使用 C++/Win32 与 Direct2D 绘制截图浮层，支持即时标注与基于 Intel NPU 的离线文字识别。
 
 ## 特性
 
-- **区域截图**：全局快捷键唤起浮层（默认 F1，可在配置中修改），拖动选择区域，支持四边与四角微调。
-- **智能选区**：基于 UI Automation 识别指针下的窗口与控件，推荐对齐的选区，也可随时改为手动拖动。
-- **悬浮工具栏**：选中区域后出现，提供编辑选区、识别文本、复制到剪贴板、取消四个操作。
-- **使用 Intel NPU 的 OCR**：文字识别由 PaddleOCR 的检测（DBNet）与识别（CTC）两个模型完成，推理通过 Level Zero 全部提交给 Intel NPU，CPU 只负责图像缩放与结果整理。模型不嵌入二进制，与程序一同分发，识别全程离线。
-- **识别与界面解耦**：识别在系统线程池中执行，不阻塞浮层绘制；切换界面、关闭浮层或再次截图都不会中断正在进行的识别，结果只在原浮层仍存在时回填。
-- **文本选取**：识别结果支持鼠标拖动选择、Ctrl+A 全选、Ctrl+C 复制并关闭、方向键移动光标、滚轮与 PageUp/PageDown 滚动。
-- **常驻托盘**：程序没有主窗口，常驻通知区域；托盘菜单可打开设置、重载配置或退出，重复启动会唤醒已有实例。
-- **配置热重载**：配置文件修改后自动生效，无需重启。
+- **区域截图与智能吸附**：全局快捷键唤起浮层（默认 `F1`），基于 UI Automation 自动识别窗口与控件边界，支持拖动框选与四边四角微调。
+- **即时标注**：选中区域后弹出悬浮工具栏，支持图形（矩形/椭圆/菱形）、箭头与直线、画笔/荧光笔、内联文字、序号徽章、GPU 模糊/马赛克、对象多选对齐与撤销/重做，以及带取色器的拾色面板。
+- **Intel NPU 离线 OCR**：基于 PaddleOCR（DBNet + CTC）通过 Level Zero 提交 Intel NPU 推理，后台线程池异步执行不阻塞界面；识别结果支持拖动选字、`Ctrl+A`、`Ctrl+C` 复制并关闭与滚轮滚动。
+- **独立设置窗口**：托盘打开的 WebView2 设置界面，支持快捷键录制、性能 HUD 开关、OCR 模型包导入（按钮选择或直接拖入 `.zip` / `manifest.toml`）以及 NPU 内存卸载与缓存清理。
+- **常驻托盘与热重载**：无主窗口常驻托盘，支持 `config.toml` 修改自动热重载；缺少 OCR 模型时静默启动，不阻塞截图与标注。
 
 ## 系统要求
 
-- Windows 10 或更高版本，x64。
-- OCR 需要 Intel NPU（例如 Core Ultra 系列处理器）以及随 NPU 驱动安装的 Level Zero 运行时。没有 NPU 时截图与标注仍可使用，识别会返回错误信息。
-- 构建需要 Visual Studio 2022（v143 工具集）、vcpkg（依赖见 `vcpkg.json`）以及仓库内的 `third_party/level-zero-ext` 子模块。
+- Windows 10/11（x64）；设置窗口需要 WebView2 Runtime（缺失时自动回退打开配置文件）。
+- OCR 需要 Intel NPU（如 Core Ultra 系列）及随驱动安装的 Level Zero 运行时；无 NPU 或未导入模型时截图与标注仍可正常使用。
+- 构建需要 Visual Studio 2022（`v143`）、vcpkg（见 `vcpkg.json`）、Node.js + pnpm（前端打包与图标烘焙）、Level Zero SDK 及 `third_party/level-zero-ext` 子模块。
 
 ## 构建
 
@@ -27,44 +24,36 @@
    git clone --recursive https://github.com/apkipa/AGShot.git
    ```
 
-2. 准备 OCR 模型，放到仓库根目录的 `models/ocr/`（见下一节）。
-
-3. 用 Visual Studio 2022 打开 `AGShot.sln`，选择 x64 配置构建；也可以直接调用：
+2. （可选）准备 OCR 模型放到仓库根目录 `models/ocr/`，或运行后在设置窗口导入。
+3. 用 Visual Studio 2022 打开 `AGShot.sln` 构建 x64 配置，或命令行调用：
 
    ```
-   msbuild AGShot.sln /p:Configuration=Debug /p:Platform=x64
+   msbuild AGShot.sln /p:Configuration=Release /p:Platform=x64
    ```
-
-构建完成后，输出目录下的 `models` 是指向仓库根目录 `models/` 的目录联接，程序启动时从 `models/ocr/` 读取清单并加载模型。
 
 ## OCR 模型
 
-模型不随源码提交，需要放在 `models/ocr/` 目录中，包含以下四个文件：
+模型不随源码提交，由 `manifest.toml`（记录 `pack_format = 1`、`pack_version`、文件名与 SHA-256）及三个资源文件组成：
 
-- `manifest.toml`（记录 `pack_format = 1`、`pack_version`、文件名与 SHA-256 校验值）
 - `ppocrv6_small_det_u8_template.ngraph_lite`
 - `ppocrv6_small_rec_u8_template.ngraph_lite`
 - `ppocr_keys_v1.txt`
 
-程序依次在数据目录（默认 `%APPDATA%\AGShot\models\ocr\`，便携模式下即程序同目录）、可执行文件旁的 `models/ocr/` 与当前工作目录中查找，并优先选用 `pack_format` 匹配的模型包。首次识别会把驱动编译出的硬件 blob 缓存到数据目录下的 `cache`，后续启动直接复用。
+可在设置窗口的 **OCR** 页通过 **Import...** 或直接拖入模型包 `.zip` / `manifest.toml` 导入（自动做 SHA-256 校验并热加载），也可手动放入 `models/ocr/`。查找顺序依次为数据目录（默认 `%APPDATA%\AGShot\models\ocr\`）、程序同目录与当前工作目录；首次推理会把驱动编译出的硬件 blob 缓存到数据目录 `cache/`。
 
 ## 使用
 
-1. 启动 AGShot，按 F1（或配置的快捷键）开始截图。
-2. 拖动鼠标选择区域；靠近窗口或控件时选区会自动吸附，按需微调。
-3. 点击工具栏的 **Copy to clipboard** 或按 Ctrl+C 复制选区图像；点击 **Recognize text** 进入 OCR 视图。
-4. 在 OCR 视图中拖动选择文字，Ctrl+C 复制并关闭，Esc 取消。
+1. 启动 AGShot，按 `F1`（或自定义快捷键）开始截图。
+2. 拖动选择区域或单击吸附窗口/控件；需要标注时在工具栏选用对应工具。
+3. 点击 **Copy** 或按 `Ctrl+C` 复制选区图像；点击 **Recognize text** 进入 OCR 视图。
+4. 在 OCR 视图中选字、`Ctrl+C` 复制并关闭，按 `Esc` 取消。
 
 ## 配置
 
-配置文件默认位于 `%APPDATA%\AGShot\config.toml`。若可执行文件旁存在 `AGShot.portable` 文件或已存在 `config.toml`，则切换为便携模式，使用同目录下的 `config.toml`、`cache/` 与 `models/ocr/`。
+配置文件默认位于 `%APPDATA%\AGShot\config.toml`。若程序同目录存在 `AGShot.portable` 或已有 `config.toml`，则切换为便携模式（配置、缓存与模型均保存在程序同目录）。
 
 ```toml
 version = 1
-
-[window]
-width = 800
-height = 450
 
 [screenshot]
 hotkey = "F1"
