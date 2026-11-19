@@ -421,6 +421,18 @@ namespace
             app.ocrRuntime.Trim();
             return 1;
 
+        case agshot::kReloadOcrModelsMessage:
+        {
+            const auto dataDirectory = app.configPath.parent_path();
+            const auto ocrModels = agshot::FindLocalOcrModelDirectory(
+                dataDirectory, agshot::ExecutableDirectory());
+            const auto ocrCache = agshot::OcrCacheDirectory();
+            std::error_code ocrCacheError;
+            std::filesystem::create_directories(ocrCache, ocrCacheError);
+            app.ocrRuntime.Reload(ocrModels, ocrCacheError ? std::filesystem::path{} : ocrCache);
+            return app.ocrRuntime.available() ? 1 : 0;
+        }
+
         case kSettingsExitedMessage:
             // If ShowSettings already replaced a just-exited child before this
             // queued notification was pumped, the current handle is still alive.
@@ -583,19 +595,11 @@ int RunApp(HINSTANCE instance, int showCommand, bool& restartRequested)
     agshot::SetDiagnosticContext(L"Config: " + configPath.wstring());
 
     // Model distribution is intentionally external. Detect the local payload at
-    // startup, but never attempt a model load on the UI thread.
+    // startup silently (without blocking capture/annotation if absent), and never
+    // attempt a model load on the UI thread.
     const auto dataDirectory = configPath.parent_path();
     const auto ocrModels = agshot::FindLocalOcrModelDirectory(
         dataDirectory, agshot::ExecutableDirectory());
-    if (ocrModels.empty()) {
-        const auto appDataHint = dataDirectory / L"models" / L"ocr";
-        const std::wstring detail = (dataDirectory == agshot::ExecutableDirectory())
-            ? L"Expected a local models\\ocr\\ directory beside AGShot."
-            : L"Expected models\\ocr\\ beside AGShot or in " + appDataHint.wstring() + L".";
-        agshot::ShowWarning(
-            agshot::Failure{ {}, detail },
-            L"AGShot OCR models are unavailable.");
-    }
     const auto ocrCache = agshot::OcrCacheDirectory();
     std::error_code ocrCacheError;
     std::filesystem::create_directories(ocrCache, ocrCacheError);

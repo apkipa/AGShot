@@ -28,9 +28,6 @@ namespace agshot
     {
         m_strokeFactory = nullptr;
         m_dashStroke = nullptr;
-        m_brushContext = nullptr;
-        m_scratchBrush = nullptr;
-        m_whiteBrush = nullptr;
     }
 
     void InlineTextEditor::InvalidateLayout() noexcept
@@ -935,7 +932,7 @@ namespace agshot
     void InlineTextEditor::Draw(
         ID2D1Factory1* factory, ID2D1DeviceContext* context,
         IDWriteFactory* dwrite, int dpi,
-        const HudBrushes* brushes) const
+        const HudBrushes& brushes) const
     {
         if (!m_active || factory == nullptr || context == nullptr || dwrite == nullptr)
         {
@@ -952,27 +949,11 @@ namespace agshot
             m_strokeFactory = factory;
         }
 
-        if (brushes == nullptr && (m_brushContext != context || !m_scratchBrush || !m_whiteBrush))
+        const auto colorBrush = [&](const D2D1_COLOR_F& c) noexcept -> ID2D1SolidColorBrush*
         {
-            m_scratchBrush = nullptr;
-            m_whiteBrush = nullptr;
-            AGSHOT_CHECK_HR(context->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), m_scratchBrush.put()));
-            AGSHOT_CHECK_HR(context->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), m_whiteBrush.put()));
-            m_brushContext = context;
-        }
-
-        const auto colorBrush = [&](const D2D1_COLOR_F& c) -> ID2D1SolidColorBrush*
-        {
-            if (brushes != nullptr)
-            {
-                return brushes->WithColor(c);
-            }
-            m_scratchBrush->SetColor(c);
-            return m_scratchBrush.get();
+            return brushes.WithColor(c);
         };
-        ID2D1SolidColorBrush* whiteBrush = (brushes != nullptr)
-            ? brushes->handleFill.get()
-            : m_whiteBrush.get();
+        ID2D1SolidColorBrush* whiteBrush = brushes.handleFill.get();
 
         // Single EnsureLayout() reused across EditorBox, DrawTextLayout, and Caret!
         IDWriteTextLayout* layout = EnsureLayout(dwrite, dpi);

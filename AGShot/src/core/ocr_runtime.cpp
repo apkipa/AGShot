@@ -2,28 +2,16 @@
 
 #include "core/ocr_runtime.h"
 #include "core/ocr_manifest.h"
+#include "core/text.h"
 #include "../../../OcrEngine/src/ocr_engine.hpp"
 
 namespace agshot
 {
     namespace
     {
-        std::wstring Utf8ToWide(const std::string& value)
-        {
-            if (value.empty()) return {};
-            const int length = MultiByteToWideChar(
-                CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0);
-            if (length <= 0) return L"[invalid UTF-8 OCR result]";
-            std::wstring result(static_cast<size_t>(length), L'\0');
-            MultiByteToWideChar(
-                CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
-                result.data(), length);
-            return result;
-        }
-
         std::wstring ErrorText(const std::exception& error)
         {
-            return Utf8ToWide(error.what());
+            return FromUtf8(error.what());
         }
 
         void Finish(const std::shared_ptr<OcrCompletion>& completion, bool ok,
@@ -90,6 +78,24 @@ namespace agshot
         // The system thread pool: one work item covers every request that is
         // waiting, and the callback runs on the pool the process already has.
         m_work = CreateThreadpoolWork(WorkCallback, this, nullptr);
+    }
+
+    void OcrRuntime::Reload(const std::filesystem::path& models,
+                            const std::filesystem::path& cache)
+    {
+        Shutdown();
+        {
+            std::lock_guard lock(m_mutex);
+            m_stopping = false;
+            m_queued = false;
+            m_trimRequested = false;
+            m_pending.reset();
+        }
+        m_initializationAttempted = false;
+        m_initializationError.clear();
+        m_models.clear();
+        m_cache.clear();
+        Start(models, cache);
     }
 
     bool OcrRuntime::available() const noexcept
@@ -304,7 +310,7 @@ namespace agshot
                 for (const auto& line : lines)
                 {
                     if (!text.empty()) text += L"\r\n";
-                    text += Utf8ToWide(line.text);
+                    text += FromUtf8(line.text);
                 }
                 Finish(job.completion, true, std::move(text), {});
                 PostResult(job.target, std::move(job.completion));

@@ -127,9 +127,6 @@ namespace agshot::ui
         IHudLayer* hovered() const noexcept { return m_hovered; }
         bool hasCapture() const noexcept { return m_captured != nullptr; }
 
-        void SetCapture(IHudLayer* layer) noexcept { m_captured = layer; }
-        void ReleaseCapture() noexcept { m_captured = nullptr; }
-
         bool DispatchLeftDown(const PointerInput& in, Invalidate& inv);
         void DispatchMove(const PointerInput& in, Invalidate& inv);
         bool DispatchLeftUp(const PointerInput& in, Invalidate& inv);

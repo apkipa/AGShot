@@ -251,7 +251,6 @@ namespace agshot
         bool CanSendSelectedBackward() const noexcept;
         bool ReorderSelected(AnnotationZOrderOp op);
         bool DuplicateSelected(float dx, float dy);
-        bool UpdateItem(std::uint64_t id, const AnnotationItem& updated);
         void CommitPreviousState(std::vector<AnnotationItem> previousItems);
 
         bool Undo() noexcept;

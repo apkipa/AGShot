@@ -28,6 +28,9 @@
     <ClInclude Include="src\core\app_ipc.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\clipboard.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\core\config.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -47,6 +50,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\core\error.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\file_io.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\core\hotkey.h">
@@ -234,9 +240,6 @@
     <ClCompile Include="src\core\icon_pack.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\core\text.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="src\core\tray_icon.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -245,9 +248,6 @@
     <None Include="PropertySheet.props" />
     <None Include="packages.config" />
     <None Include="assets\icons\manifest.json">
-      <Filter>Icon Assets</Filter>
-    </None>
-    <None Include="assets\icons\*.svg">
       <Filter>Icon Assets</Filter>
     </None>
   </ItemGroup>

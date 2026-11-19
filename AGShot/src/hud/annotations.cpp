@@ -1,5 +1,6 @@
 #include "pch.h"
 
+#include "core/clipboard.h"
 #include "core/error.h"
 #include "hud/annotations.h"
 
@@ -1148,22 +1149,6 @@ namespace agshot
         return true;
     }
 
-    bool AnnotationDocument::UpdateItem(std::uint64_t id, const AnnotationItem& updated)
-    {
-        for (AnnotationItem& item : m_items)
-        {
-            if (item.id == id)
-            {
-                PushUndoSnapshot(m_items);
-                const std::uint64_t keepId = item.id;
-                item = updated;
-                item.id = keepId;
-                return true;
-            }
-        }
-        return false;
-    }
-
     void AnnotationDocument::CommitPreviousState(std::vector<AnnotationItem> previousItems)
     {
         PushUndoSnapshot(std::move(previousItems));
@@ -1829,7 +1814,6 @@ namespace agshot
 
         const UINT width = static_cast<UINT>(clipped.right - clipped.left);
         const UINT height = static_cast<UINT>(clipped.bottom - clipped.top);
-        const std::size_t pixelBytes = static_cast<std::size_t>(width) * height * 4;
         const D2D1_SIZE_U size = D2D1::SizeU(width, height);
 
         winrt::com_ptr<ID2D1DeviceContext> target;
@@ -1889,38 +1873,7 @@ namespace agshot
         AGSHOT_CHECK_HR(readable->Map(D2D1_MAP_OPTIONS_READ, &mapped));
         auto unmap = wil::scope_exit([&] { readable->Unmap(); });
 
-        wil::unique_hglobal block{ GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + pixelBytes) };
-        AGSHOT_CHECK_WIN32(block != nullptr);
-
-        BYTE* targetMem = static_cast<BYTE*>(GlobalLock(block.get()));
-        AGSHOT_CHECK_WIN32(targetMem != nullptr);
-        auto unlockBlock = wil::scope_exit([&] { GlobalUnlock(block.get()); });
-
-        BITMAPINFOHEADER header{};
-        header.biSize = sizeof(BITMAPINFOHEADER);
-        header.biWidth = static_cast<LONG>(width);
-        header.biHeight = static_cast<LONG>(height); // bottom-up CF_DIB
-        header.biPlanes = 1;
-        header.biBitCount = 32;
-        header.biCompression = BI_RGB;
-        std::memcpy(targetMem, &header, sizeof(header));
-
-        BYTE* out = targetMem + sizeof(BITMAPINFOHEADER);
-        const std::size_t rowBytes = static_cast<std::size_t>(width) * 4;
-        for (UINT row = 0; row < height; ++row)
-        {
-            const UINT sourceRow = height - 1 - row;
-            const BYTE* source = mapped.bits + static_cast<std::size_t>(sourceRow) * mapped.pitch;
-            std::memcpy(out + static_cast<std::size_t>(row) * rowBytes, source, rowBytes);
-        }
-
-        unlockBlock.reset();
-        unmap.reset();
-
-        AGSHOT_CHECK_WIN32(OpenClipboard(owner) != 0);
-        auto closeClipboard = wil::scope_exit([] { CloseClipboard(); });
-        AGSHOT_CHECK_WIN32(EmptyClipboard() != 0);
-        AGSHOT_CHECK_WIN32(SetClipboardData(CF_DIB, block.get()) != nullptr);
-        block.release();
+        CopyBgraToClipboard(
+            owner, mapped.bits, static_cast<int>(width), static_cast<int>(height), mapped.pitch);
     }
 }

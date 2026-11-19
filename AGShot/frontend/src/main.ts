@@ -6,6 +6,7 @@ const host = (window as unknown as {
   chrome?: {
     webview?: {
       postMessage(data: unknown): void;
+      postMessageWithAdditionalObjects?(data: unknown, additionalObjects: ArrayLike<unknown>): void;
       addEventListener(type: 'message', listener: (ev: MessageEvent<HostMessage>) => void): void;
     };
   };
@@ -15,6 +16,7 @@ const send = (payload: Record<string, unknown>) => host?.postMessage(payload);
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
 let recording = false;
+let importingModels = false;
 let currentData: HostState | null = null;
 
 const navButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('.nav-btn[data-tab]'));
@@ -137,7 +139,7 @@ function renderState(s: HostState) {
   if (!s.ocr.modelsFound) {
     ocrBadge.className = 'badge warn';
     ocrBadge.textContent = 'Models missing';
-    ocrDesc.textContent = 'Place OCR models in the models folder to enable text recognition.';
+    ocrDesc.textContent = 'Import a model pack (.zip or manifest.toml) to enable text recognition.';
   } else if (!s.ocr.manifestOk) {
     ocrBadge.className = 'badge err';
     ocrBadge.textContent = 'Model error';
@@ -158,6 +160,11 @@ function renderState(s: HostState) {
       : 'Models verified · loads on demand.';
   }
 
+  const importBtn = $<HTMLButtonElement>('import-models-btn');
+  importBtn.classList.toggle('primary', !s.ocr.modelsFound || !s.ocr.manifestOk);
+  importBtn.disabled = importingModels;
+  importBtn.textContent = importingModels ? 'Importing...' : 'Import...';
+  $<HTMLButtonElement>('open-models-btn').disabled = importingModels;
   $<HTMLButtonElement>('trim-ocr-btn').classList.toggle('hidden', !(s.runtime.mainRunning && s.runtime.ocrLoaded));
   $<HTMLSpanElement>('ocr-cache-badge').textContent = formatBytes(s.ocr.cacheBytes);
   $<HTMLButtonElement>('clear-cache-btn').disabled = !(s.ocr.cacheFiles > 0);
@@ -274,6 +281,55 @@ $<HTMLInputElement>('debug-stats-toggle').addEventListener('change', (e) =>
   send({ type: 'setDebugStats', value: (e.currentTarget as HTMLInputElement).checked })
 );
 $<HTMLButtonElement>('trim-ocr-btn').addEventListener('click', () => send({ type: 'trimOcrMemory' }));
+$<HTMLButtonElement>('import-models-btn').addEventListener('click', () => {
+  if (!importingModels) send({ type: 'importOcrModels' });
+});
+
+const dropOverlay = $<HTMLDivElement>('drop-overlay');
+let dragDepth = 0;
+const hasDraggedFiles = (e: DragEvent) =>
+  Array.from(e.dataTransfer?.types ?? []).includes('Files');
+const resetDropOverlay = () => {
+  dragDepth = 0;
+  dropOverlay.classList.remove('active');
+};
+
+window.addEventListener('dragenter', (e) => {
+  if (!hasDraggedFiles(e)) return;
+  e.preventDefault();
+  dragDepth += 1;
+  if (!importingModels) dropOverlay.classList.add('active');
+});
+
+window.addEventListener('dragover', (e) => {
+  if (!hasDraggedFiles(e)) return;
+  e.preventDefault();
+  if (e.dataTransfer) {
+    e.dataTransfer.dropEffect = importingModels ? 'none' : 'copy';
+  }
+});
+
+window.addEventListener('dragleave', (e) => {
+  if (!hasDraggedFiles(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0 || e.relatedTarget === null) resetDropOverlay();
+});
+
+window.addEventListener('blur', resetDropOverlay);
+
+window.addEventListener('drop', (e) => {
+  if (!hasDraggedFiles(e)) return;
+  e.preventDefault();
+  resetDropOverlay();
+  if (importingModels) return;
+  const files = e.dataTransfer?.files;
+  if (!files || files.length === 0) return;
+  if (host?.postMessageWithAdditionalObjects) {
+    host.postMessageWithAdditionalObjects({ type: 'dropOcrModels' }, [files[0]]);
+  } else {
+    pushToast('warn', 'Drag-and-drop import requires a newer WebView2 Runtime.');
+  }
+});
 $<HTMLButtonElement>('clear-cache-btn').addEventListener('click', () => send({ type: 'clearOcrCache' }));
 $<HTMLButtonElement>('open-models-btn').addEventListener('click', () => send({ type: 'openModelsFolder' }));
 $<HTMLButtonElement>('open-config-btn').addEventListener('click', () => send({ type: 'openConfig' }));
@@ -291,6 +347,9 @@ host?.addEventListener('message', (event) => {
   } else if (msg.type === 'hotkeyResult') {
     if (msg.state) renderState(msg.state);
     pushToast(msg.ok ? 'ok' : 'err', msg.message);
+  } else if (msg.type === 'importState') {
+    importingModels = !!msg.busy;
+    if (currentData) renderState(currentData);
   } else if (msg.type === 'actionResult') {
     if (msg.state) renderState(msg.state);
     if (msg.message) pushToast(msg.ok ? 'ok' : 'warn', msg.message);

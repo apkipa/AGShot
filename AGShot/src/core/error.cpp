@@ -1,5 +1,6 @@
 #include "pch.h"
 
+#include "core/clipboard.h"
 #include "core/error.h"
 #include "core/text.h"
 
@@ -78,9 +79,11 @@ namespace agshot
         {
             std::wostringstream out;
 
-            wchar_t path[MAX_PATH]{};
-            const DWORD length = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
-            out << L"Executable: " << std::wstring_view{ path, length } << L"\n";
+            std::wstring exePath;
+            if (SUCCEEDED(wil::GetModuleFileNameW<std::wstring>(nullptr, exePath)))
+            {
+                out << L"Executable: " << exePath << L"\n";
+            }
 
             out << L"Architecture: " << (sizeof(void*) == 8 ? L"x64" : L"x86") << L"\n";
 
@@ -100,36 +103,6 @@ namespace agshot
 
             out << L"System DPI: " << GetDpiForSystem();
             return out.str();
-        }
-
-        bool CopyToClipboard(std::wstring_view text) noexcept
-        {
-            if (text.empty() || !OpenClipboard(nullptr))
-            {
-                return false;
-            }
-            auto closeClipboard = wil::scope_exit([] { CloseClipboard(); });
-
-            bool ok = false;
-            if (EmptyClipboard())
-            {
-                const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-                wil::unique_hglobal memory{ GlobalAlloc(GMEM_MOVEABLE, bytes) };
-                if (memory)
-                {
-                    if (void* target = GlobalLock(memory.get()))
-                    {
-                        memcpy(target, text.data(), bytes);
-                        GlobalUnlock(memory.get());
-                        if (SetClipboardData(CF_UNICODETEXT, memory.get()) != nullptr)
-                        {
-                            ok = true;
-                            memory.release(); // the clipboard owns it now
-                        }
-                    }
-                }
-            }
-            return ok;
         }
     }
 
@@ -310,7 +283,7 @@ namespace agshot
             }
             if (pressed == kCopyDetails)
             {
-                CopyToClipboard(failure.what + L"\n\n" + content);
+                CopyTextToClipboard(nullptr, failure.what + L"\n\n" + content);
             }
         }
         catch (...)

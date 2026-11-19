@@ -58,7 +58,6 @@ namespace agshot
         bool SelectionMatchesTool(ToolbarButton toolMode) const noexcept;
         void PopulateToolbarState(ToolbarState& state, ToolbarButton toolMode) const noexcept;
 
-        bool HitTestTextEditorBorder(POINT point, IDWriteFactory* dwrite, int dpi) const;
         LPCWSTR CursorForActiveEditor(POINT point, IDWriteFactory* dwrite, int dpi) const;
         LPCWSTR CursorForSelectedHandle(POINT point, ToolbarButton toolMode,
                                         IDWriteFactory* dwrite, int dpi) const;
@@ -86,7 +85,6 @@ namespace agshot
         void ApplyColorFromPicker(const ColorPickerPopover& picker, ToolbarButton toolMode, bool commitUndo);
 
         void CommitTextEditor(HWND window);
-        void CancelTextEditor(HWND window) noexcept;
         void BeginTextEditAt(HWND window, POINT point, IDWriteFactory* dwrite, int dpi);
 
         bool TryBeginSelectedHandleDrag(POINT point, ToolbarButton toolMode,
@@ -122,7 +120,7 @@ namespace agshot
                                ID2D1Bitmap* sourceBitmap, int dpi);
         void DrawOverlayChrome(ID2D1Factory1* factory, ID2D1DeviceContext* context,
                                IDWriteFactory* dwrite, int dpi,
-                               const HudBrushes* brushes = nullptr);
+                               const HudBrushes& brushes);
         void ExportToClipboard(HWND owner, const RenderDevice& device,
                                const ScreenImage& sourceImage,
                                const RECT& bounds, const RECT& selection) const;

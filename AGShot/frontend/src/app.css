@@ -120,6 +120,8 @@ html, body { margin: 0; padding: 0; height: 100%; background: var(--bg-canvas); 
 .btn { appearance: none; border: 1px solid var(--border-strong); background: var(--bg-input); color: var(--text-primary); border-radius: var(--radius-md); padding: 6px 12px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; transition: background-color 120ms ease; white-space: nowrap; }
 .btn:hover:not(:disabled) { background: var(--bg-nav-hover); }
 .btn:disabled { opacity: 0.45; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
 .btn.subtle { padding: 5px 10px; font-size: 12.5px; color: var(--text-secondary); }
 
 .hotkey-box { min-width: 132px; padding: 6px 12px; border-radius: var(--radius-md); border: 1px solid var(--border-strong); background: var(--bg-input); color: var(--text-primary); font-family: var(--font-mono); font-size: 13px; font-weight: 600; text-align: center; cursor: pointer; transition: border-color 120ms ease, box-shadow 120ms ease; }
@@ -149,15 +151,19 @@ html, body { margin: 0; padding: 0; height: 100%; background: var(--bg-canvas); 
 .toast.mounted { opacity: var(--toast-opacity, 1); transform: translateY(calc(var(--toast-y, 0px) + var(--swipe-y, 0px))) scale(var(--toast-scale, 1)); }
 .toast.swiping { transition: none; }
 .toast.leaving { opacity: 0 !important; transform: translateY(calc(var(--toast-y, 0px) + 18px)) scale(0.95) !important; pointer-events: none; }
-.toast-icon { flex-shrink: 0; }
+.toast-icon { width: 20px; height: 20px; flex-shrink: 0; }
 .toast.ok .toast-icon { color: var(--success-fg); }
 .toast.warn .toast-icon { color: var(--warn-fg); }
 .toast.err .toast-icon { color: var(--danger-fg); }
 .toast.err { border-color: rgba(196, 43, 28, 0.35); }
 .toast-text { flex: 1; min-width: 0; line-height: 1.35; }
 .toast-close { appearance: none; border: 0; background: transparent; color: var(--text-muted); width: 24px; height: 24px; padding: 0; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; opacity: 0.72; transition: opacity 120ms ease, background-color 120ms ease, color 120ms ease; }
-.toast-close .ui-icon { width: 9px; height: 9px; }
+.toast-close .ui-icon { width: 11px; height: 11px; }
 .toast-close:hover { opacity: 1; background: var(--bg-nav-hover); color: var(--text-primary); }
+
+.drop-overlay { position: fixed; inset: 10px; z-index: 40; display: flex; align-items: center; justify-content: center; border-radius: var(--radius-lg); border: 2px dashed var(--accent); background: color-mix(in srgb, var(--bg-canvas) 82%, transparent); backdrop-filter: blur(4px); pointer-events: none; opacity: 0; transition: opacity 140ms ease; }
+.drop-overlay.active { opacity: 1; }
+.drop-overlay-card { padding: 10px 16px; border-radius: var(--radius-md); background: var(--bg-card); border: 1px solid var(--border-strong); color: var(--text-primary); font-size: 13.5px; font-weight: 600; box-shadow: var(--toast-shadow); }
 
 @media (max-width: 580px) {
   .shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }

@@ -20,6 +20,7 @@ namespace agshot
     inline constexpr UINT kQueryStatusMessage = WM_APP + 6;
     inline constexpr UINT kTrimOcrMemoryMessage = WM_APP + 7;
     inline constexpr UINT kReloadConfigMessage = WM_APP + 8;
+    inline constexpr UINT kReloadOcrModelsMessage = WM_APP + 10;
 
     // Bitmask returned by kQueryStatusMessage.
     inline constexpr LRESULT kStatusOcrAvailable = 1 << 0;

@@ -34,6 +34,97 @@ namespace agshot
         constexpr int kMinHeightDip = 360;
         constexpr int kProbeHotkeyId = 9001;
         constexpr UINT kFallbackOpenConfigMsg = WM_APP + 20;
+        constexpr UINT kImportModelsDoneMsg = WM_APP + 21;
+        constexpr UINT kImportModelsPickMsg = WM_APP + 22;
+        constexpr UINT kMoveFocusMsg = WM_APP + 23;
+
+        bool PickOcrModelPackFile(HWND owner, std::filesystem::path& outPath)
+        {
+            outPath.clear();
+            winrt::com_ptr<IFileOpenDialog> dialog;
+            if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                        __uuidof(IFileOpenDialog), dialog.put_void()))
+                || !dialog)
+            {
+                return false;
+            }
+
+            DWORD options = 0;
+            if (SUCCEEDED(dialog->GetOptions(&options)))
+            {
+                dialog->SetOptions(
+                    options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST
+                    | FOS_DONTADDTORECENT | FOS_NOCHANGEDIR);
+            }
+
+            constexpr COMDLG_FILTERSPEC kFilters[] = {
+                { L"OCR Model Pack (*.zip;manifest.toml)", L"*.zip;manifest.toml" },
+                { L"All files (*.*)", L"*.*" },
+            };
+            dialog->SetFileTypes(ARRAYSIZE(kFilters), kFilters);
+            dialog->SetFileTypeIndex(1);
+            dialog->SetTitle(L"Import OCR model pack");
+
+            if (FAILED(dialog->Show(owner)))
+            {
+                return false;
+            }
+
+            winrt::com_ptr<IShellItem> item;
+            if (FAILED(dialog->GetResult(item.put())) || !item)
+            {
+                return false;
+            }
+            wil::unique_cotaskmem_string path;
+            if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, path.put())) || !path)
+            {
+                return false;
+            }
+            outPath = path.get();
+            return !outPath.empty();
+        }
+
+        // Extracts the local path of a file dropped onto the WebView2 page via
+        // postMessageWithAdditionalObjects (bypasses IFileOpenDialog completely).
+        std::filesystem::path ExtractFirstAdditionalFilePath(
+            ICoreWebView2WebMessageReceivedEventArgs* args)
+        {
+            if (args == nullptr)
+            {
+                return {};
+            }
+            winrt::com_ptr<ICoreWebView2WebMessageReceivedEventArgs2> args2;
+            if (FAILED(args->QueryInterface(IID_PPV_ARGS(args2.put()))) || !args2)
+            {
+                return {};
+            }
+            winrt::com_ptr<ICoreWebView2ObjectCollectionView> objects;
+            if (FAILED(args2->get_AdditionalObjects(objects.put())) || !objects)
+            {
+                return {};
+            }
+            UINT32 count = 0;
+            if (FAILED(objects->get_Count(&count)) || count == 0)
+            {
+                return {};
+            }
+            winrt::com_ptr<IUnknown> unk;
+            if (FAILED(objects->GetValueAtIndex(0, unk.put())) || !unk)
+            {
+                return {};
+            }
+            winrt::com_ptr<ICoreWebView2File> file;
+            if (FAILED(unk->QueryInterface(IID_PPV_ARGS(file.put()))) || !file)
+            {
+                return {};
+            }
+            wil::unique_cotaskmem_string path;
+            if (FAILED(file->get_Path(path.put())) || !path)
+            {
+                return {};
+            }
+            return std::filesystem::path{ path.get() };
+        }
 
         bool IsSystemDarkMode() noexcept
         {
@@ -81,6 +172,25 @@ namespace agshot
             if (outResult != nullptr)
             {
                 *outResult = static_cast<LRESULT>(result);
+            }
+            return true;
+        }
+
+        bool RequestAndWaitMainOcrTrim(int maxPolls) noexcept
+        {
+            LRESULT ignored = 0;
+            if (!SendMainCommand(kTrimOcrMemoryMessage, &ignored))
+            {
+                return false;
+            }
+            for (int i = 0; i < maxPolls; ++i)
+            {
+                Sleep(35);
+                LRESULT status = 0;
+                if (SendMainCommand(kQueryStatusMessage, &status) && (status & kStatusOcrLoaded) == 0)
+                {
+                    break;
+                }
             }
             return true;
         }
@@ -255,6 +365,10 @@ namespace agshot
 
             ~SettingsHost()
             {
+                if (m_importThread.joinable())
+                {
+                    m_importThread.join();
+                }
                 ResumeMainHotkeyIfPaused();
             }
 
@@ -282,10 +396,11 @@ namespace agshot
 
             void HandleSetHotkey(const std::wstring& value);
             void HandleSetDebugStats(bool enabled);
-            bool RequestAndWaitOcrTrim(int maxPolls);
             bool OpenConfigInShell();
             void HandleTrimOcr();
             void HandleClearOcrCache();
+            void HandlePickOcrModels();
+            void StartImportOcrModels(std::filesystem::path chosenPath);
 
             void PauseMainHotkey() noexcept;
             void ResumeMainHotkeyIfPaused() noexcept;
@@ -309,6 +424,10 @@ namespace agshot
             bool m_hotkeyPausedByUs = false;
             bool m_fallbackHandled = false;
             bool m_closing = false;
+            bool m_importingModels = false;
+            std::mutex m_importMutex;
+            std::optional<OcrImportResult> m_importResult;
+            std::thread m_importThread;
         };
 
         void SettingsHost::PauseMainHotkey() noexcept
@@ -608,28 +727,9 @@ namespace agshot
             return OpenShellTarget(m_configPath.c_str(), L"ShellExecuteW(open config)");
         }
 
-        bool SettingsHost::RequestAndWaitOcrTrim(int maxPolls)
-        {
-            LRESULT ignored = 0;
-            if (!SendMainCommand(kTrimOcrMemoryMessage, &ignored))
-            {
-                return false;
-            }
-            for (int i = 0; i < maxPolls; ++i)
-            {
-                Sleep(35);
-                LRESULT status = 0;
-                if (SendMainCommand(kQueryStatusMessage, &status) && (status & kStatusOcrLoaded) == 0)
-                {
-                    break;
-                }
-            }
-            return true;
-        }
-
         void SettingsHost::HandleTrimOcr()
         {
-            const bool sent = RequestAndWaitOcrTrim(6);
+            const bool sent = RequestAndWaitMainOcrTrim(6);
             SendResult(L"actionResult", sent,
                        sent ? L"Requested NPU OCR engine unload." : L"AGShot tray host is not running.");
         }
@@ -639,7 +739,7 @@ namespace agshot
             LRESULT rtBits = 0;
             if (SendMainCommand(kQueryStatusMessage, &rtBits) && (rtBits & kStatusOcrLoaded) != 0)
             {
-                RequestAndWaitOcrTrim(8);
+                RequestAndWaitMainOcrTrim(8);
             }
 
             const std::filesystem::path cacheDir = OcrCacheDirectory();
@@ -657,6 +757,74 @@ namespace agshot
             }
 
             SendResult(L"actionResult", res.failedEntries == 0, msg);
+        }
+
+        void SettingsHost::HandlePickOcrModels()
+        {
+            if (m_importingModels || m_closing)
+            {
+                return;
+            }
+            // Guard before Show() because IFileOpenDialog runs a nested modal message loop.
+            m_importingModels = true;
+            std::filesystem::path chosenPath;
+            const bool picked = PickOcrModelPackFile(m_hwnd, chosenPath);
+            m_importingModels = false;
+            if (!picked || m_closing)
+            {
+                return;
+            }
+            StartImportOcrModels(std::move(chosenPath));
+        }
+
+        void SettingsHost::StartImportOcrModels(std::filesystem::path chosenPath)
+        {
+            if (m_importingModels || m_closing)
+            {
+                return;
+            }
+            if (chosenPath.empty())
+            {
+                SendResult(L"actionResult", false, L"Could not read the selected file path.");
+                return;
+            }
+            if (m_importThread.joinable())
+            {
+                m_importThread.join();
+            }
+
+            m_importingModels = true;
+            Json::JsonObject busyObj;
+            busyObj.Insert(L"type", Json::JsonValue::CreateStringValue(L"importState"));
+            busyObj.Insert(L"busy", Json::JsonValue::CreateBooleanValue(true));
+            SendJson(busyObj);
+
+            const HWND targetHwnd = m_hwnd;
+            std::filesystem::path dataDir = DataDirectory();
+            m_importThread = std::thread([this, targetHwnd, chosenPath = std::move(chosenPath), dataDir = std::move(dataDir)]()
+            {
+                LRESULT rtBits = 0;
+                if (SendMainCommand(kQueryStatusMessage, &rtBits) && (rtBits & kStatusOcrLoaded) != 0)
+                {
+                    RequestAndWaitMainOcrTrim(8);
+                }
+
+                OcrImportResult result = ImportOcrModelPack(chosenPath, dataDir);
+                if (result.ok)
+                {
+                    LRESULT reloaded = 0;
+                    SendMainCommand(kReloadOcrModelsMessage, &reloaded);
+                }
+
+                {
+                    std::lock_guard lock(m_importMutex);
+                    m_importResult = std::move(result);
+                }
+                if (IsWindow(targetHwnd))
+                {
+                    PostMessageW(targetHwnd, kImportModelsDoneMsg, 0, 0);
+                }
+            });
         }
 
         void SettingsHost::OnWebResourceRequested(
@@ -688,25 +856,7 @@ namespace agshot
                 const std::wstring_view wname = target.substr(
                     kIconsPrefix.size(),
                     target.size() - kIconsPrefix.size() - kSvgSuffix.size());
-                std::string name;
-                name.reserve(wname.size());
-                bool safeName = !wname.empty();
-                for (wchar_t ch : wname)
-                {
-                    if ((ch >= L'a' && ch <= L'z') || (ch >= L'0' && ch <= L'9')
-                        || ch == L'_' || ch == L'-')
-                    {
-                        name.push_back(static_cast<char>(ch));
-                    }
-                    else
-                    {
-                        safeName = false;
-                        break;
-                    }
-                }
-                const std::string_view svg = safeName
-                    ? SharedHudIconPack().SvgByName(name)
-                    : std::string_view{};
+                const std::string_view svg = SharedHudIconPack().SvgByName(ToUtf8(wname));
                 if (!svg.empty())
                 {
                     winrt::com_ptr<IStream> iconStream;
@@ -715,7 +865,7 @@ namespace agshot
                         winrt::com_ptr<ICoreWebView2WebResourceResponse> iconResponse;
                         if (SUCCEEDED(m_env->CreateWebResourceResponse(
                                 iconStream.get(), 200, L"OK",
-                                L"Content-Type: image/svg+xml; charset=utf-8\r\nCache-Control: immutable, max-age=3600",
+                                L"Content-Type: image/svg+xml; charset=utf-8\r\nCache-Control: no-store",
                                 iconResponse.put()))
                             && iconResponse)
                         {
@@ -816,6 +966,35 @@ namespace agshot
             else if (type == L"clearOcrCache")
             {
                 HandleClearOcrCache();
+            }
+            else if (type == L"importOcrModels")
+            {
+                if (m_hwnd != nullptr)
+                {
+                    // Never invoke a modal IFileOpenDialog synchronously inside a WebView2 callback.
+                    PostMessageW(m_hwnd, kImportModelsPickMsg, 0, 0);
+                }
+            }
+            else if (type == L"dropOcrModels")
+            {
+                if (m_hwnd != nullptr)
+                {
+                    if (IsIconic(m_hwnd))
+                    {
+                        ShowWindow(m_hwnd, SW_RESTORE);
+                    }
+                    BringWindowToTop(m_hwnd);
+                    SetForegroundWindow(m_hwnd);
+                }
+                if (auto droppedPath = ExtractFirstAdditionalFilePath(args); !droppedPath.empty())
+                {
+                    StartImportOcrModels(std::move(droppedPath));
+                }
+                else
+                {
+                    SendResult(L"actionResult", false,
+                               L"Unsupported drop. Drop an OCR model pack (.zip) or manifest.toml file.");
+                }
             }
             else if (type == L"openConfig")
             {
@@ -1049,6 +1228,58 @@ namespace agshot
                 TriggerFallbackToConfig(L"WebView2 Runtime was not found on this system.");
                 return 0;
 
+            case kImportModelsPickMsg:
+                HandlePickOcrModels();
+                return 0;
+
+            case kMoveFocusMsg:
+                if (m_controller && !m_closing && GetForegroundWindow() == hwnd)
+                {
+                    m_controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                }
+                return 0;
+
+            case kImportModelsDoneMsg:
+            {
+                m_importingModels = false;
+                if (m_importThread.joinable())
+                {
+                    m_importThread.join();
+                }
+                std::optional<OcrImportResult> completed;
+                {
+                    std::lock_guard lock(m_importMutex);
+                    completed = std::move(m_importResult);
+                    m_importResult.reset();
+                }
+                if (!m_closing)
+                {
+                    Json::JsonObject idleObj;
+                    idleObj.Insert(L"type", Json::JsonValue::CreateStringValue(L"importState"));
+                    idleObj.Insert(L"busy", Json::JsonValue::CreateBooleanValue(false));
+                    SendJson(idleObj);
+
+                    if (completed)
+                    {
+                        if (completed->ok)
+                        {
+                            const std::wstring msg = completed->packVersion.empty()
+                                ? L"Imported OCR model pack."
+                                : (L"Imported OCR model pack " + completed->packVersion + L".");
+                            SendResult(L"actionResult", true, msg);
+                        }
+                        else
+                        {
+                            SendResult(L"actionResult", false,
+                                       completed->error.empty()
+                                           ? L"Failed to import OCR model pack."
+                                           : completed->error);
+                        }
+                    }
+                }
+                return 0;
+            }
+
             case WM_SIZE:
                 if (m_controller)
                 {
@@ -1059,14 +1290,14 @@ namespace agshot
                 return 0;
 
             case WM_SETFOCUS:
-                if (m_controller)
+                if (m_controller && !m_closing)
                 {
-                    m_controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                    PostMessageW(hwnd, kMoveFocusMsg, 0, 0);
                 }
                 return 0;
 
             case WM_ACTIVATE:
-                if (LOWORD(wparam) != WA_INACTIVE && m_webview)
+                if (LOWORD(wparam) != WA_INACTIVE && m_webview && !m_importingModels)
                 {
                     SendState();
                 }
@@ -1228,6 +1459,13 @@ namespace agshot
                 : (showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
             ShowWindow(m_hwnd, cmd);
             UpdateWindow(m_hwnd);
+
+            // Keep the Settings UI thread's Shell ChangeNotify refcount >= 1 for the
+            // lifetime of this short-lived process. Otherwise comdlg32's IFileOpenDialog::Show()
+            // teardown calls SHChangeNotifyRegisterThread(SCNRT_DISABLE) (1 -> 0) and blocks
+            // synchronously for ~6s whenever Quick Access / Shell namespace has an offline
+            // UNC or virtual-FS (e.g. WinFsp/SSHFS) entry stalled in NtCreateFile.
+            SHChangeNotifyRegisterThread(SCNRT_ENABLE);
 
             StartWebView();
 

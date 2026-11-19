@@ -68,7 +68,7 @@ namespace agshot
 
         void Draw(ID2D1Factory1* factory, ID2D1DeviceContext* context,
                   IDWriteFactory* dwrite, int dpi,
-                  const HudBrushes* brushes = nullptr) const;
+                  const HudBrushes& brushes) const;
 
     private:
         std::wstring ComposedDisplayText() const;
@@ -103,9 +103,6 @@ namespace agshot
 
         mutable ID2D1Factory1* m_strokeFactory{};
         mutable winrt::com_ptr<ID2D1StrokeStyle> m_dashStroke;
-        mutable ID2D1DeviceContext* m_brushContext{};
-        mutable winrt::com_ptr<ID2D1SolidColorBrush> m_scratchBrush;
-        mutable winrt::com_ptr<ID2D1SolidColorBrush> m_whiteBrush;
         mutable std::vector<DWRITE_HIT_TEST_METRICS> m_hitScratch;
     };
 }

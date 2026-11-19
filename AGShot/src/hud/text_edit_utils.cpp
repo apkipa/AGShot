@@ -343,64 +343,28 @@ namespace agshot
         }
     }
 
-    bool CopyTextToClipboard(HWND owner, std::wstring_view text) noexcept
-    {
-        if (text.empty())
-        {
-            return false;
-        }
-        const std::size_t bytes = (text.size() + 1) * sizeof(wchar_t);
-        wil::unique_hglobal mem{ GlobalAlloc(GMEM_MOVEABLE, bytes) };
-        if (!mem)
-        {
-            return false;
-        }
-        {
-            void* dst = GlobalLock(mem.get());
-            if (dst == nullptr)
-            {
-                return false;
-            }
-            std::memcpy(dst, text.data(), text.size() * sizeof(wchar_t));
-            static_cast<wchar_t*>(dst)[text.size()] = L'\0';
-            GlobalUnlock(mem.get());
-        }
-        if (OpenClipboard(owner) == 0)
-        {
-            return false;
-        }
-        auto close = wil::scope_exit([] { CloseClipboard(); });
-        if (EmptyClipboard() == 0)
-        {
-            return false;
-        }
-        if (SetClipboardData(CF_UNICODETEXT, mem.get()) == nullptr)
-        {
-            return false;
-        }
-        mem.release();
-        return true;
-    }
-
     std::wstring ReadTextFromClipboard(HWND owner, bool normalizeNewlines)
     {
-        if (!IsClipboardFormatAvailable(CF_UNICODETEXT) || OpenClipboard(owner) == 0)
+        if (!IsClipboardFormatAvailable(CF_UNICODETEXT))
         {
             return {};
         }
-        auto close = wil::scope_exit([] { CloseClipboard(); });
+        auto clipboard = wil::open_clipboard(owner);
+        if (!clipboard)
+        {
+            return {};
+        }
         HANDLE handle = GetClipboardData(CF_UNICODETEXT);
         if (handle == nullptr)
         {
             return {};
         }
-        const auto* src = static_cast<const wchar_t*>(GlobalLock(handle));
-        if (src == nullptr)
+        wil::unique_hglobal_locked locked{ handle };
+        if (!locked)
         {
             return {};
         }
-        auto unlock = wil::scope_exit([handle] { GlobalUnlock(handle); });
-        std::wstring result(src);
+        std::wstring result(static_cast<const wchar_t*>(locked.get()));
         if (!normalizeNewlines)
         {
             return result;

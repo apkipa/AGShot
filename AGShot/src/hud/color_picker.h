@@ -68,7 +68,6 @@ namespace agshot
         bool suspended() const noexcept { return m_visible && m_suspended; }
         bool hasTextFocus() const noexcept { return visible() && m_activeField != ColorPickerTextField::None; }
         ColorPickerTextField activeField() const noexcept { return m_activeField; }
-        bool HasEditSelection() const noexcept { return m_input.HasSelection(); }
         std::size_t caret() const noexcept { return m_input.caret(); }
         std::size_t anchor() const noexcept { return m_input.anchor(); }
         ColorPickerTarget target() const noexcept { return m_target; }
@@ -109,7 +108,6 @@ namespace agshot
         void EndDrag() noexcept { m_drag = ColorPickerDrag::None; m_input.EndDrag(); }
         void SetPickedPixelColor(D2D1_COLOR_F rgb, int dpi) noexcept;
         void SetFormatMode(ColorFormatMode mode, int dpi) noexcept;
-        bool CloseFormatMenu() noexcept { return m_formatMenu.Close(); }
 
         void CommitTextEdit(bool& outChanged) noexcept;
         void CancelTextEdit(bool& outChanged) noexcept;

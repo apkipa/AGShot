@@ -2,6 +2,7 @@
 
 #include "core/error.h"
 #include "hud/annotation_controller.h"
+#include "hud/color_model.h"
 
 namespace agshot
 {
@@ -12,21 +13,12 @@ namespace agshot
             return (candidate >= kVisibleAlphaThreshold) ? std::clamp(candidate, 0.01f, 1.0f) : 1.0f;
         }
 
-        bool ColorEquals(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b) noexcept
-        {
-            constexpr float kEps = 1e-4f;
-            return std::fabs(a.r - b.r) <= kEps
-                && std::fabs(a.g - b.g) <= kEps
-                && std::fabs(a.b - b.b) <= kEps
-                && std::fabs(a.a - b.a) <= kEps;
-        }
-
         bool LiveEditableStateEquals(const AnnotationItem& a, const AnnotationItem& b) noexcept
         {
             return a.id == b.id
                 && a.stepNumber == b.stepNumber
-                && ColorEquals(a.style.color, b.style.color)
-                && ColorEquals(a.style.fillColor, b.style.fillColor)
+                && SameRgbaColor(a.style.color, b.style.color, 1e-4f)
+                && SameRgbaColor(a.style.fillColor, b.style.fillColor, 1e-4f)
                 && a.style.strokeStyle == b.style.strokeStyle
                 && a.style.mosaicBlockDip == b.style.mosaicBlockDip
                 && std::fabs(a.style.mosaicBlurRadiusDip - b.style.mosaicBlurRadiusDip) <= 0.01f;
@@ -310,13 +302,6 @@ namespace agshot
         state.activeStyle = ToolStyle(AnnotationKind::Shape);
     }
 
-    bool AnnotationController::HitTestTextEditorBorder(
-        POINT point, IDWriteFactory* dwrite, int dpi) const
-    {
-        return m_textEditor.active()
-            && m_textEditor.HitTestZone(point, dwrite, dpi) == TextEditorZone::Border;
-    }
-
     LPCWSTR AnnotationController::CursorForActiveEditor(
         POINT point, IDWriteFactory* dwrite, int dpi) const
     {
@@ -505,68 +490,43 @@ namespace agshot
                     }
                 }
             }
-            else if (action == SubToolbarAction::DistributeH)
-            {
-                std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b)
-                {
-                    const float ca = (a.bounds.left + a.bounds.right) * 0.5f;
-                    const float cb = (b.bounds.left + b.bounds.right) * 0.5f;
-                    if (std::fabs(ca - cb) > 0.01f) return ca < cb;
-                    if (std::fabs(a.bounds.left - b.bounds.left) > 0.01f) return a.bounds.left < b.bounds.left;
-                    return a.id < b.id;
-                });
-                float sumW = 0.0f;
-                for (const Entry& e : entries)
-                {
-                    sumW += (e.bounds.right - e.bounds.left);
-                }
-                const float span = entries.back().bounds.right - entries.front().bounds.left;
-                const float gap = (span - sumW) / static_cast<float>(entries.size() - 1);
-                float cursor = entries.front().bounds.right + gap;
-                for (std::size_t i = 1; i + 1 < entries.size(); ++i)
-                {
-                    const float dx = cursor - entries[i].bounds.left;
-                    if (std::fabs(dx) > kEps)
-                    {
-                        if (AnnotationItem* item = m_doc.FindItem(entries[i].id))
-                        {
-                            MoveAnnotation(*item, dx, 0.0f);
-                            movedAny = true;
-                        }
-                    }
-                    cursor += (entries[i].bounds.right - entries[i].bounds.left) + gap;
-                }
-            }
             else
             {
-                std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b)
+                const bool horiz = (action == SubToolbarAction::DistributeH);
+                const auto axisStart = [horiz](const D2D1_RECT_F& r) noexcept { return horiz ? r.left : r.top; };
+                const auto axisEnd = [horiz](const D2D1_RECT_F& r) noexcept { return horiz ? r.right : r.bottom; };
+
+                std::sort(entries.begin(), entries.end(), [&](const Entry& a, const Entry& b)
                 {
-                    const float ca = (a.bounds.top + a.bounds.bottom) * 0.5f;
-                    const float cb = (b.bounds.top + b.bounds.bottom) * 0.5f;
+                    const float ca = (axisStart(a.bounds) + axisEnd(a.bounds)) * 0.5f;
+                    const float cb = (axisStart(b.bounds) + axisEnd(b.bounds)) * 0.5f;
                     if (std::fabs(ca - cb) > 0.01f) return ca < cb;
-                    if (std::fabs(a.bounds.top - b.bounds.top) > 0.01f) return a.bounds.top < b.bounds.top;
+                    if (std::fabs(axisStart(a.bounds) - axisStart(b.bounds)) > 0.01f)
+                    {
+                        return axisStart(a.bounds) < axisStart(b.bounds);
+                    }
                     return a.id < b.id;
                 });
-                float sumH = 0.0f;
+                float sumSize = 0.0f;
                 for (const Entry& e : entries)
                 {
-                    sumH += (e.bounds.bottom - e.bounds.top);
+                    sumSize += (axisEnd(e.bounds) - axisStart(e.bounds));
                 }
-                const float span = entries.back().bounds.bottom - entries.front().bounds.top;
-                const float gap = (span - sumH) / static_cast<float>(entries.size() - 1);
-                float cursor = entries.front().bounds.bottom + gap;
+                const float span = axisEnd(entries.back().bounds) - axisStart(entries.front().bounds);
+                const float gap = (span - sumSize) / static_cast<float>(entries.size() - 1);
+                float cursor = axisEnd(entries.front().bounds) + gap;
                 for (std::size_t i = 1; i + 1 < entries.size(); ++i)
                 {
-                    const float dy = cursor - entries[i].bounds.top;
-                    if (std::fabs(dy) > kEps)
+                    const float delta = cursor - axisStart(entries[i].bounds);
+                    if (std::fabs(delta) > kEps)
                     {
                         if (AnnotationItem* item = m_doc.FindItem(entries[i].id))
                         {
-                            MoveAnnotation(*item, 0.0f, dy);
+                            MoveAnnotation(*item, horiz ? delta : 0.0f, horiz ? 0.0f : delta);
                             movedAny = true;
                         }
                     }
-                    cursor += (entries[i].bounds.bottom - entries[i].bounds.top) + gap;
+                    cursor += (axisEnd(entries[i].bounds) - axisStart(entries[i].bounds)) + gap;
                 }
             }
 
@@ -1095,15 +1055,6 @@ namespace agshot
             return;
         }
         m_textEditor.Commit(window, m_doc);
-        if (m_interaction == InteractionKind::TextEditor)
-        {
-            m_interaction = InteractionKind::None;
-        }
-    }
-
-    void AnnotationController::CancelTextEditor(HWND window) noexcept
-    {
-        m_textEditor.Cancel(window);
         if (m_interaction == InteractionKind::TextEditor)
         {
             m_interaction = InteractionKind::None;
@@ -1852,7 +1803,7 @@ namespace agshot
     void AnnotationController::DrawOverlayChrome(
         ID2D1Factory1* factory, ID2D1DeviceContext* context,
         IDWriteFactory* dwrite, int dpi,
-        const HudBrushes* brushes)
+        const HudBrushes& brushes)
     {
         if (context == nullptr)
         {
@@ -1866,38 +1817,20 @@ namespace agshot
                 m_doc.items(), m_doc.selectedIds(), hiddenId);
         }
 
-        winrt::com_ptr<ID2D1SolidColorBrush> fallbackBrush;
-        const auto colorBrush = [&](const D2D1_COLOR_F& c) -> ID2D1SolidColorBrush*
-        {
-            if (brushes != nullptr)
-            {
-                return brushes->WithColor(c);
-            }
-            if (!fallbackBrush)
-            {
-                AGSHOT_CHECK_HR(context->CreateSolidColorBrush(c, fallbackBrush.put()));
-            }
-            else
-            {
-                fallbackBrush->SetColor(c);
-            }
-            return fallbackBrush.get();
-        };
-
         if (m_interaction == InteractionKind::MarqueeSelect)
         {
             const D2D1_RECT_F mr = NormalizeAnnotationRect(m_marqueeRect);
             if (mr.right - mr.left >= 1.0f || mr.bottom - mr.top >= 1.0f)
             {
-                context->FillRectangle(mr, colorBrush(D2D1::ColorF(0.18f, 0.49f, 0.94f, 0.16f)));
+                context->FillRectangle(mr, brushes.WithColor(D2D1::ColorF(0.18f, 0.49f, 0.94f, 0.16f)));
                 context->DrawRectangle(
-                    mr, colorBrush(D2D1::ColorF(0.18f, 0.49f, 0.94f, 0.92f)), ScaleByDpi(1.25f, dpi));
+                    mr, brushes.WithColor(D2D1::ColorF(0.18f, 0.49f, 0.94f, 0.92f)), ScaleByDpi(1.25f, dpi));
             }
         }
 
         if (!m_snapGuidesX.empty() || !m_snapGuidesY.empty())
         {
-            ID2D1SolidColorBrush* guideBrush = colorBrush(D2D1::ColorF(0.0f, 0.83f, 1.0f, 0.88f));
+            ID2D1SolidColorBrush* guideBrush = brushes.WithColor(D2D1::ColorF(0.0f, 0.83f, 1.0f, 0.88f));
             const float gw = std::max(1.0f, ScaleByDpi(1.0f, dpi));
             for (float gx : m_snapGuidesX)
             {

@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "core/config.h"
+#include "core/file_io.h"
 #include "core/text.h"
 
 // TODO: Replace toml++ with a minimal [section] + int64/bool/string subset parser/writer to drop ~185-190 KB of Release overhead (~72 KB toml++ code/data plus ~120 KB MSVC <charconv> double Ryu tables pulled in by float formatting/parsing that AGShot never uses).
@@ -8,28 +9,15 @@
 
 namespace agshot
 {
-    // Full path to the running executable, preserving GetLastError() on failure.
+    // Full path to the running executable.
     std::filesystem::path ExecutableFilePath()
     {
-        std::wstring buffer(MAX_PATH, L'\0');
-        for (;;)
+        std::wstring path;
+        if (FAILED(wil::GetModuleFileNameW<std::wstring>(nullptr, path)))
         {
-            const DWORD written = GetModuleFileNameW(
-                nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-            if (written == 0)
-            {
-                const DWORD error = GetLastError();
-                buffer = {};
-                SetLastError(error);
-                return {};
-            }
-            if (written < buffer.size())
-            {
-                buffer.resize(written);
-                return std::filesystem::path{ std::move(buffer) };
-            }
-            buffer.resize(buffer.size() * 2);   // truncated: try again bigger
+            return {};
         }
+        return std::filesystem::path{ std::move(path) };
     }
 
     // Where the executable lives. Data that ships with the application goes
@@ -64,34 +52,6 @@ namespace agshot
                 || (std::filesystem::is_regular_file(exeDir / L"config.toml", ec) && !ec);
         }
 
-        enum class ReadFileStatus
-        {
-            Ok,
-            TooLarge,
-            OpenFailed,
-        };
-
-        ReadFileStatus ReadFileWithLimit(const std::filesystem::path& path,
-                                         std::uintmax_t maxBytes,
-                                         std::string& out)
-        {
-            std::error_code ec;
-            if (const auto size = std::filesystem::file_size(path, ec); !ec && size > maxBytes)
-            {
-                return ReadFileStatus::TooLarge;
-            }
-
-            std::ifstream file{ path, std::ios::binary };
-            if (!file)
-            {
-                return ReadFileStatus::OpenFailed;
-            }
-            std::ostringstream buffer;
-            buffer << file.rdbuf();
-            out = buffer.str();
-            return ReadFileStatus::Ok;
-        }
-
         void AtomicWriteFile(const std::filesystem::path& path, std::string_view text)
         {
             if (!path.parent_path().empty())
@@ -101,16 +61,27 @@ namespace agshot
 
             const std::filesystem::path temp{ path.wstring() + L".tmp" };
             {
-                std::ofstream file{ temp, std::ios::binary | std::ios::trunc };
+                const wil::unique_hfile file{ CreateFileW(
+                    temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, nullptr) };
                 if (!file)
                 {
-                    throw std::system_error{ errno, std::system_category(), "cannot write " + ToUtf8(temp.wstring()) };
+                    throw std::system_error{ static_cast<int>(GetLastError()), std::system_category(),
+                                             "cannot write " + ToUtf8(temp.wstring()) };
                 }
-                file.write(text.data(), static_cast<std::streamsize>(text.size()));
-                file.flush();
-                if (!file)
+
+                std::size_t offset = 0;
+                while (offset < text.size())
                 {
-                    throw std::system_error{ errno, std::system_category(), "cannot write " + ToUtf8(temp.wstring()) };
+                    const DWORD chunk = static_cast<DWORD>(
+                        std::min<std::size_t>(text.size() - offset, 64u * 1024u * 1024u));
+                    DWORD written = 0;
+                    if (!WriteFile(file.get(), text.data() + offset, chunk, &written, nullptr) || written == 0)
+                    {
+                        throw std::system_error{ static_cast<int>(GetLastError()), std::system_category(),
+                                                 "cannot write " + ToUtf8(temp.wstring()) };
+                    }
+                    offset += written;
                 }
             }
 
@@ -194,13 +165,15 @@ namespace agshot
         // not our file, and slurping it into memory would be the bug.
         constexpr std::uintmax_t kMaxConfigBytes = 1024 * 1024;
         std::string content;
-        switch (ReadFileWithLimit(path, kMaxConfigBytes, content))
+        switch (ReadFileBounded(path, kMaxConfigBytes, content))
         {
         case ReadFileStatus::TooLarge:
             result.ok = false;
             result.error = L"the file is larger than 1 MB, so it is not an AGShot configuration";
             return result;
+        case ReadFileStatus::NotFound:
         case ReadFileStatus::OpenFailed:
+        case ReadFileStatus::ReadFailed:
             result.ok = false;
             result.error = L"could not open " + path.wstring();
             return result;
@@ -381,7 +354,7 @@ namespace agshot
             return state;
         }
         std::string content;
-        if (ReadFileWithLimit(path, 64 * 1024, content) != ReadFileStatus::Ok)
+        if (ReadFileBounded(path, 64 * 1024, content) != ReadFileStatus::Ok)
         {
             return state;
         }

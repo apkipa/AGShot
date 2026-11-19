@@ -46,6 +46,8 @@ namespace agshot
 
         void Start(const std::filesystem::path& models,
                    const std::filesystem::path& cache);
+        void Reload(const std::filesystem::path& models,
+                    const std::filesystem::path& cache);
         bool available() const noexcept;
         bool hasLoadedEngine() const noexcept;
         bool hasInitializationError() const noexcept;

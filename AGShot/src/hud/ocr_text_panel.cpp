@@ -120,7 +120,9 @@ namespace agshot
 
             const bool canRecognize = runtime != nullptr && runtime->available();
             m_pending = false;
-            m_text = canRecognize ? std::wstring{} : L"OCR models are unavailable.";
+            m_text = canRecognize
+                ? std::wstring{}
+                : L"OCR models are not installed.\r\nOpen Settings -> OCR to import a model pack.";
             if (canRecognize && !image.empty())
             {
                 const RECT& imageRegion = image.region();

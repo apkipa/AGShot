@@ -27,5 +27,6 @@ export interface HostState {
 
 export type HostMessage =
   | HostState
+  | { type: 'importState'; busy: boolean }
   | { type: 'hotkeyResult'; ok: boolean; message: string; state?: HostState }
   | { type: 'actionResult'; ok: boolean; message: string; state?: HostState };

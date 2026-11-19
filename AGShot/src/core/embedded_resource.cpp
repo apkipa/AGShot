@@ -113,13 +113,12 @@ namespace agshot
         }
         if (size > 0)
         {
-            void* locked = GlobalLock(memory.get());
-            if (locked == nullptr)
+            wil::unique_hglobal_locked locked{ memory.get() };
+            if (!locked)
             {
                 return HRESULT_FROM_WIN32(GetLastError());
             }
-            std::memcpy(locked, data, size);
-            GlobalUnlock(memory.get());
+            std::memcpy(locked.get(), data, size);
         }
 
         winrt::com_ptr<IStream> stream;

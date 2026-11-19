@@ -41,8 +41,31 @@ namespace agshot
     std::filesystem::path FindLocalOcrModelDirectory(const std::filesystem::path& dataDirectory,
                                                      const std::filesystem::path& executableDirectory) noexcept;
 
+    struct OcrImportResult
+    {
+        bool ok{};
+        std::wstring packVersion;
+        std::filesystem::path installedDir;
+        std::wstring error;
+    };
+
     // Reads and validates `<ocrDirectory>/manifest.toml` (pack_format, asset
     // filenames, and SHA-256 format). Throws std::runtime_error with a clear
     // diagnostic message on mismatch.
     OcrModelPack LoadOcrModelManifest(const std::filesystem::path& ocrDirectory);
+
+    // Computes the lowercase hex SHA-256 digest of a regular file via Windows CNG.
+    bool ComputeFileSha256Hex(const std::filesystem::path& path,
+                              std::string& outHex,
+                              std::wstring& outError);
+
+    // Validates manifest.toml AND checks actual SHA-256 digests of det, rec, and dict.
+    // Throws std::runtime_error on any mismatch or missing/corrupted asset.
+    OcrModelPack LoadAndVerifyOcrModelPack(const std::filesystem::path& ocrDirectory);
+
+    // Imports an OCR model pack from either a .zip archive or a manifest.toml file
+    // into `<targetDataDir>/models/ocr`, verifying manifest + SHA-256 digests before
+    // atomically swapping the directory into place.
+    OcrImportResult ImportOcrModelPack(const std::filesystem::path& sourcePath,
+                                       const std::filesystem::path& targetDataDir) noexcept;
 }

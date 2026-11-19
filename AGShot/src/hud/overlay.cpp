@@ -2013,7 +2013,7 @@ namespace agshot
                     context,
                     m_device.dwriteFactory(),
                     m_device.dpi(),
-                    &m_device.brushes());
+                    m_device.brushes());
             }
         }
 

@@ -84,7 +84,7 @@
       <GenerateWindowsMetadata>false</GenerateWindowsMetadata>
       <!-- windowscodecs and psapi come from OcrEngine: it decodes images through
            WIC and reports process memory through PSAPI. -->
-      <AdditionalDependencies>d2d1.lib;d3d11.lib;dcomp.lib;dwrite.lib;dxgi.lib;dxguid.lib;imm32.lib;shell32.lib;comctl32.lib;ole32.lib;gdi32.lib;dwmapi.lib;uiautomationcore.lib;windowscodecs.lib;psapi.lib;cabinet.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d2d1.lib;d3d11.lib;dcomp.lib;dwrite.lib;dxgi.lib;dxguid.lib;imm32.lib;bcrypt.lib;shell32.lib;comctl32.lib;ole32.lib;gdi32.lib;dwmapi.lib;uiautomationcore.lib;windowscodecs.lib;psapi.lib;cabinet.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(IntDir)frontend;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -117,6 +117,7 @@
     <ClInclude Include="resource.h" />
     <ClInclude Include="src\pch.h" />
     <ClInclude Include="src\core\app_ipc.h" />
+    <ClInclude Include="src\core\clipboard.h" />
     <ClInclude Include="src\core\config.h" />
     <ClInclude Include="src\core\config_watcher.h" />
     <ClInclude Include="src\core\memory_watch.h" />
@@ -124,6 +125,7 @@
     <ClInclude Include="src\core\ocr_runtime.h" />
     <ClInclude Include="src\core\embedded_resource.h" />
     <ClInclude Include="src\core\error.h" />
+    <ClInclude Include="src\core\file_io.h" />
     <ClInclude Include="src\core\hotkey.h" />
     <ClInclude Include="src\core\icon_pack.h" />
     <ClInclude Include="src\core\text.h" />
@@ -162,7 +164,6 @@
     <ClCompile Include="src\core\error.cpp" />
     <ClCompile Include="src\core\hotkey.cpp" />
     <ClCompile Include="src\core\icon_pack.cpp" />
-    <ClCompile Include="src\core\text.cpp" />
     <ClCompile Include="src\core\tray_icon.cpp" />
     <ClCompile Include="src\core\screen_capture.cpp" />
     <ClCompile Include="src\core\ui_element.cpp" />
@@ -198,7 +199,6 @@
     <None Include="scripts\compress_mszip.ps1" />
     <None Include="scripts\gen_build_info.ps1" />
     <None Include="assets\icons\manifest.json" />
-    <None Include="assets\icons\*.svg" />
     <None Include="frontend\index.html" />
     <None Include="frontend\package.json" />
     <None Include="frontend\pnpm-lock.yaml" />
@@ -222,10 +222,6 @@
     <Import Project="..\packages\Microsoft.Windows.CppWinRT.3.0.260818.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('..\packages\Microsoft.Windows.CppWinRT.3.0.260818.1\build\native\Microsoft.Windows.CppWinRT.targets')" />
     <Import Project="..\packages\Microsoft.Web.WebView2.1.0.4314.35\build\native\Microsoft.Web.WebView2.targets" Condition="Exists('..\packages\Microsoft.Web.WebView2.1.0.4314.35\build\native\Microsoft.Web.WebView2.targets')" />
   </ImportGroup>
-  <ItemGroup>
-    <SettingsUiInput Include="frontend\index.html;frontend\package.json;frontend\pnpm-lock.yaml;frontend\tsconfig.json;frontend\vite.config.ts;frontend\src\**\*;scripts\compress_mszip.ps1" />
-    <HudIconInput Include="assets\icons\*.svg;assets\icons\manifest.json;scripts\bake_icons.mjs;scripts\compress_mszip.ps1" />
-  </ItemGroup>
   <Target Name="GenerateHudIconHeader"
           BeforeTargets="ClCompile"
           Inputs="assets\icons\manifest.json;scripts\bake_icons.mjs"
@@ -233,8 +229,17 @@
     <MakeDir Directories="$(IntDir)generated" />
     <Exec Command="node &quot;$(ProjectDir)scripts\bake_icons.mjs&quot; --header-only --icons-dir &quot;$(ProjectDir)assets\icons&quot; --header-out &quot;$([System.IO.Path]::GetFullPath('$(IntDir)generated\hud_icon_ids.h'))&quot;" />
   </Target>
+  <Target Name="CollectHudIconInputs">
+    <ItemGroup>
+      <HudIconInput Include="assets\icons\*.svg" />
+      <HudIconInput Include="assets\icons\manifest.json" />
+      <HudIconInput Include="scripts\bake_icons.mjs" />
+      <HudIconInput Include="scripts\compress_mszip.ps1" />
+    </ItemGroup>
+  </Target>
   <Target Name="BakeHudIcons"
           BeforeTargets="ResourceCompile"
+          DependsOnTargets="CollectHudIconInputs"
           Inputs="@(HudIconInput)"
           Outputs="$(IntDir)generated\icons.pack;$(IntDir)frontend\icons.mszip">
     <MakeDir Directories="$(IntDir)generated;$(IntDir)frontend" />
@@ -247,8 +252,20 @@
     <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\gen_build_info.ps1&quot; -RepoRoot &quot;$([System.IO.Path]::GetFullPath('$(SolutionDir).'))&quot; -OutputPath &quot;$([System.IO.Path]::GetFullPath('$(IntDir)generated\build_info.h'))&quot;"
           StandardOutputImportance="low" />
   </Target>
+  <Target Name="CollectSettingsUiInputs">
+    <ItemGroup>
+      <SettingsUiInput Include="frontend\index.html" />
+      <SettingsUiInput Include="frontend\package.json" />
+      <SettingsUiInput Include="frontend\pnpm-lock.yaml" />
+      <SettingsUiInput Include="frontend\tsconfig.json" />
+      <SettingsUiInput Include="frontend\vite.config.ts" />
+      <SettingsUiInput Include="frontend\src\**\*" />
+      <SettingsUiInput Include="scripts\compress_mszip.ps1" />
+    </ItemGroup>
+  </Target>
   <Target Name="BuildSettingsUi"
           BeforeTargets="ResourceCompile"
+          DependsOnTargets="CollectSettingsUiInputs"
           Inputs="@(SettingsUiInput)"
           Outputs="$(IntDir)frontend\settings.mszip">
     <MakeDir Directories="$(IntDir)frontend" />

@@ -1,5 +1,6 @@
 #include "pch.h"
 
+#include "core/clipboard.h"
 #include "core/error.h"
 #include "core/screen_capture.h"
 
@@ -136,43 +137,10 @@ namespace agshot
 
         const int width = clipped.right - clipped.left;
         const int height = clipped.bottom - clipped.top;
-        const std::size_t pixelBytes = static_cast<std::size_t>(width) * height * 4;
-
-        // One block holding the header and the pixels together, because that is
-        // the shape CF_DIB has on the clipboard.
-        wil::unique_hglobal block{ GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + pixelBytes) };
-        AGSHOT_CHECK_WIN32(block != nullptr);
-
-        BYTE* target = static_cast<BYTE*>(GlobalLock(block.get()));
-        AGSHOT_CHECK_WIN32(target != nullptr);
-
-        BITMAPINFOHEADER header{};
-        header.biSize = sizeof(BITMAPINFOHEADER);
-        header.biWidth = width;
-        header.biHeight = height;   // positive: bottom-up, which is what CF_DIB means
-        header.biPlanes = 1;
-        header.biBitCount = 32;
-        header.biCompression = BI_RGB;
-        std::memcpy(target, &header, sizeof(header));
-
-        // The picture is top-down and CF_DIB is bottom-up, so the rows are walked
-        // backwards on the way out.
-        BYTE* out = target + sizeof(BITMAPINFOHEADER);
-        for (int row = 0; row < height; ++row)
-        {
-            const int sourceRow = clipped.top - m_region.top + (height - 1 - row);
-            const BYTE* source = m_bits
-                + (static_cast<std::size_t>(sourceRow) * m_width + (clipped.left - m_region.left)) * 4;
-            std::memcpy(out + static_cast<std::size_t>(row) * width * 4, source,
-                        static_cast<std::size_t>(width) * 4);
-        }
-
-        GlobalUnlock(block.get());
-
-        AGSHOT_CHECK_WIN32(OpenClipboard(owner) != 0);
-        auto closeClipboard = wil::scope_exit([] { CloseClipboard(); });
-        AGSHOT_CHECK_WIN32(EmptyClipboard() != 0);
-        AGSHOT_CHECK_WIN32(SetClipboardData(CF_DIB, block.get()) != nullptr);
-        block.release(); // the clipboard owns the block from here on
+        const std::size_t rowPitch = static_cast<std::size_t>(m_width) * 4;
+        const BYTE* topLeft = m_bits
+            + static_cast<std::size_t>(clipped.top - m_region.top) * rowPitch
+            + static_cast<std::size_t>(clipped.left - m_region.left) * 4;
+        CopyBgraToClipboard(owner, topLeft, width, height, rowPitch);
     }
 }

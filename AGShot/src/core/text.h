@@ -1,13 +1,20 @@
 #pragma once
 
+#include <winrt/base.h>
+
 #include <string>
 #include <string_view>
 
-// Windows speaks UTF-16, TOML and most on-disk formats speak UTF-8. These two
-// conversions are needed by both the config and the error reporter, so they live
-// in one place instead of once per module.
+// Thin UTF-8 <-> UTF-16 wrappers backed directly by C++/WinRT (winrt::to_string / winrt::to_hstring).
 namespace agshot
 {
-    std::string ToUtf8(std::wstring_view text);
-    std::wstring FromUtf8(std::string_view text);
+    inline std::string ToUtf8(std::wstring_view text)
+    {
+        return winrt::to_string(text);
+    }
+
+    inline std::wstring FromUtf8(std::string_view text)
+    {
+        return std::wstring{ winrt::to_hstring(text) };
+    }
 }

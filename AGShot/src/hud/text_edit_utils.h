@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/clipboard.h"
+
 #include <windows.h>
 
 #include <cstddef>
@@ -82,7 +84,6 @@ namespace agshot
                       std::size_t& ioAnchor, std::size_t& ioCaret) const noexcept;
     };
 
-    bool CopyTextToClipboard(HWND owner, std::wstring_view text) noexcept;
     std::wstring ReadTextFromClipboard(HWND owner, bool normalizeNewlines);
     bool CanPasteTextFromClipboard() noexcept;
 

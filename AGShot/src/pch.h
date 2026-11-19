@@ -7,6 +7,7 @@
 #endif
 #include <windowsx.h>
 #include <unknwn.h>
+#include <bcrypt.h>
 #include <commctrl.h>
 #include <compressapi.h>
 #include <dwmapi.h>
@@ -25,6 +26,8 @@
 
 // WIL / WebView2 / C++/WinRT
 #include <wil/resource.h>
+#include <wil/stl.h>
+#include <wil/win32_helpers.h>
 #include <WebView2.h>
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>

@@ -83,6 +83,7 @@
                 </div>
                 <div class="card-actions">
                   <button id="trim-ocr-btn" class="btn hidden" type="button">Unload</button>
+                  <button id="import-models-btn" class="btn" type="button">Import...</button>
                   <button id="open-models-btn" class="btn" type="button">Models folder</button>
                 </div>
               </div>
@@ -179,6 +180,9 @@
 
       <div id="toast-stack" class="toast-stack" role="status" aria-live="polite"></div>
     </main>
+  </div>
+  <div id="drop-overlay" class="drop-overlay" aria-hidden="true">
+    <div class="drop-overlay-card">Drop OCR model pack (.zip or manifest.toml) to import</div>
   </div>
   <script type="module" src="/src/main.ts"></script>
 </body>
