@@ -17,6 +17,7 @@
 // DirectX / Direct2D / DirectWrite / DirectComposition
 #include <d2d1_1.h>
 #include <d2d1_3.h>
+#include <d2d1effects.h>
 #include <d3d11.h>
 #include <dcomp.h>
 #include <dwrite.h>

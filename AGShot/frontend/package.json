@@ -9,6 +9,7 @@
     "check": "tsc --noEmit"
   },
   "devDependencies": {
+    "pathkit-wasm": "^1.0.0",
     "typescript": "^5.8.2",
     "vite": "^6.2.0",
     "vite-plugin-singlefile": "^2.2.0"

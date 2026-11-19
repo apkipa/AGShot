@@ -13,51 +13,6 @@ interface ToastEntry {
 const MAX_VISIBLE = 3;
 const GAP = 8;
 
-function createToastIcon(kind: ToastKind): SVGSVGElement {
-  const svgNS = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(svgNS, 'svg');
-  svg.setAttribute('viewBox', '0 0 16 16');
-  svg.setAttribute('width', '16');
-  svg.setAttribute('height', '16');
-  svg.setAttribute('fill', 'none');
-
-  const path = document.createElementNS(svgNS, 'path');
-  path.setAttribute('stroke', 'currentColor');
-  path.setAttribute('stroke-width', '1.6');
-  path.setAttribute('stroke-linecap', 'round');
-  path.setAttribute('stroke-linejoin', 'round');
-
-  if (kind === 'ok') {
-    const c = document.createElementNS(svgNS, 'circle');
-    c.setAttribute('cx', '8');
-    c.setAttribute('cy', '8');
-    c.setAttribute('r', '6.2');
-    c.setAttribute('stroke', 'currentColor');
-    c.setAttribute('stroke-width', '1.5');
-    svg.appendChild(c);
-    path.setAttribute('d', 'M5.4 8.1l1.8 1.8 3.5-3.6');
-  } else if (kind === 'warn') {
-    path.setAttribute('d', 'M8 2.4L14 13H2L8 2.4ZM8 6.4v3.1');
-    const dot = document.createElementNS(svgNS, 'circle');
-    dot.setAttribute('cx', '8');
-    dot.setAttribute('cy', '11.4');
-    dot.setAttribute('r', '0.75');
-    dot.setAttribute('fill', 'currentColor');
-    svg.appendChild(dot);
-  } else {
-    const c = document.createElementNS(svgNS, 'circle');
-    c.setAttribute('cx', '8');
-    c.setAttribute('cy', '8');
-    c.setAttribute('r', '6.2');
-    c.setAttribute('stroke', 'currentColor');
-    c.setAttribute('stroke-width', '1.5');
-    svg.appendChild(c);
-    path.setAttribute('d', 'M6 6l4 4M10 6l-4 4');
-  }
-  svg.appendChild(path);
-  return svg;
-}
-
 export function createToastDeck(stackEl: HTMLElement) {
   const toasts: ToastEntry[] = [];
   let expanded = false;
@@ -159,9 +114,9 @@ export function createToastDeck(stackEl: HTMLElement) {
     el.className = `toast ${kind}`;
 
     const icon = document.createElement('span');
-    icon.className = 'toast-icon';
+    icon.className = 'toast-icon ui-icon';
+    icon.style.setProperty('--icon', `url('/icons/toast_${kind}.svg')`);
     icon.setAttribute('aria-hidden', 'true');
-    icon.appendChild(createToastIcon(kind));
 
     const textEl = document.createElement('span');
     textEl.className = 'toast-text';
@@ -171,19 +126,11 @@ export function createToastDeck(stackEl: HTMLElement) {
     closeBtn.className = 'toast-close';
     closeBtn.type = 'button';
     closeBtn.setAttribute('aria-label', 'Dismiss');
-    const svgNS = 'http://www.w3.org/2000/svg';
-    const closeSvg = document.createElementNS(svgNS, 'svg');
-    closeSvg.setAttribute('viewBox', '0 0 12 12');
-    closeSvg.setAttribute('width', '12');
-    closeSvg.setAttribute('height', '12');
-    closeSvg.setAttribute('fill', 'none');
-    const closePath = document.createElementNS(svgNS, 'path');
-    closePath.setAttribute('d', 'M3 3l6 6M9 3l-6 6');
-    closePath.setAttribute('stroke', 'currentColor');
-    closePath.setAttribute('stroke-width', '1.5');
-    closePath.setAttribute('stroke-linecap', 'round');
-    closeSvg.appendChild(closePath);
-    closeBtn.appendChild(closeSvg);
+    const closeIcon = document.createElement('span');
+    closeIcon.className = 'ui-icon';
+    closeIcon.style.setProperty('--icon', "url('/icons/cancel.svg')");
+    closeIcon.setAttribute('aria-hidden', 'true');
+    closeBtn.appendChild(closeIcon);
 
     el.append(icon, textEl, closeBtn);
     stackEl.appendChild(el);

@@ -3,6 +3,9 @@
 #include "hud/overlay.h"
 
 #include "core/error.h"
+#include "hud/color_model.h"
+
+#include <imm.h>
 
 namespace agshot
 {
@@ -11,9 +14,6 @@ namespace agshot
         constexpr wchar_t kOverlayClass[] = L"AGShot.Overlay";
         constexpr wchar_t kOverlayTitle[] = L"AGShot";
 
-        // No frame, no taskbar button, never in Alt+Tab, and no redirection bitmap
-        // so that DirectComposition owns every pixel - including the alpha that
-        // makes the rest of the screen show through.
         constexpr DWORD kOverlayStyle = WS_POPUP;
         constexpr DWORD kOverlayExStyle =
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
@@ -59,10 +59,6 @@ namespace agshot
                 return DefWindowProcW(hwnd, message, wparam, lparam);
             }
 
-            // DispatchMessageW has no handler above it, so an exception escaping a
-            // message handler would not unwind: the CRT would call abort(). Unlike
-            // the main window, a fault here does not have to kill the application -
-            // the HUD can simply step out of the way and let the user try again.
             try
             {
                 return overlay->HandleMessage(hwnd, message, wparam, lparam);
@@ -74,6 +70,25 @@ namespace agshot
                 return 0;
             }
         }
+    }
+
+    Overlay::Overlay()
+    {
+        m_eyedropperLayer.owner = this;
+        m_colorPickerLayer.owner = this;
+        m_toolbarController.Bind(this, &m_annotController, &m_device, &m_toolMode);
+        m_textEditorLayer.owner = this;
+        m_ocrLayer.owner = this;
+        m_canvasLayer.owner = this;
+
+        // Single Z-Order registry (front-to-back) driving hit-test, hover,
+        // light-dismiss, pointer/keyboard/wheel dispatch, cursor, and IME.
+        m_layerStack.Register(&m_eyedropperLayer);
+        m_layerStack.Register(&m_colorPickerLayer);
+        m_layerStack.Register(&m_toolbarController);
+        m_layerStack.Register(&m_textEditorLayer);
+        m_layerStack.Register(&m_ocrLayer);
+        m_layerStack.Register(&m_canvasLayer);
     }
 
     Overlay::~Overlay()
@@ -142,12 +157,18 @@ namespace agshot
     {
         StopSelectionAnimation();
         m_clock.Stop();
+        m_layerStack.ResetTransientState();
+        m_annotController.ResetSession(m_window);
+        m_annotController.DiscardDeviceResources();
+        m_colorPicker.DiscardDeviceResources();
+        m_toolbarController.InvalidateLayouts();
         m_ocrPanel.Destroy(m_window);
         m_renderer.DiscardIndependentResources();
         m_memoryWatch.Destroy();
         m_device.Destroy();
         if (m_window != nullptr)
         {
+            ImmAssociateContextEx(m_window, nullptr, IACE_DEFAULT);
             SetWindowLongPtrW(m_window, GWLP_USERDATA, 0);
             DestroyWindow(m_window);
             m_window = nullptr;
@@ -161,6 +182,8 @@ namespace agshot
     HRESULT Overlay::RecoverDeviceResources() noexcept
     {
         m_ocrPanel.InvalidateSpinner();
+        m_annotController.DiscardDeviceResources();
+        m_colorPicker.DiscardDeviceResources();
         m_renderer.DiscardIndependentResources();
         const HRESULT hr = m_device.Recover(m_width, m_height);
         if (FAILED(hr))
@@ -189,17 +212,23 @@ namespace agshot
         return RECT{ 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
     }
 
+    ui::LayoutEnv Overlay::CurrentLayoutEnv() const noexcept
+    {
+        return ui::LayoutEnv{ ClientBounds(), m_device.dpi() };
+    }
+
+    int Overlay::EffectiveHandleSize(ui::PointerKind kind) const noexcept
+    {
+        if (kind == ui::PointerKind::Touch)
+        {
+            return std::max(m_handleSize, MulDiv(18, m_device.dpi(), 96));
+        }
+        return m_handleSize;
+    }
+
     void Overlay::Begin()
     {
-        if (m_window == nullptr || m_beginning)
-        {
-            return;
-        }
-
-        // Already up: a second press has nothing to add. Freezing again would
-        // mean hiding the overlay to photograph the screen without it, and the
-        // picture the user is already looking at is the one they meant.
-        if (IsWindowVisible(m_window))
+        if (m_window == nullptr || m_beginning || IsWindowVisible(m_window))
         {
             return;
         }
@@ -224,9 +253,6 @@ namespace agshot
                          SWP_NOACTIVATE);
         }
 
-        // Freeze the screen pixels immediately while the overlay is hidden, then
-        // snapshot window bounds (with UIA COM setup deferred) and upload into
-        // the warm background bitmap.
         m_image.Capture(m_bounds);
         m_picker.Freeze(m_window);
         m_ladder.clear();
@@ -255,18 +281,23 @@ namespace agshot
         m_animationStart = 0;
         m_hasSelection = false;
         m_smart = true;
-        m_mode = OperationMode::EditSelection;
+        m_toolMode = ToolbarButton::EditSelection;
+        m_annotController.ResetSession(m_window);
+        m_colorPicker.Close();
+        m_toolbarController.Reset();
+        m_pickerAnchorAction = SubToolbarAction::None;
+        m_eyedropperActive = false;
         m_ocrPanel.ResetSession();
         m_depth = 0;
-        m_dragMode = DragMode::None;
+        m_canvasDrag = CanvasDrag::None;
         m_dragPart = SelectionPart::None;
-        m_pressedButton = ToolbarButton::None;
+        m_lastClickMs = 0;
         m_pendingConfirm = false;
-        m_toolbarVisible = false;
-        m_toolbar.hovered = ToolbarButton::None;
+        m_reselectPending = false;
+        m_layerStack.ResetTransientState();
+        m_canvasWheelAccum.Reset();
+        SyncImeState();
 
-        // Resolve and draw the initial suggestion while hidden so the very first
-        // visible frame already has both the frozen desktop and smart selection.
         POINT cursor{};
         if (GetCursorPos(&cursor))
         {
@@ -282,8 +313,6 @@ namespace agshot
             return;
         }
 
-        // Activating is deliberate: the overlay needs the keyboard for Escape and
-        // Return, and the mouse for everything else.
         SetWindowPos(m_window, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
         SetForegroundWindow(m_window);
@@ -301,21 +330,24 @@ namespace agshot
         m_clock.Cancel();
         ShowWindow(m_window, SW_HIDE);
 
+        m_annotController.ResetSession(m_window);
+        m_colorPicker.Close();
+        m_toolbarController.Reset();
+        m_pickerAnchorAction = SubToolbarAction::None;
+        m_eyedropperActive = false;
+
         m_hasSelection = false;
         m_smart = true;
+        m_toolMode = ToolbarButton::EditSelection;
         m_depth = 0;
-        m_dragMode = DragMode::None;
+        m_canvasDrag = CanvasDrag::None;
         m_dragPart = SelectionPart::None;
-        m_pressedButton = ToolbarButton::None;
         m_pendingConfirm = false;
-        m_toolbarVisible = false;
-        m_toolbar.hovered = ToolbarButton::None;
+        m_reselectPending = false;
+        m_layerStack.ResetTransientState();
+        m_canvasWheelAccum.Reset();
+        SyncImeState();
 
-        // Always drop cross-process UIA element proxies and per-session text
-        // state, and trim the virtual surface back to uncommitted so stale
-        // pixels cannot flash on the next F1, while keeping the capture bitmap,
-        // background texture, and loaded NPU OCR engine warm unless memory or
-        // VRAM is tight.
         m_picker.Clear();
         m_ladder.clear();
         m_ocrPanel.CancelSession(m_window);
@@ -338,7 +370,6 @@ namespace agshot
         }
         m_lastQuery = now;
 
-        // TODO: Consider resetting m_depth when the pointer moves to a different candidate.
         const POINT screen{ point.x + m_bounds.left, point.y + m_bounds.top };
         if (m_picker.Ladder(screen, m_ladder, expansionBudget) < 0)
         {
@@ -385,12 +416,10 @@ namespace agshot
             m_displaySelection = target;
             return;
         }
-
         if (m_animatingSelection && EqualRect(&m_animationTo, &target))
         {
             return;
         }
-
         if (EqualRect(&m_displaySelection, &target))
         {
             StopSelectionAnimation();
@@ -410,13 +439,8 @@ namespace agshot
         }
     }
 
-    // TODO(render): there is no dirty tracking behind this. Render() always
-    // redraws the whole surface - the update rect handed to BeginDraw is the
-    // full client area, never a sub-rectangle.
     void Overlay::RequestRender()
     {
-        // Never commit frames while hidden or without a captured desktop:
-        // Begin() renders synchronously once the background bitmap is ready.
         if (m_window == nullptr || !IsWindowVisible(m_window) || !m_device.hasBackground())
         {
             return;
@@ -472,145 +496,275 @@ namespace agshot
         m_animatingSelection = false;
     }
 
-    Overlay::HitTarget Overlay::HitTest(POINT point) const noexcept
-    {
-        if (m_toolbarVisible)
-        {
-            const ToolbarHitTarget target = HitTestToolbarTarget(m_toolbar, point);
-            if (target == ToolbarHitTarget::Handle) return HitTarget::ToolbarHandle;
-            if (target == ToolbarHitTarget::Panel) return HitTarget::ToolbarPanel;
-            if (target != ToolbarHitTarget::None) return HitTarget::ToolbarButton;
-        }
-
-        if (!m_hasSelection)
-        {
-            return HitTarget::Canvas;
-        }
-
-        if (m_mode == OperationMode::TextRecognition)
-        {
-            const RECT track = m_ocrPanel.ScrollTrack(m_selection, m_device.dpi());
-            if (m_ocrPanel.HasScrollbar(m_selection, m_device.dpi(),
-                                        m_device.dwriteFactory(), m_device.textFormat())
-                && PtInRect(&track, point))
-            {
-                return HitTarget::OcrScrollbar;
-            }
-            return PtInRect(&m_selection, point) ? HitTarget::OcrText : HitTarget::Canvas;
-        }
-
-        if (!m_smart)
-        {
-            const SelectionPart part = HitTestSelection(m_selection, point, m_handleSize);
-            if (part == SelectionPart::Body)
-            {
-                return HitTarget::Selection;
-            }
-            if (part != SelectionPart::None)
-            {
-                return HitTarget::SelectionHandle;
-            }
-        }
-
-        return PtInRect(&m_selection, point) ? HitTarget::Selection : HitTarget::Canvas;
-    }
-
-    LPCWSTR Overlay::CursorShapeForPoint(POINT point) const noexcept
-    {
-        if (m_dragMode == DragMode::MoveOrResize)
-        {
-            return CursorForPart(m_dragPart);
-        }
-        if (m_dragMode == DragMode::ToolbarMove)
-        {
-            return IDC_SIZEALL;
-        }
-        if (m_dragMode == DragMode::NewRectangle)
-        {
-            return IDC_CROSS;
-        }
-
-        switch (HitTest(point))
-        {
-        case HitTarget::ToolbarHandle:
-            return IDC_SIZEALL;
-        case HitTarget::ToolbarButton:
-            return IDC_HAND;
-        case HitTarget::ToolbarPanel:
-        case HitTarget::OcrScrollbar:
-            return IDC_ARROW;
-        case HitTarget::OcrText:
-            return IDC_IBEAM;
-        case HitTarget::SelectionHandle:
-            return CursorForPart(HitTestSelection(m_selection, point, m_handleSize));
-        case HitTarget::Selection:
-            return m_smart ? IDC_CROSS : IDC_SIZEALL;
-        case HitTarget::Canvas:
-        default:
-            return m_mode == OperationMode::TextRecognition ? IDC_ARROW : IDC_CROSS;
-        }
-    }
-
     void Overlay::ApplyCursor()
     {
         if (m_window == nullptr || !IsWindowVisible(m_window))
         {
             return;
         }
-
-        POINT point{};
-        if (!GetCursorPos(&point))
-        {
-            return;
-        }
-        ScreenToClient(m_window, &point);
-
-        const RECT bounds = ClientBounds();
-        if (!PtInRect(&bounds, point))
-        {
-            return;
-        }
-        SetCursor(LoadCursorW(nullptr, CursorShapeForPoint(point)));
+        SetCursor(LoadCursorW(nullptr, m_layerStack.ResolveCursor(m_pointer)));
     }
 
-    void Overlay::UpdateHover(POINT point)
+    void Overlay::SyncImeState() noexcept
     {
-        const ToolbarButton button = m_toolbarVisible
-            ? HitTestToolbar(m_toolbar, point)
-            : ToolbarButton::None;
-
-        if (button != m_toolbar.hovered)
+        if (m_window == nullptr)
         {
-            m_toolbar.hovered = button;
+            return;
         }
+        ImmAssociateContextEx(m_window, nullptr, m_layerStack.ResolveWantIme() ? IACE_DEFAULT : 0);
+    }
+
+    void Overlay::OnToolbarMoved()
+    {
+        if (m_colorPicker.isOpen())
+        {
+            m_colorPicker.Arrange(
+                ui::AnchorSpec{
+                    m_toolbarController.PickerAnchorRect(m_pickerAnchorAction),
+                    m_toolbarController.PickerAvoidBand(),
+                    7 },
+                CurrentLayoutEnv());
+        }
+    }
+
+    ToolbarState Overlay::CurrentToolbarState() const noexcept
+    {
+        ToolbarState state{};
+        state.activeMode = m_toolMode;
+        state.activePicker = m_colorPicker.isOpen() ? m_colorPicker.target() : ColorPickerTarget::None;
+        state.mosaicEffectMenuOpen = m_toolbarController.isMosaicMenuOpen();
+        m_annotController.PopulateToolbarState(state, m_toolMode);
+        return state;
+    }
+
+    void Overlay::RunLayout()
+    {
+        const ui::LayoutEnv env = CurrentLayoutEnv();
+        m_toolbarController.LayoutSub(CurrentToolbarState(), env);
+        if (m_colorPicker.isOpen())
+        {
+            m_colorPicker.Arrange(
+                ui::AnchorSpec{
+                    m_toolbarController.PickerAnchorRect(m_pickerAnchorAction),
+                    m_toolbarController.PickerAvoidBand(),
+                    7 },
+                env);
+        }
+        if (!m_layerStack.hasCapture()
+            && !m_colorPicker.HitTestPanel(m_pointer)
+            && !m_toolbarController.isMosaicMenuOpen())
+        {
+            m_toolbarController.UpdateHover(m_pointer);
+        }
+    }
+
+    void Overlay::FlushInvalidation(ui::Invalidate inv)
+    {
+        if (inv == ui::Invalidate::None)
+        {
+            return;
+        }
+        if (ui::HasFlag(inv, ui::Invalidate::Layout))
+        {
+            RunLayout();
+            inv |= ui::Invalidate::Paint;
+        }
+        if (ui::HasFlag(inv, ui::Invalidate::Ime))
+        {
+            SyncImeState();
+        }
+        if (ui::HasFlag(inv, ui::Invalidate::Paint))
+        {
+            RequestRender();
+        }
+        else if (ui::HasFlag(inv, ui::Invalidate::Cursor))
+        {
+            ApplyCursor();
+        }
+    }
+
+    void Overlay::DismissColorPicker(bool commitEdit, ui::Invalidate& inv)
+    {
+        if (!m_colorPicker.isOpen())
+        {
+            return;
+        }
+        if (commitEdit)
+        {
+            bool commitChanged = false;
+            m_colorPicker.CommitTextEdit(commitChanged);
+            if (commitChanged)
+            {
+                ApplyColorFromPicker(true);
+            }
+        }
+        m_colorPicker.Close();
+        m_pickerAnchorAction = SubToolbarAction::None;
+        m_annotController.ClearLiveEditSnapshot();
+        inv |= ui::Invalidate::Layout | ui::Invalidate::Ime | ui::Invalidate::Paint;
     }
 
     void Overlay::Settle()
     {
-        m_toolbarVisible = LayoutToolbar(m_toolbar, m_selection, ClientBounds(), m_device.dpi());
-        m_toolbar.hovered = m_toolbarVisible
-            ? HitTestToolbar(m_toolbar, m_pointer)
-            : ToolbarButton::None;
+        m_colorPicker.Close();
+        m_pickerAnchorAction = SubToolbarAction::None;
+        m_annotController.ClearLiveEditSnapshot();
+        m_toolbarController.Settle(CurrentToolbarState(), m_selection, CurrentLayoutEnv());
+        m_toolbarController.UpdateHover(m_pointer);
     }
 
-    void Overlay::ShowOcrContextMenu(POINT point)
+    void Overlay::ToggleColorPicker(
+        ColorPickerTarget target, SubToolbarAction anchorAction, ui::Invalidate& inv)
     {
-        const HitTarget target = HitTest(point);
-        if (target == HitTarget::ToolbarPanel || target == HitTarget::ToolbarHandle
-            || target == HitTarget::ToolbarButton || target == HitTarget::OcrScrollbar)
+        if (m_colorPicker.isOpen() && m_colorPicker.target() == target)
         {
+            DismissColorPicker(true, inv);
             return;
         }
-        if (target != HitTarget::OcrText)
+
+        m_pickerAnchorAction = anchorAction;
+        const RECT anchor = m_toolbarController.PickerAnchorRect(anchorAction);
+        const ColorPickerOpenInfo info = m_annotController.ResolvePickerOpenInfo(target, m_toolMode);
+        m_annotController.ClearLiveEditSnapshot();
+        m_colorPicker.Open(
+            target, info.allowNone, info.showStrokeStyles, info.strokeStyle,
+            info.initialColor, anchor, ClientBounds(), m_device.dpi(),
+            m_toolbarController.PickerAvoidBand(), info.restoreAlpha);
+        inv |= ui::Invalidate::Layout | ui::Invalidate::Ime | ui::Invalidate::Paint;
+    }
+
+    void Overlay::ApplyColorFromPicker(bool commitUndo)
+    {
+        m_annotController.ApplyColorFromPicker(m_colorPicker, m_toolMode, commitUndo);
+    }
+
+    void Overlay::Invoke(ToolbarButton button, ui::Invalidate& inv)
+    {
+        if (button == ToolbarButton::Cancel)
         {
             Cancel();
             return;
         }
 
-        m_ocrPanel.ShowContextMenu(
-            m_window, m_selection, point, m_device.dpi(),
-            m_device.dwriteFactory(), m_device.textFormat());
-        RequestRender();
+        DismissColorPicker(false, inv);
+        m_toolbarController.CloseMosaicEffectMenu();
+        m_annotController.CommitTextEditor(m_window);
+        inv |= ui::Invalidate::Ime;
+
+        if (button == ToolbarButton::Undo)
+        {
+            if (m_annotController.document().Undo())
+            {
+                inv |= ui::Invalidate::Layout | ui::Invalidate::Paint;
+            }
+            return;
+        }
+        if (button == ToolbarButton::Redo)
+        {
+            if (m_annotController.document().Redo())
+            {
+                inv |= ui::Invalidate::Layout | ui::Invalidate::Paint;
+            }
+            return;
+        }
+        if (button == ToolbarButton::EditSelection)
+        {
+            m_toolMode = ToolbarButton::EditSelection;
+            m_annotController.document().ClearSelection();
+            m_ocrPanel.CancelInteractions(m_window);
+            SetFocus(m_window);
+            inv |= ui::Invalidate::Layout | ui::Invalidate::Paint;
+            return;
+        }
+        if (button == ToolbarButton::SelectObject)
+        {
+            m_toolMode = ToolbarButton::SelectObject;
+            m_ocrPanel.CancelInteractions(m_window);
+            SetFocus(m_window);
+            inv |= ui::Invalidate::Layout | ui::Invalidate::Paint;
+            return;
+        }
+        if (IsAnnotationToolButton(button))
+        {
+            m_toolMode = button;
+            m_annotController.document().ClearSelection();
+            m_ocrPanel.CancelInteractions(m_window);
+            SetFocus(m_window);
+            inv |= ui::Invalidate::Layout | ui::Invalidate::Paint;
+            return;
+        }
+        if (button == ToolbarButton::TextRecognition)
+        {
+            EnterTextRecognitionMode(inv);
+            return;
+        }
+        if (button != ToolbarButton::Copy)
+        {
+            return;
+        }
+        if (m_toolMode == ToolbarButton::TextRecognition)
+        {
+            CopyOcrText(true);
+            return;
+        }
+
+        try
+        {
+            m_annotController.ExportToClipboard(
+                m_window, m_device, m_image, m_bounds, m_selection);
+        }
+        catch (...)
+        {
+            ReportCurrentException(__FILEW__, __LINE__);
+        }
+
+        Cancel();
+    }
+
+    void Overlay::InvokeSubAction(SubToolbarAction action, ui::Invalidate& inv)
+    {
+        if (action == SubToolbarAction::StrokePicker)
+        {
+            ToggleColorPicker(ColorPickerTarget::Stroke, action, inv);
+            return;
+        }
+        if (action == SubToolbarAction::FillPicker)
+        {
+            ToggleColorPicker(ColorPickerTarget::Fill, action, inv);
+            return;
+        }
+
+        DismissColorPicker(false, inv);
+        if (m_annotController.InvokeSubAction(
+            action, m_toolMode, m_device.dwriteFactory(), m_device.dpi()))
+        {
+            inv |= ui::Invalidate::Layout | ui::Invalidate::Paint;
+        }
+    }
+
+    void Overlay::EnterTextRecognitionMode(ui::Invalidate& inv)
+    {
+        if (!m_hasSelection)
+        {
+            return;
+        }
+
+        m_annotController.CommitTextEditor(m_window);
+        m_annotController.document().ClearSelection();
+        m_ocrPanel.Enter(m_window, m_ocrRuntime, m_image, m_bounds, m_selection);
+        m_toolMode = ToolbarButton::TextRecognition;
+        m_smart = false;
+        SetFocus(m_window);
+        inv |= ui::Invalidate::Layout | ui::Invalidate::Ime | ui::Invalidate::Paint;
+    }
+
+    void Overlay::CopyOcrText(bool closeAfterCopy)
+    {
+        m_ocrPanel.CopyText(m_window);
+        if (closeAfterCopy)
+        {
+            Cancel();
+        }
     }
 
     bool Overlay::PointerEvent(WPARAM wparam, POINTER_INFO& info, POINT& point) const noexcept
@@ -623,381 +777,1035 @@ namespace agshot
 
         point = info.ptPixelLocation;
         ScreenToClient(m_window, &point);
-        return info.pointerType == PT_MOUSE || info.pointerType == PT_PEN;
+        if (info.pointerType == PT_MOUSE || info.pointerType == PT_PEN)
+        {
+            return true;
+        }
+        return info.pointerType == PT_TOUCH && IS_POINTER_PRIMARY_WPARAM(wparam);
     }
 
-    void Overlay::OnMouseMove(POINT point)
+    // -------------------------------------------------------------------------
+    // Layer 0: Eyedropper (modal desktop pixel sampling)
+    // -------------------------------------------------------------------------
+    bool Overlay::EyedropperLayer::IsVisible() const noexcept
     {
-        UpdateHover(point);
+        return owner->m_eyedropperActive;
+    }
 
-        if (point.x == m_pointer.x && point.y == m_pointer.y)
+    bool Overlay::EyedropperLayer::HitTest(POINT) const
+    {
+        return true;
+    }
+
+    void Overlay::EyedropperLayer::OnHoverMove(POINT, ui::Invalidate& inv)
+    {
+        owner->m_toolbarController.ClearHover();
+        inv |= ui::Invalidate::Paint;
+    }
+
+    ui::EventOutcome Overlay::EyedropperLayer::OnLeftDown(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        owner->m_eyedropperActive = false;
+        owner->m_colorPicker.ResumeFromEyedropper();
+        if (!owner->m_image.empty() && owner->m_image.pixels() != nullptr)
         {
-            return;
+            const int px = std::clamp(static_cast<int>(in.point.x), 0, owner->m_image.width() - 1);
+            const int py = std::clamp(static_cast<int>(in.point.y), 0, owner->m_image.height() - 1);
+            const BYTE* row = static_cast<const BYTE*>(owner->m_image.pixels())
+                + static_cast<std::size_t>(py) * owner->m_image.stride()
+                + static_cast<std::size_t>(px) * 4;
+            const D2D1_COLOR_F picked = D2D1::ColorF(
+                row[2] / 255.0f, row[1] / 255.0f, row[0] / 255.0f, 1.0f);
+            owner->m_colorPicker.SetPickedPixelColor(picked, owner->m_device.dpi());
+            owner->ApplyColorFromPicker(true);
+            inv |= ui::Invalidate::Layout;
         }
+        inv |= ui::Invalidate::Ime | ui::Invalidate::Paint;
+        return ui::EventOutcome::Handled;
+    }
 
-        m_pointer = point;
+    ui::EventOutcome Overlay::EyedropperLayer::OnRightUp(const ui::PointerInput&, ui::Invalidate& inv)
+    {
+        owner->m_eyedropperActive = false;
+        owner->m_colorPicker.ResumeFromEyedropper();
+        owner->m_annotController.ClearLiveEditSnapshot();
+        inv |= ui::Invalidate::Ime | ui::Invalidate::Paint;
+        return ui::EventOutcome::Handled;
+    }
 
-        if (m_ocrPanel.OnMouseMove(m_selection, point, m_device.dpi(),
-                                   m_device.dwriteFactory(), m_device.textFormat()))
+    ui::EventOutcome Overlay::EyedropperLayer::OnKeyDown(
+        WPARAM key, KeyModifiers, ui::Invalidate& inv)
+    {
+        if (key == VK_ESCAPE)
         {
-            RequestRender();
-            return;
+            owner->m_eyedropperActive = false;
+            owner->m_colorPicker.ResumeFromEyedropper();
+            owner->m_annotController.ClearLiveEditSnapshot();
+            inv |= ui::Invalidate::Ime | ui::Invalidate::Paint;
+            return ui::EventOutcome::Handled;
         }
+        return ui::EventOutcome::Handled;
+    }
 
-        switch (m_dragMode)
+    std::optional<LPCWSTR> Overlay::EyedropperLayer::CursorForPoint(POINT, bool) const
+    {
+        return IDC_CROSS;
+    }
+
+    // -------------------------------------------------------------------------
+    // Layer 1: ColorPickerPopover
+    // -------------------------------------------------------------------------
+    bool Overlay::ColorPickerLayer::IsVisible() const noexcept
+    {
+        return owner->m_colorPicker.visible();
+    }
+
+    bool Overlay::ColorPickerLayer::HitTest(POINT point) const
+    {
+        return owner->m_colorPicker.HitTestPanel(point);
+    }
+
+    void Overlay::ColorPickerLayer::OnHoverMove(POINT point, ui::Invalidate& inv)
+    {
+        if (owner->m_colorPicker.UpdateHover(point))
         {
-        case DragMode::NewRectangle:
+            inv |= ui::Invalidate::Paint;
+        }
+        inv |= ui::Invalidate::Cursor;
+    }
+
+    void Overlay::ColorPickerLayer::OnHoverLeave(ui::Invalidate& inv)
+    {
+        if (owner->m_colorPicker.visible())
         {
-            if (m_pendingConfirm)
+            owner->m_colorPicker.ClearHover();
+            inv |= ui::Invalidate::Paint;
+        }
+    }
+
+    ui::OutsideClickPolicy Overlay::ColorPickerLayer::OnOutsidePointer(
+        ui::PointerButton button, POINT point, const ui::IHudLayer* hitBelow,
+        ui::Invalidate& inv)
+    {
+        if (button == ui::PointerButton::Left && hitBelow == &owner->m_toolbarController)
+        {
+            const ToolbarHit th = HitTestToolbarTarget(owner->m_toolbarController.toolbar(), point);
+            const bool keepPicker =
+                (th.target == ToolbarHitTarget::SubButton && th.subAction == owner->m_pickerAnchorAction)
+                || th.target == ToolbarHitTarget::Handle;
+            if (keepPicker)
             {
-                const int dx = point.x > m_dragOrigin.x ? point.x - m_dragOrigin.x : m_dragOrigin.x - point.x;
-                const int dy = point.y > m_dragOrigin.y ? point.y - m_dragOrigin.y : m_dragOrigin.y - point.y;
+                return ui::OutsideClickPolicy::Ignore;
+            }
+            owner->DismissColorPicker(true, inv);
+            return ui::OutsideClickPolicy::DismissAndPass;
+        }
+
+        owner->DismissColorPicker(true, inv);
+        return ui::OutsideClickPolicy::DismissAndAbsorb;
+    }
+
+    ui::EventOutcome Overlay::ColorPickerLayer::OnLeftDown(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        bool reqEyedropper = false;
+        bool pickerChanged = false;
+        if (!owner->m_colorPicker.OnLeftButtonDown(
+            in.point, owner->m_device.dwriteFactory(), owner->m_device.textFormat(),
+            owner->m_device.dpi(), reqEyedropper, pickerChanged, in.mods))
+        {
+            return ui::EventOutcome::Ignored;
+        }
+
+        if (reqEyedropper)
+        {
+            owner->m_colorPicker.SuspendForEyedropper();
+            owner->m_eyedropperActive = true;
+            owner->m_layerStack.ClearHover(inv);
+            inv |= ui::Invalidate::Ime | ui::Invalidate::Paint;
+            return ui::EventOutcome::Handled;
+        }
+
+        if (owner->m_colorPicker.dragging())
+        {
+            if (pickerChanged)
+            {
+                owner->ApplyColorFromPicker(false);
+                inv |= ui::Invalidate::Layout;
+            }
+            inv |= ui::Invalidate::Ime | ui::Invalidate::Paint;
+            return ui::EventOutcome::Capture;
+        }
+
+        if (pickerChanged)
+        {
+            owner->ApplyColorFromPicker(true);
+            inv |= ui::Invalidate::Layout;
+        }
+        if (!owner->m_colorPicker.hasTextFocus())
+        {
+            owner->m_annotController.ClearLiveEditSnapshot();
+        }
+        inv |= ui::Invalidate::Ime | ui::Invalidate::Paint;
+        return ui::EventOutcome::Handled;
+    }
+
+    void Overlay::ColorPickerLayer::OnCapturedMove(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        bool pickerChanged = false;
+        if (owner->m_colorPicker.OnMouseMove(
+            in.point, owner->m_device.dwriteFactory(), owner->m_device.textFormat(),
+            owner->m_device.dpi(), pickerChanged)
+            && pickerChanged)
+        {
+            owner->ApplyColorFromPicker(false);
+            inv |= ui::Invalidate::Layout;
+        }
+        inv |= ui::Invalidate::Paint;
+    }
+
+    void Overlay::ColorPickerLayer::OnCapturedUp(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        bool pickerCommit = false;
+        if (owner->m_colorPicker.OnLeftButtonUp(in.point, pickerCommit) && pickerCommit)
+        {
+            owner->ApplyColorFromPicker(true);
+            inv |= ui::Invalidate::Layout;
+        }
+        if (!owner->m_colorPicker.hasTextFocus())
+        {
+            owner->m_annotController.ClearLiveEditSnapshot();
+        }
+        inv |= ui::Invalidate::Ime | ui::Invalidate::Paint;
+    }
+
+    void Overlay::ColorPickerLayer::OnCancelCapture(ui::Invalidate& inv)
+    {
+        owner->m_colorPicker.EndDrag();
+        if (!owner->m_colorPicker.hasTextFocus() && owner->m_annotController.CommitLiveEdit())
+        {
+            inv |= ui::Invalidate::Layout;
+        }
+        inv |= ui::Invalidate::Paint;
+    }
+
+    ui::EventOutcome Overlay::ColorPickerLayer::OnRightUp(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        bool changed = false;
+        bool commitUndo = false;
+        owner->m_colorPicker.OnRightButtonUp(
+            owner->m_window, in.point, owner->m_device.dwriteFactory(),
+            owner->m_device.textFormat(), owner->m_device.dpi(), changed, commitUndo);
+        if (changed)
+        {
+            owner->ApplyColorFromPicker(commitUndo);
+            inv |= ui::Invalidate::Layout;
+        }
+        if (!owner->m_colorPicker.hasTextFocus())
+        {
+            owner->m_annotController.ClearLiveEditSnapshot();
+        }
+        inv |= ui::Invalidate::Ime | ui::Invalidate::Paint;
+        return ui::EventOutcome::Handled;
+    }
+
+    ui::EventOutcome Overlay::ColorPickerLayer::OnWheel(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        bool changed = false;
+        if (owner->m_colorPicker.OnWheel(in.point, in.wheelDelta, changed) && changed)
+        {
+            owner->ApplyColorFromPicker(true);
+            inv |= ui::Invalidate::Layout | ui::Invalidate::Paint;
+        }
+        return ui::EventOutcome::Handled;
+    }
+
+    ui::EventOutcome Overlay::ColorPickerLayer::OnKeyDown(
+        WPARAM key, KeyModifiers mods, ui::Invalidate& inv)
+    {
+        if (owner->m_colorPicker.hasTextFocus() || owner->m_colorPicker.isFormatMenuOpen())
+        {
+            bool changed = false;
+            bool commitUndo = false;
+            if (owner->m_colorPicker.OnKeyDown(owner->m_window, key, changed, commitUndo, mods))
+            {
+                if (changed)
+                {
+                    owner->ApplyColorFromPicker(commitUndo);
+                    inv |= ui::Invalidate::Layout;
+                }
+                if (!owner->m_colorPicker.hasTextFocus())
+                {
+                    owner->m_annotController.ClearLiveEditSnapshot();
+                    inv |= ui::Invalidate::Ime;
+                }
+                inv |= ui::Invalidate::Paint;
+                return ui::EventOutcome::Handled;
+            }
+        }
+        if (key == VK_ESCAPE)
+        {
+            owner->DismissColorPicker(false, inv);
+            return ui::EventOutcome::Handled;
+        }
+        return ui::EventOutcome::Ignored;
+    }
+
+    ui::EventOutcome Overlay::ColorPickerLayer::OnChar(wchar_t ch, ui::Invalidate& inv)
+    {
+        if (!owner->m_colorPicker.hasTextFocus())
+        {
+            return ui::EventOutcome::Ignored;
+        }
+        bool changed = false;
+        if (owner->m_colorPicker.OnChar(ch, changed))
+        {
+            if (changed)
+            {
+                owner->ApplyColorFromPicker(false);
+                inv |= ui::Invalidate::Layout;
+            }
+            inv |= ui::Invalidate::Paint;
+        }
+        return ui::EventOutcome::Handled;
+    }
+
+    std::optional<LPCWSTR> Overlay::ColorPickerLayer::CursorForPoint(POINT point, bool) const
+    {
+        return owner->m_colorPicker.CursorForPoint(point);
+    }
+
+    ui::ImePolicy Overlay::ColorPickerLayer::QueryImePolicy() const noexcept
+    {
+        return owner->m_colorPicker.hasTextFocus() ? ui::ImePolicy::Disable : ui::ImePolicy::Pass;
+    }
+
+    // -------------------------------------------------------------------------
+    // Layer 3: InlineTextEditor (below Toolbar, above Canvas)
+    // -------------------------------------------------------------------------
+    bool Overlay::TextEditorLayer::IsVisible() const noexcept
+    {
+        return owner->m_annotController.hasActiveTextEditor();
+    }
+
+    bool Overlay::TextEditorLayer::HitTest(POINT point) const
+    {
+        return owner->m_annotController.textEditor().HitTestInside(
+            point, owner->m_device.dwriteFactory(), owner->m_device.dpi());
+    }
+
+    ui::OutsideClickPolicy Overlay::TextEditorLayer::OnOutsidePointer(
+        ui::PointerButton, POINT, const ui::IHudLayer*, ui::Invalidate& inv)
+    {
+        owner->m_annotController.CommitTextEditor(owner->m_window);
+        inv |= ui::Invalidate::Layout | ui::Invalidate::Ime | ui::Invalidate::Paint;
+        return ui::OutsideClickPolicy::DismissAndAbsorb;
+    }
+
+    ui::EventOutcome Overlay::TextEditorLayer::OnLeftDown(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        bool syncTb = false;
+        bool syncIme = false;
+        if (!owner->m_annotController.HandleActiveTextEditorLeftDown(
+            owner->m_window, in.point, owner->m_device.dwriteFactory(),
+            owner->m_device.dpi(), syncTb, syncIme, in.mods))
+        {
+            return ui::EventOutcome::Ignored;
+        }
+        if (syncTb) inv |= ui::Invalidate::Layout;
+        if (syncIme) inv |= ui::Invalidate::Ime;
+        inv |= ui::Invalidate::Paint;
+        return owner->m_annotController.isInteracting()
+            ? ui::EventOutcome::Capture
+            : ui::EventOutcome::Handled;
+    }
+
+    void Overlay::TextEditorLayer::OnCapturedMove(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        owner->m_annotController.OnMouseMove(
+            owner->m_window, in.point, in.mods, owner->m_selection,
+            owner->m_device.dwriteFactory(), owner->m_device.dpi());
+        inv |= ui::Invalidate::Paint;
+    }
+
+    void Overlay::TextEditorLayer::OnCapturedUp(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        bool syncTb = false;
+        owner->m_annotController.OnLeftButtonUp(
+            in.point, owner->m_selection, owner->m_device.dwriteFactory(),
+            owner->m_device.dpi(), syncTb);
+        if (syncTb) inv |= ui::Invalidate::Layout;
+        inv |= ui::Invalidate::Paint;
+    }
+
+    void Overlay::TextEditorLayer::OnCancelCapture(ui::Invalidate& inv)
+    {
+        owner->m_annotController.ClearTransientDragState();
+        inv |= ui::Invalidate::Paint;
+    }
+
+    ui::EventOutcome Overlay::TextEditorLayer::OnRightUp(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        bool syncTb = false;
+        bool syncIme = false;
+        if (owner->m_annotController.OnRightButtonUp(
+            owner->m_window, in.point, owner->m_device.dwriteFactory(),
+            owner->m_device.dpi(), syncTb, syncIme))
+        {
+            if (syncTb) inv |= ui::Invalidate::Layout;
+            if (syncIme) inv |= ui::Invalidate::Ime;
+            inv |= ui::Invalidate::Paint;
+            return ui::EventOutcome::Handled;
+        }
+        return ui::EventOutcome::Ignored;
+    }
+
+    ui::EventOutcome Overlay::TextEditorLayer::OnKeyDown(
+        WPARAM key, KeyModifiers mods, ui::Invalidate& inv)
+    {
+        bool syncTb = false;
+        bool syncIme = false;
+        if (owner->m_annotController.OnKeyDown(
+            owner->m_window, key, owner->m_toolMode,
+            owner->m_device.dwriteFactory(), owner->m_device.dpi(),
+            syncTb, syncIme, mods))
+        {
+            if (syncTb) inv |= ui::Invalidate::Layout;
+            if (syncIme) inv |= ui::Invalidate::Ime;
+            inv |= ui::Invalidate::Paint;
+            return ui::EventOutcome::Handled;
+        }
+        return ui::EventOutcome::Ignored;
+    }
+
+    ui::EventOutcome Overlay::TextEditorLayer::OnChar(wchar_t ch, ui::Invalidate& inv)
+    {
+        if (owner->m_annotController.OnChar(
+            owner->m_window, ch, owner->m_device.dwriteFactory(), owner->m_device.dpi()))
+        {
+            inv |= ui::Invalidate::Paint;
+        }
+        return ui::EventOutcome::Handled;
+    }
+
+    std::optional<LPCWSTR> Overlay::TextEditorLayer::CursorForPoint(POINT point, bool) const
+    {
+        return owner->m_annotController.CursorForActiveEditor(
+            point, owner->m_device.dwriteFactory(), owner->m_device.dpi());
+    }
+
+    // -------------------------------------------------------------------------
+    // Layer 4: OCR Text Panel
+    // -------------------------------------------------------------------------
+    bool Overlay::OcrLayer::IsVisible() const noexcept
+    {
+        return owner->m_hasSelection && owner->m_toolMode == ToolbarButton::TextRecognition;
+    }
+
+    bool Overlay::OcrLayer::HitTest(POINT point) const
+    {
+        return PtInRect(&owner->m_selection, point) != 0;
+    }
+
+    ui::EventOutcome Overlay::OcrLayer::OnLeftDown(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        bool needsRender = false;
+        owner->m_ocrPanel.OnLeftButtonDown(
+            owner->m_window, owner->m_selection, in.point, owner->m_device.dpi(),
+            owner->m_device.dwriteFactory(), owner->m_device.textFormat(),
+            needsRender, in.mods);
+        if (needsRender)
+        {
+            inv |= ui::Invalidate::Paint;
+        }
+        return owner->m_ocrPanel.capturingInput()
+            ? ui::EventOutcome::Capture
+            : ui::EventOutcome::Handled;
+    }
+
+    void Overlay::OcrLayer::OnCapturedMove(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        if (owner->m_ocrPanel.OnMouseMove(
+            owner->m_selection, in.point, owner->m_device.dpi(),
+            owner->m_device.dwriteFactory(), owner->m_device.textFormat()))
+        {
+            inv |= ui::Invalidate::Paint;
+        }
+        else
+        {
+            inv |= ui::Invalidate::Cursor;
+        }
+    }
+
+    void Overlay::OcrLayer::OnCapturedUp(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        if (owner->m_ocrPanel.OnLeftButtonUp(
+            owner->m_window, owner->m_selection, in.point, owner->m_device.dpi(),
+            owner->m_device.dwriteFactory(), owner->m_device.textFormat()))
+        {
+            inv |= ui::Invalidate::Paint;
+        }
+    }
+
+    void Overlay::OcrLayer::OnCancelCapture(ui::Invalidate& inv)
+    {
+        owner->m_ocrPanel.CancelInteractions(owner->m_window);
+        inv |= ui::Invalidate::Paint;
+    }
+
+    ui::EventOutcome Overlay::OcrLayer::OnRightUp(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        const RECT track = owner->m_ocrPanel.ScrollTrack(owner->m_selection, owner->m_device.dpi());
+        if (owner->m_ocrPanel.HasScrollbar(owner->m_selection, owner->m_device.dpi(),
+                                           owner->m_device.dwriteFactory(), owner->m_device.textFormat())
+            && PtInRect(&track, in.point))
+        {
+            return ui::EventOutcome::Handled;
+        }
+        owner->m_ocrPanel.ShowContextMenu(
+            owner->m_window, owner->m_selection, in.point, owner->m_device.dpi(),
+            owner->m_device.dwriteFactory(), owner->m_device.textFormat());
+        inv |= ui::Invalidate::Paint;
+        return ui::EventOutcome::Handled;
+    }
+
+    ui::EventOutcome Overlay::OcrLayer::OnWheel(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        owner->m_ocrPanel.OnWheel(
+            owner->m_selection, in.wheelDelta, owner->m_device.dpi(), kHudTextSizeDip,
+            owner->m_device.dwriteFactory(), owner->m_device.textFormat());
+        inv |= ui::Invalidate::Paint;
+        return ui::EventOutcome::Handled;
+    }
+
+    ui::EventOutcome Overlay::OcrLayer::OnKeyDown(
+        WPARAM key, KeyModifiers mods, ui::Invalidate& inv)
+    {
+        if (key == VK_ESCAPE)
+        {
+            owner->Cancel();
+            return ui::EventOutcome::Handled;
+        }
+        bool shouldClose = false;
+        bool needsRender = false;
+        if (owner->m_ocrPanel.OnKeyDown(
+            owner->m_window, owner->m_selection, key, owner->m_device.dpi(),
+            owner->m_device.dwriteFactory(), owner->m_device.textFormat(),
+            shouldClose, needsRender, mods))
+        {
+            if (shouldClose)
+            {
+                owner->Cancel();
+            }
+            else if (needsRender)
+            {
+                inv |= ui::Invalidate::Paint;
+            }
+            return ui::EventOutcome::Handled;
+        }
+        return ui::EventOutcome::Ignored;
+    }
+
+    ui::EventOutcome Overlay::OcrLayer::OnChar(wchar_t, ui::Invalidate&)
+    {
+        return ui::EventOutcome::Handled;
+    }
+
+    std::optional<LPCWSTR> Overlay::OcrLayer::CursorForPoint(POINT point, bool) const
+    {
+        const RECT track = owner->m_ocrPanel.ScrollTrack(owner->m_selection, owner->m_device.dpi());
+        if (owner->m_ocrPanel.HasScrollbar(owner->m_selection, owner->m_device.dpi(),
+                                           owner->m_device.dwriteFactory(), owner->m_device.textFormat())
+            && PtInRect(&track, point))
+        {
+            return IDC_ARROW;
+        }
+        return IDC_IBEAM;
+    }
+
+    // -------------------------------------------------------------------------
+    // Layer 5: Canvas (selection handles, UIA smart picking, annotations)
+    // -------------------------------------------------------------------------
+    void Overlay::CanvasLayer::OnHoverMove(POINT point, ui::Invalidate& inv)
+    {
+        if (owner->m_smart)
+        {
+            owner->RefreshSuggestion(point);
+        }
+        inv |= ui::Invalidate::Paint;
+    }
+
+    ui::EventOutcome Overlay::CanvasLayer::OnLeftDown(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        if (owner->m_toolMode == ToolbarButton::TextRecognition)
+        {
+            return ui::EventOutcome::Handled;
+        }
+
+        const bool wasFollowing = owner->m_smart;
+        owner->StopSelectionAnimation();
+        owner->m_displaySelection = owner->m_selection;
+        owner->m_smart = false;
+        owner->m_depth = 0;
+
+        if (wasFollowing)
+        {
+            owner->m_canvasDrag = CanvasDrag::NewRectangle;
+            owner->m_dragOrigin = in.point;
+            owner->m_dragStart = owner->m_selection;
+            owner->m_pendingConfirm = owner->m_hasSelection;
+            owner->m_reselectPending = false;
+            if (!owner->m_hasSelection)
+            {
+                owner->m_toolbarController.Hide();
+            }
+            return ui::EventOutcome::Capture;
+        }
+
+        if (owner->m_hasSelection)
+        {
+            const ULONGLONG now = GetTickCount64();
+            const bool isDoubleClick = (now - owner->m_lastClickMs <= GetDoubleClickTime())
+                && std::abs(in.point.x - owner->m_lastClickPt.x) <= GetSystemMetrics(SM_CXDOUBLECLK)
+                && std::abs(in.point.y - owner->m_lastClickPt.y) <= GetSystemMetrics(SM_CYDOUBLECLK);
+            owner->m_lastClickMs = now;
+            owner->m_lastClickPt = in.point;
+
+            const float annotHandleDip = (in.kind == ui::PointerKind::Touch) ? 18.0f : 8.0f;
+            if (owner->m_annotController.TryBeginSelectedHandleDrag(
+                in.point, owner->m_toolMode, owner->m_device.dwriteFactory(),
+                owner->m_device.dpi(), annotHandleDip))
+            {
+                owner->m_canvasDrag = CanvasDrag::Annotation;
+                inv |= ui::Invalidate::Paint;
+                return ui::EventOutcome::Capture;
+            }
+
+            const SelectionPart selPart = HitTestSelection(
+                owner->m_selection, in.point, owner->EffectiveHandleSize(in.kind));
+            if (selPart != SelectionPart::None && selPart != SelectionPart::Body)
+            {
+                owner->m_canvasDrag = CanvasDrag::MoveOrResize;
+                owner->m_dragPart = selPart;
+                owner->m_dragOrigin = in.point;
+                owner->m_dragStart = owner->m_selection;
+                owner->m_toolbarController.Hide();
+                inv |= ui::Invalidate::Paint;
+                return ui::EventOutcome::Capture;
+            }
+
+            if (owner->m_toolMode == ToolbarButton::EditSelection)
+            {
+                if (selPart == SelectionPart::Body)
+                {
+                    owner->m_canvasDrag = CanvasDrag::MoveOrResize;
+                    owner->m_dragPart = SelectionPart::Body;
+                    owner->m_dragOrigin = in.point;
+                    owner->m_dragStart = owner->m_selection;
+                    owner->m_toolbarController.Hide();
+                    inv |= ui::Invalidate::Paint;
+                    return ui::EventOutcome::Capture;
+                }
+                if (owner->m_annotController.empty())
+                {
+                    owner->m_canvasDrag = CanvasDrag::NewRectangle;
+                    owner->m_dragOrigin = in.point;
+                    owner->m_dragStart = owner->m_selection;
+                    owner->m_reselectPending = true;
+                    return ui::EventOutcome::Capture;
+                }
+                return ui::EventOutcome::Handled;
+            }
+
+            bool canvasSyncTb = false;
+            bool canvasSyncIme = false;
+            owner->m_annotController.OnCanvasLeftButtonDown(
+                owner->m_window, in.point, owner->m_toolMode, owner->m_selection, in.mods,
+                isDoubleClick, owner->m_device.dwriteFactory(), owner->m_device.dpi(),
+                canvasSyncTb, canvasSyncIme);
+            if (owner->m_annotController.ConsumeStepNumberEditRequest())
+            {
+                const RECT curBox = owner->m_toolbarController.StepNumberItemRect();
+                if (canvasSyncTb || IsRectEmpty(&curBox))
+                {
+                    owner->RunLayout();
+                }
+                owner->m_toolbarController.BeginStepNumberEdit(inv);
+                return ui::EventOutcome::Handled;
+            }
+            if (canvasSyncTb) inv |= ui::Invalidate::Layout;
+            if (canvasSyncIme) inv |= ui::Invalidate::Ime;
+            inv |= ui::Invalidate::Paint;
+            if (owner->m_annotController.isInteracting())
+            {
+                owner->m_canvasDrag = CanvasDrag::Annotation;
+                return ui::EventOutcome::Capture;
+            }
+            return ui::EventOutcome::Handled;
+        }
+
+        if (owner->m_toolMode == ToolbarButton::EditSelection)
+        {
+            owner->m_depth = 0;
+            owner->m_toolbarController.Hide();
+            owner->m_canvasDrag = CanvasDrag::NewRectangle;
+            owner->m_dragOrigin = in.point;
+            owner->m_hasSelection = false;
+            owner->m_pendingConfirm = false;
+            owner->m_reselectPending = false;
+            return ui::EventOutcome::Capture;
+        }
+
+        return ui::EventOutcome::Handled;
+    }
+
+    void Overlay::CanvasLayer::OnCapturedMove(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        switch (owner->m_canvasDrag)
+        {
+        case CanvasDrag::Annotation:
+            owner->m_annotController.OnMouseMove(
+                owner->m_window, in.point, in.mods, owner->m_selection,
+                owner->m_device.dwriteFactory(), owner->m_device.dpi());
+            break;
+
+        case CanvasDrag::NewRectangle:
+        {
+            if (owner->m_pendingConfirm || owner->m_reselectPending)
+            {
+                const int dx = std::abs(static_cast<int>(in.point.x - owner->m_dragOrigin.x));
+                const int dy = std::abs(static_cast<int>(in.point.y - owner->m_dragOrigin.y));
                 if (dx < kMinimumDrag && dy < kMinimumDrag)
                 {
                     break;
                 }
-                m_pendingConfirm = false;
-                m_hasSelection = false;
+                owner->m_pendingConfirm = false;
+                owner->m_reselectPending = false;
+                owner->m_hasSelection = false;
+                owner->m_toolbarController.Hide();
             }
-
-            const RECT bounds = ClientBounds();
-            RECT candidate = RectFromPoints(m_dragOrigin, point);
+            const RECT bounds = owner->ClientBounds();
+            RECT candidate = RectFromPoints(owner->m_dragOrigin, in.point);
             RECT clipped{};
             if (IntersectRect(&clipped, &candidate, &bounds))
             {
-                m_selection = clipped;
-                m_hasSelection = !IsEmptyRect(clipped);
+                owner->m_selection = clipped;
+                owner->m_hasSelection = !IsEmptyRect(clipped);
             }
             break;
         }
 
-        case DragMode::MoveOrResize:
-            m_selection = DragSelection(m_dragStart, m_dragPart, m_dragOrigin, point, ClientBounds());
-            m_hasSelection = true;
+        case CanvasDrag::MoveOrResize:
+            owner->m_selection = DragSelection(
+                owner->m_dragStart, owner->m_dragPart, owner->m_dragOrigin,
+                in.point, owner->ClientBounds());
+            owner->m_hasSelection = true;
             break;
 
-        case DragMode::ToolbarMove:
-            DragToolbar(m_toolbar, m_toolbarDragStart, m_toolbarDragOrigin, point, ClientBounds());
-            m_toolbar.hovered = ToolbarButton::None;
-            break;
-
+        case CanvasDrag::None:
         default:
-            if (m_smart)
-            {
-                RefreshSuggestion(point);
-            }
-            else
-            {
-                UpdateHover(point);
-            }
             break;
         }
-
-        RequestRender();
+        inv |= ui::Invalidate::Paint;
     }
 
-    void Overlay::OnLeftButtonDown(POINT point)
+    void Overlay::CanvasLayer::OnCapturedUp(
+        const ui::PointerInput& in, ui::Invalidate& inv)
     {
-        const HitTarget hit = HitTest(point);
+        const CanvasDrag drag = owner->m_canvasDrag;
+        owner->m_canvasDrag = CanvasDrag::None;
+        owner->m_dragPart = SelectionPart::None;
 
-        if (hit == HitTarget::ToolbarButton || hit == HitTarget::ToolbarHandle
-            || hit == HitTarget::ToolbarPanel)
+        if (drag == CanvasDrag::Annotation)
         {
-            switch (HitTestToolbarTarget(m_toolbar, point))
-            {
-            case ToolbarHitTarget::EditSelection:
-                m_pressedButton = ToolbarButton::EditSelection;
-                return;
-            case ToolbarHitTarget::TextRecognition:
-                m_pressedButton = ToolbarButton::TextRecognition;
-                return;
-            case ToolbarHitTarget::Copy:
-                m_pressedButton = ToolbarButton::Copy;
-                return;
-            case ToolbarHitTarget::Cancel:
-                m_pressedButton = ToolbarButton::Cancel;
-                return;
-            case ToolbarHitTarget::Handle:
-                m_dragMode = DragMode::ToolbarMove;
-                m_toolbarDragOrigin = point;
-                m_toolbarDragStart = m_toolbar;
-                m_toolbar.hovered = ToolbarButton::None;
-                return;
-            case ToolbarHitTarget::Panel:
-            case ToolbarHitTarget::None:
-                return;
-            }
+            bool syncTb = false;
+            owner->m_annotController.OnLeftButtonUp(
+                in.point, owner->m_selection, owner->m_device.dwriteFactory(),
+                owner->m_device.dpi(), syncTb);
+            if (syncTb) inv |= ui::Invalidate::Layout;
+            inv |= ui::Invalidate::Paint;
+            return;
         }
 
-        if (m_mode == OperationMode::TextRecognition)
+        if (drag == CanvasDrag::NewRectangle || drag == CanvasDrag::MoveOrResize)
         {
-            if (hit == HitTarget::OcrText || hit == HitTarget::OcrScrollbar)
+            if (owner->m_reselectPending)
             {
-                bool needsRender = false;
-                m_ocrPanel.OnLeftButtonDown(m_window, m_selection, point, m_device.dpi(),
-                                            m_device.dwriteFactory(), m_device.textFormat(), needsRender);
-                if (needsRender)
+                owner->m_reselectPending = false;
+                inv |= ui::Invalidate::Paint;
+                return;
+            }
+            if (owner->m_pendingConfirm)
+            {
+                owner->m_pendingConfirm = false;
+                owner->m_smart = false;
+                owner->m_depth = 0;
+                owner->Settle();
+                inv |= ui::Invalidate::Paint;
+                return;
+            }
+            if (drag == CanvasDrag::NewRectangle)
+            {
+                const RECT& r = owner->m_selection;
+                if (!owner->m_hasSelection || IsEmptyRect(r)
+                    || (r.right - r.left) < kMinimumDrag || (r.bottom - r.top) < kMinimumDrag)
                 {
-                    RequestRender();
-                }
-            }
-            return;
-        }
-
-        const bool wasFollowing = m_smart;
-        StopSelectionAnimation();
-        m_displaySelection = m_selection;
-        m_smart = false;
-        m_depth = 0;
-
-        if (wasFollowing)
-        {
-            m_dragMode = DragMode::NewRectangle;
-            m_dragOrigin = point;
-            m_dragStart = m_selection;
-            m_pendingConfirm = m_hasSelection;
-            if (!m_hasSelection)
-            {
-                m_toolbarVisible = false;
-            }
-            return;
-        }
-
-        const SelectionPart part = HitTestSelection(m_selection, point, m_handleSize);
-        if (part != SelectionPart::None)
-        {
-            m_dragMode = DragMode::MoveOrResize;
-            m_dragPart = part;
-            m_dragOrigin = point;
-            m_dragStart = m_selection;
-            m_toolbarVisible = false;
-            m_toolbar.hovered = ToolbarButton::None;
-            return;
-        }
-
-        m_depth = 0;
-        m_toolbarVisible = false;
-        m_dragMode = DragMode::NewRectangle;
-        m_dragOrigin = point;
-        m_hasSelection = false;
-    }
-
-    void Overlay::OnLeftButtonUp(POINT point)
-    {
-        m_pointer = point;
-
-        if (m_ocrPanel.OnLeftButtonUp(m_window, m_selection, point, m_device.dpi(),
-                                      m_device.dwriteFactory(), m_device.textFormat()))
-        {
-            RequestRender();
-            return;
-        }
-
-        if (m_pressedButton != ToolbarButton::None)
-        {
-            const ToolbarButton pressed = m_pressedButton;
-            m_pressedButton = ToolbarButton::None;
-
-            if (HitTestToolbar(m_toolbar, point) == pressed)
-            {
-                Invoke(pressed);
-            }
-            return;
-        }
-
-        if (m_dragMode == DragMode::ToolbarMove)
-        {
-            m_dragMode = DragMode::None;
-            UpdateHover(point);
-            RequestRender();
-            return;
-        }
-
-        if (m_dragMode == DragMode::None)
-        {
-            return;
-        }
-
-        const bool wasNew = m_dragMode == DragMode::NewRectangle;
-        m_dragMode = DragMode::None;
-        m_dragPart = SelectionPart::None;
-
-        if (m_pendingConfirm)
-        {
-            m_pendingConfirm = false;
-            m_smart = false;
-            m_depth = 0;
-            Settle();
-            RequestRender();
-            return;
-        }
-
-        if (wasNew)
-        {
-            const RECT& r = m_selection;
-            if (!m_hasSelection || IsEmptyRect(r)
-                || (r.right - r.left) < kMinimumDrag || (r.bottom - r.top) < kMinimumDrag)
-            {
-                m_hasSelection = false;
-                m_smart = true;
-                m_depth = 0;
-                RefreshSuggestion(point);
-                RequestRender();
-                return;
-            }
-        }
-
-        Settle();
-        RequestRender();
-    }
-
-    void Overlay::OnWheel(POINT point, int delta)
-    {
-        const RECT bounds = ClientBounds();
-        if (delta == 0 || !PtInRect(&bounds, point))
-        {
-            return;
-        }
-
-        if (m_mode == OperationMode::TextRecognition)
-        {
-            const HitTarget hit = HitTest(point);
-            if (hit == HitTarget::OcrText || hit == HitTarget::OcrScrollbar)
-            {
-                m_ocrPanel.OnWheel(m_selection, delta, m_device.dpi(), kHudTextSizeDip,
-                                   m_device.dwriteFactory(), m_device.textFormat());
-                RequestRender();
-            }
-            return;
-        }
-
-        if (!m_smart)
-        {
-            if (!m_hasSelection || m_dragMode != DragMode::None
-                || (m_toolbarVisible
-                    && HitTestToolbarTarget(m_toolbar, point) != ToolbarHitTarget::None))
-            {
-                return;
-            }
-
-            RECT adjusted = m_selection;
-            if (delta > 0)
-            {
-                adjusted.left = std::max(bounds.left, adjusted.left - 1);
-                adjusted.top = std::max(bounds.top, adjusted.top - 1);
-                adjusted.right = std::min(bounds.right, adjusted.right + 1);
-                adjusted.bottom = std::min(bounds.bottom, adjusted.bottom + 1);
-            }
-            else
-            {
-                if (adjusted.right - adjusted.left <= 2
-                    || adjusted.bottom - adjusted.top <= 2)
-                {
+                    owner->m_hasSelection = false;
+                    owner->m_smart = true;
+                    owner->m_depth = 0;
+                    owner->RefreshSuggestion(in.point);
+                    inv |= ui::Invalidate::Paint;
                     return;
                 }
-                ++adjusted.left;
-                ++adjusted.top;
-                --adjusted.right;
-                --adjusted.bottom;
             }
+            owner->Settle();
+            inv |= ui::Invalidate::Paint;
+        }
+    }
 
-            if (EqualRect(&adjusted, &m_selection))
+    void Overlay::CanvasLayer::OnCancelCapture(ui::Invalidate& inv)
+    {
+        const CanvasDrag prev = owner->m_canvasDrag;
+        owner->m_canvasDrag = CanvasDrag::None;
+        owner->m_dragPart = SelectionPart::None;
+        owner->m_pendingConfirm = false;
+        owner->m_reselectPending = false;
+        owner->m_annotController.ClearTransientDragState();
+        if (prev == CanvasDrag::MoveOrResize || (prev == CanvasDrag::NewRectangle && owner->m_hasSelection))
+        {
+            owner->Settle();
+        }
+        inv |= ui::Invalidate::Paint;
+    }
+
+    void Overlay::CanvasLayer::OnCapturedModifiersChanged(
+        POINT point, KeyModifiers mods, ui::Invalidate& inv)
+    {
+        if (owner->m_canvasDrag == CanvasDrag::Annotation
+            && owner->m_annotController.OnModifiersChanged(
+                point, mods, owner->m_selection,
+                owner->m_device.dwriteFactory(), owner->m_device.dpi()))
+        {
+            inv |= ui::Invalidate::Paint;
+        }
+    }
+
+    ui::EventOutcome Overlay::CanvasLayer::OnRightUp(const ui::PointerInput&, ui::Invalidate&)
+    {
+        owner->Cancel();
+        return ui::EventOutcome::Handled;
+    }
+
+    ui::EventOutcome Overlay::CanvasLayer::OnWheel(
+        const ui::PointerInput& in, ui::Invalidate& inv)
+    {
+        if (owner->m_toolMode == ToolbarButton::TextRecognition)
+        {
+            return ui::EventOutcome::Handled;
+        }
+
+        if (owner->m_smart)
+        {
+            const int steps = owner->m_canvasWheelAccum.Feed(in.wheelDelta, 1u);
+            if (steps == 0)
             {
-                return;
+                return ui::EventOutcome::Handled;
             }
-            m_selection = adjusted;
-            m_displaySelection = adjusted;
-            Settle();
-            RequestRender();
-            return;
+            const int previousDepth = owner->m_depth;
+            owner->m_depth -= steps;
+            owner->m_depth = std::clamp(owner->m_depth, -8, 0);
+
+            const POINT screen{ in.point.x + owner->m_bounds.left, in.point.y + owner->m_bounds.top };
+            if (owner->m_picker.Ladder(screen, owner->m_ladder, 6) < 0)
+            {
+                owner->m_depth = previousDepth;
+                return ui::EventOutcome::Handled;
+            }
+            owner->m_lastQuery = GetTickCount64();
+            owner->ApplyLadderLevel();
+            inv |= ui::Invalidate::Paint;
+            return ui::EventOutcome::Handled;
         }
 
-        const int previousDepth = m_depth;
-        m_depth += delta < 0 ? 1 : -1;
-        m_depth = std::clamp(m_depth, -8, 0);
-
-        const POINT screen{ point.x + m_bounds.left, point.y + m_bounds.top };
-        if (m_picker.Ladder(screen, m_ladder, 6) < 0)
+        if (owner->m_toolMode == ToolbarButton::EditSelection && owner->m_hasSelection)
         {
-            m_depth = previousDepth;
-            return;
+            const int steps = owner->m_canvasWheelAccum.Feed(in.wheelDelta, 2u);
+            if (steps == 0)
+            {
+                return ui::EventOutcome::Handled;
+            }
+            const RECT bounds = owner->ClientBounds();
+            RECT adjusted = owner->m_selection;
+            if (steps > 0)
+            {
+                adjusted.left = std::max(bounds.left, adjusted.left - steps);
+                adjusted.top = std::max(bounds.top, adjusted.top - steps);
+                adjusted.right = std::min(bounds.right, adjusted.right + steps);
+                adjusted.bottom = std::min(bounds.bottom, adjusted.bottom + steps);
+            }
+            else
+            {
+                const int shrink = -steps;
+                if (adjusted.right - adjusted.left <= shrink * 2
+                    || adjusted.bottom - adjusted.top <= shrink * 2)
+                {
+                    return ui::EventOutcome::Handled;
+                }
+                adjusted.left += shrink;
+                adjusted.top += shrink;
+                adjusted.right -= shrink;
+                adjusted.bottom -= shrink;
+            }
+            if (!EqualRect(&adjusted, &owner->m_selection))
+            {
+                owner->m_selection = adjusted;
+                owner->m_displaySelection = adjusted;
+                owner->Settle();
+                inv |= ui::Invalidate::Paint;
+            }
         }
-        m_lastQuery = GetTickCount64();
-        ApplyLadderLevel();
-        RequestRender();
+        return ui::EventOutcome::Handled;
     }
 
-    void Overlay::Invoke(ToolbarButton button)
+    ui::EventOutcome Overlay::CanvasLayer::OnKeyDown(
+        WPARAM key, KeyModifiers mods, ui::Invalidate& inv)
     {
-        if (button == ToolbarButton::Cancel)
+        if (key == VK_ESCAPE)
         {
-            Cancel();
-            return;
-        }
-        if (button == ToolbarButton::EditSelection)
-        {
-            m_mode = OperationMode::EditSelection;
-            m_ocrPanel.CancelInteractions(m_window);
-            SetFocus(m_window);
-            RequestRender();
-            return;
-        }
-        if (button == ToolbarButton::TextRecognition)
-        {
-            EnterTextRecognitionMode();
-            return;
-        }
-        if (button != ToolbarButton::Copy)
-        {
-            return;
-        }
-        if (m_mode == OperationMode::TextRecognition)
-        {
-            CopyOcrText(true);
-            return;
+            owner->Cancel();
+            return ui::EventOutcome::Handled;
         }
 
-        const RECT region{ m_selection.left + m_bounds.left,
-                           m_selection.top + m_bounds.top,
-                           m_selection.right + m_bounds.left,
-                           m_selection.bottom + m_bounds.top };
-
-        try
+        if (!owner->m_smart && owner->m_hasSelection)
         {
-            m_image.CopyToClipboard(m_window, region);
-        }
-        catch (...)
-        {
-            ReportCurrentException(__FILEW__, __LINE__);
+            bool syncTb = false;
+            bool syncIme = false;
+            if (owner->m_annotController.OnKeyDown(
+                owner->m_window, key, owner->m_toolMode,
+                owner->m_device.dwriteFactory(), owner->m_device.dpi(),
+                syncTb, syncIme, mods))
+            {
+                if (owner->m_colorPicker.isOpen()
+                    && (key == 'Z' || key == 'Y' || key == VK_DELETE || key == VK_BACK))
+                {
+                    owner->DismissColorPicker(false, inv);
+                }
+                if (syncTb) inv |= ui::Invalidate::Layout;
+                if (syncIme) inv |= ui::Invalidate::Ime;
+                inv |= ui::Invalidate::Paint;
+                return ui::EventOutcome::Handled;
+            }
         }
 
-        Cancel();
+        if (key == VK_RETURN && !owner->m_smart && owner->m_hasSelection)
+        {
+            owner->Invoke(ToolbarButton::Copy, inv);
+            return ui::EventOutcome::Handled;
+        }
+        if (key == 'C' && mods.ctrl && !owner->m_smart && owner->m_hasSelection)
+        {
+            owner->Invoke(ToolbarButton::Copy, inv);
+            return ui::EventOutcome::Handled;
+        }
+
+        if (key == VK_LEFT || key == VK_UP || key == VK_RIGHT || key == VK_DOWN)
+        {
+            POINT cursor{};
+            if (GetCursorPos(&cursor))
+            {
+                switch (key)
+                {
+                case VK_LEFT:  --cursor.x; break;
+                case VK_UP:    --cursor.y; break;
+                case VK_RIGHT: ++cursor.x; break;
+                case VK_DOWN:  ++cursor.y; break;
+                }
+                SetCursorPos(cursor.x, cursor.y);
+            }
+            return ui::EventOutcome::Handled;
+        }
+        return ui::EventOutcome::Ignored;
     }
 
-    void Overlay::EnterTextRecognitionMode()
+    std::optional<LPCWSTR> Overlay::CanvasLayer::CursorForPoint(POINT point, bool captured) const
     {
-        if (!m_hasSelection)
+        if (captured)
         {
-            return;
+            switch (owner->m_canvasDrag)
+            {
+            case CanvasDrag::MoveOrResize:
+                return CursorForPart(owner->m_dragPart);
+            case CanvasDrag::NewRectangle:
+                return IDC_CROSS;
+            case CanvasDrag::Annotation:
+                if (const LPCWSTR hc = owner->m_annotController.CursorForSelectedHandle(
+                    point, owner->m_toolMode, owner->m_device.dwriteFactory(), owner->m_device.dpi()))
+                {
+                    return hc;
+                }
+                return (owner->m_toolMode == ToolbarButton::SelectObject || QueryCurrentKeyModifiers().ctrl)
+                    ? IDC_ARROW
+                    : IDC_CROSS;
+            case CanvasDrag::None:
+            default:
+                break;
+            }
         }
 
-        m_ocrPanel.Enter(m_window, m_ocrRuntime, m_image, m_bounds, m_selection);
-        m_mode = OperationMode::TextRecognition;
-        m_smart = false;
-        SetFocus(m_window);
-        RequestRender();
-    }
-
-    void Overlay::CopyOcrText(bool closeAfterCopy)
-    {
-        m_ocrPanel.CopyText(m_window);
-
-        if (closeAfterCopy)
+        if (owner->m_toolMode == ToolbarButton::TextRecognition)
         {
-            Cancel();
+            return IDC_ARROW;
         }
+        if (owner->m_smart)
+        {
+            return IDC_CROSS;
+        }
+        if (owner->m_hasSelection)
+        {
+            if (const LPCWSTR hc = owner->m_annotController.CursorForSelectedHandle(
+                point, owner->m_toolMode, owner->m_device.dwriteFactory(), owner->m_device.dpi()))
+            {
+                return hc;
+            }
+            const SelectionPart selPart = HitTestSelection(owner->m_selection, point, owner->m_handleSize);
+            if (selPart != SelectionPart::None && selPart != SelectionPart::Body)
+            {
+                return CursorForPart(selPart);
+            }
+            if (owner->m_toolMode == ToolbarButton::EditSelection)
+            {
+                if (selPart == SelectionPart::Body)
+                {
+                    return IDC_SIZEALL;
+                }
+                return owner->m_annotController.empty() ? IDC_CROSS : IDC_ARROW;
+            }
+            return owner->m_annotController.CursorForCanvasPoint(
+                point, owner->m_toolMode, QueryCurrentKeyModifiers(),
+                owner->m_device.dwriteFactory(), owner->m_device.dpi());
+        }
+        return (owner->m_toolMode == ToolbarButton::EditSelection) ? IDC_CROSS : IDC_ARROW;
     }
 
+    // -------------------------------------------------------------------------
+    // Memory / VRAM pressure trimming & DirectComposition frame rendering
+    // -------------------------------------------------------------------------
     void Overlay::TrimCpuCaches() noexcept
     {
         m_image.Clear();
@@ -1014,6 +1822,10 @@ namespace agshot
     {
         m_ocrPanel.InvalidateLayout();
         m_ocrPanel.InvalidateSpinner();
+        m_annotController.DiscardDeviceResources();
+        m_colorPicker.DiscardDeviceResources();
+        m_colorPicker.InvalidateLayouts();
+        m_toolbarController.InvalidateLayouts();
         m_renderer.InvalidateLayouts();
         m_device.TrimGpuCaches();
     }
@@ -1144,10 +1956,10 @@ namespace agshot
             QueryPerformanceCounter(&renderStart);
         }
 
-        HRESULT hr = m_device.BeginFrameDraw(m_width, m_height);
-        if (FAILED(hr))
+        const HRESULT beginHr = m_device.BeginFrameDraw(m_width, m_height);
+        if (FAILED(beginHr))
         {
-            return hr;
+            return beginHr;
         }
         auto abortFrame = wil::scope_exit([&] { m_device.AbortFrameDraw(); });
 
@@ -1166,38 +1978,76 @@ namespace agshot
             context->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f));
         }
 
+        // Pass 1: Full-canvas annotation primitives underneath the dim mask
         const RECT activeSelection = m_smart ? m_displaySelection : m_selection;
+        if (m_toolMode != ToolbarButton::TextRecognition
+            && (!m_annotController.empty() || m_annotController.isInteracting()))
+        {
+            m_annotController.DrawCanvasContent(
+                m_device.d2dFactory(),
+                context,
+                m_device.roundStroke(),
+                m_device.dwriteFactory(),
+                m_device.background(),
+                m_device.dpi());
+        }
+
+        // Pass 2: Dim mask outside activeSelection
         m_renderer.DrawDim(context, m_width, m_height, m_hasSelection, activeSelection,
                            m_device.brushes());
+
+        // Pass 3: Selection border/handles & unclipped annotation chrome / OCR panel
         if (m_hasSelection)
         {
-            if (m_mode == OperationMode::TextRecognition)
+            if (m_toolMode == ToolbarButton::TextRecognition)
             {
                 m_ocrPanel.Draw(context, m_device.dwriteFactory(), m_device.textFormat(),
                                 m_selection, m_device.dpi(), m_device.brushes());
             }
             else
             {
-                m_renderer.DrawSelection(m_device, m_width, m_height,
-                                         activeSelection, m_smart, m_handleSize);
+                m_renderer.DrawSelection(
+                    m_device, m_width, m_height, activeSelection, m_smart, m_handleSize, true);
+                m_annotController.DrawOverlayChrome(
+                    m_device.d2dFactory(),
+                    context,
+                    m_device.dwriteFactory(),
+                    m_device.dpi(),
+                    &m_device.brushes());
             }
         }
-        if (m_toolbarVisible)
+
+        // Pass 4: Floating HUD overlays (Toolbar, ColorPicker, Tooltip, PixelMagnifier)
+        if (m_toolbarController.IsVisible())
         {
-            m_renderer.DrawToolbar(m_device, m_toolbar, m_mode == OperationMode::TextRecognition);
-            m_renderer.DrawTooltip(m_device, m_width, m_height, m_toolbar);
+            const bool allowTooltip = !m_layerStack.hasCapture() && !m_colorPicker.visible();
+            m_toolbarController.Draw(m_renderer, m_device, m_toolMode, allowTooltip);
+            if (m_colorPicker.visible())
+            {
+                m_colorPicker.Draw(
+                    context, m_device.dwriteFactory(), m_device.textFormat(),
+                    m_device.brushes(), m_device.dpi(),
+                    m_renderer.EyedropperSvg(context));
+            }
         }
-        const bool pointerOverToolbar = m_toolbarVisible
-            && HitTestToolbarTarget(m_toolbar, m_pointer) != ToolbarHitTarget::None;
-        if (m_mode == OperationMode::EditSelection && !pointerOverToolbar
-            && (!m_toolbarVisible || (m_hasSelection && PtInRect(&m_selection, m_pointer))))
+
+        const ui::IHudLayer* topLayer = m_layerStack.TopmostHit(m_pointer);
+        const bool pointerOverUi = !m_eyedropperActive
+            && (topLayer == &m_toolbarController || topLayer == &m_colorPickerLayer);
+        const bool draggingCanvasSel =
+            (m_canvasDrag == CanvasDrag::NewRectangle || m_canvasDrag == CanvasDrag::MoveOrResize);
+        if ((m_eyedropperActive
+             || (m_toolMode == ToolbarButton::EditSelection
+                 && !m_toolbarController.isDraggingMove()
+                 && (!m_toolbarController.visible()
+                     || (m_hasSelection && PtInRect(&m_selection, m_pointer))
+                     || draggingCanvasSel)))
+            && !pointerOverUi)
         {
-            const bool translucent =
-                m_dragMode == DragMode::NewRectangle || m_dragMode == DragMode::MoveOrResize;
             m_renderer.DrawPixelMagnifier(
                 m_device, m_width, m_height, m_image, m_bounds,
-                m_selection, m_pointer, m_dragMode == DragMode::MoveOrResize,
-                m_dragPart, translucent);
+                m_selection, m_pointer, m_canvasDrag == CanvasDrag::MoveOrResize,
+                m_dragPart, draggingCanvasSel);
         }
         m_stats.Draw(m_device, m_width);
 
@@ -1205,8 +2055,6 @@ namespace agshot
         const HRESULT endHr = m_device.EndFrameDraw();
         if (collectStats && SUCCEEDED(endHr))
         {
-            // Draw() must run before EndDraw()/Commit(), so record the full
-            // frame draw-and-commit duration here for display on the next frame.
             m_stats.RecordFrameDuration(renderStart.QuadPart);
         }
         return endHr;
@@ -1227,7 +2075,7 @@ namespace agshot
         switch (message)
         {
         case kOcrResultMessage:
-            if (m_ocrPanel.HandleResultMessage(lparam) && m_mode == OperationMode::TextRecognition)
+            if (m_ocrPanel.HandleResultMessage(lparam) && m_toolMode == ToolbarButton::TextRecognition)
             {
                 RequestRender();
             }
@@ -1243,9 +2091,11 @@ namespace agshot
             m_handleSize = MulDiv(kHandleSize, dpi, 96);
             m_ocrPanel.InvalidateSpinner();
             m_ocrPanel.InvalidateLayout();
+            m_colorPicker.InvalidateLayouts();
+            m_toolbarController.InvalidateLayouts();
             m_renderer.InvalidateLayouts();
             m_device.OnDpiChanged(dpi);
-            if (m_toolbarVisible)
+            if (m_toolbarController.visible())
             {
                 Settle();
             }
@@ -1299,7 +2149,6 @@ namespace agshot
             {
                 return 0;
             }
-
             if (m_animatingSelection)
             {
                 LARGE_INTEGER now{};
@@ -1310,7 +2159,7 @@ namespace agshot
             endClock.reset();
 
             if (m_animatingSelection
-                || (m_mode == OperationMode::TextRecognition && m_ocrPanel.pending()))
+                || (m_toolMode == ToolbarButton::TextRecognition && m_ocrPanel.pending()))
             {
                 m_clock.RequestFrame(m_window, kFrameMessage);
             }
@@ -1343,25 +2192,68 @@ namespace agshot
             POINT point{};
             if (!PointerEvent(wparam, info, point))
             {
-                break;
+                return 0;
             }
 
-            switch (info.ButtonChangeType)
+            const ui::PointerKind pkind = (info.pointerType == PT_TOUCH)
+                ? ui::PointerKind::Touch
+                : ((info.pointerType == PT_PEN) ? ui::PointerKind::Pen : ui::PointerKind::Mouse);
+
+            ui::Invalidate inv = ui::Invalidate::None;
+            if ((info.pointerFlags & POINTER_FLAG_CANCELED) != 0)
             {
-            case POINTER_CHANGE_FIRSTBUTTON_DOWN:
-                OnLeftButtonDown(point);
+                m_layerStack.CancelCapture(inv);
+                m_layerStack.ClearHover(inv);
+                FlushInvalidation(inv);
                 return 0;
-            case POINTER_CHANGE_FIRSTBUTTON_UP:
-                OnLeftButtonUp(point);
-                return 0;
-            case POINTER_CHANGE_SECONDBUTTON_UP:
-                ShowOcrContextMenu(point);
-                return 0;
-            default:
-                break;
             }
 
-            OnMouseMove(point);
+            const ui::PointerInput in{ point, QueryCurrentKeyModifiers(), 0, pkind };
+
+            if (info.ButtonChangeType == POINTER_CHANGE_FIRSTBUTTON_DOWN
+                || (message == WM_POINTERDOWN && info.ButtonChangeType == POINTER_CHANGE_NONE))
+            {
+                m_pointer = point;
+                m_layerStack.DispatchLeftDown(in, inv);
+                FlushInvalidation(inv);
+                return 0;
+            }
+
+            if (info.ButtonChangeType == POINTER_CHANGE_FIRSTBUTTON_UP
+                || (message == WM_POINTERUP && info.ButtonChangeType == POINTER_CHANGE_NONE))
+            {
+                m_pointer = point;
+                m_layerStack.DispatchLeftUp(in, inv);
+                if (pkind == ui::PointerKind::Touch)
+                {
+                    m_layerStack.ClearHover(inv);
+                }
+                FlushInvalidation(inv);
+                return 0;
+            }
+
+            if (info.ButtonChangeType == POINTER_CHANGE_SECONDBUTTON_UP)
+            {
+                m_pointer = point;
+                m_layerStack.DispatchRightUp(in, inv);
+                FlushInvalidation(inv);
+                return 0;
+            }
+
+            // Touch has no non-contact hover cursor.
+            if (pkind == ui::PointerKind::Touch
+                && !m_layerStack.hasCapture()
+                && (info.pointerFlags & POINTER_FLAG_INCONTACT) == 0)
+            {
+                return 0;
+            }
+
+            if (point.x != m_pointer.x || point.y != m_pointer.y)
+            {
+                m_pointer = point;
+                m_layerStack.DispatchMove(in, inv);
+                FlushInvalidation(inv);
+            }
             return 0;
         }
 
@@ -1371,22 +2263,46 @@ namespace agshot
             POINT point{};
             if (!PointerEvent(wparam, info, point))
             {
-                break;
+                return 0;
             }
-            OnMouseMove(point);
+            if (info.pointerType == PT_TOUCH)
+            {
+                return 0;
+            }
+            if (point.x != m_pointer.x || point.y != m_pointer.y)
+            {
+                m_pointer = point;
+                const ui::PointerKind pkind =
+                    (info.pointerType == PT_PEN) ? ui::PointerKind::Pen : ui::PointerKind::Mouse;
+                ui::Invalidate inv = ui::Invalidate::None;
+                m_layerStack.DispatchMove(
+                    ui::PointerInput{ point, QueryCurrentKeyModifiers(), 0, pkind }, inv);
+                FlushInvalidation(inv);
+            }
             return 0;
         }
 
         case WM_POINTERLEAVE:
-            m_toolbar.hovered = ToolbarButton::None;
-            RequestRender();
+        {
+            ui::Invalidate inv = ui::Invalidate::None;
+            m_layerStack.ClearHover(inv);
+            FlushInvalidation(inv);
             return 0;
+        }
 
         case WM_POINTERWHEEL:
         {
             POINT point{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
             ScreenToClient(hwnd, &point);
-            OnWheel(point, GET_WHEEL_DELTA_WPARAM(wparam));
+            const RECT bounds = ClientBounds();
+            const int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+            if (delta != 0 && PtInRect(&bounds, point))
+            {
+                ui::Invalidate inv = ui::Invalidate::None;
+                m_layerStack.DispatchWheel(
+                    ui::PointerInput{ point, QueryCurrentKeyModifiers(), delta }, inv);
+                FlushInvalidation(inv);
+            }
             return 0;
         }
 
@@ -1394,42 +2310,17 @@ namespace agshot
             return 0;
 
         case WM_POINTERCAPTURECHANGED:
-            if (m_dragMode != DragMode::None)
-            {
-                m_dragMode = DragMode::None;
-                m_dragPart = SelectionPart::None;
-                Settle();
-            }
-            m_ocrPanel.CancelInteractions(m_window);
-            RequestRender();
-            return 0;
-
-        case WM_MOUSEMOVE:
-            OnMouseMove(POINT{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) });
-            return 0;
-
-        case WM_LBUTTONDOWN:
-            OnLeftButtonDown(POINT{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) });
-            return 0;
-
-        case WM_LBUTTONUP:
-            OnLeftButtonUp(POINT{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) });
-            return 0;
-
-        case WM_RBUTTONUP:
-            ShowOcrContextMenu(POINT{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) });
-            return 0;
-
-        case WM_MOUSELEAVE:
-            m_toolbar.hovered = ToolbarButton::None;
-            RequestRender();
-            return 0;
-
-        case WM_MOUSEWHEEL:
+        case WM_CANCELMODE:
         {
-            POINT point{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
-            ScreenToClient(hwnd, &point);
-            OnWheel(point, GET_WHEEL_DELTA_WPARAM(wparam));
+            ui::Invalidate inv = ui::Invalidate::Paint;
+            m_layerStack.CancelCapture(inv);
+            if (m_eyedropperActive)
+            {
+                m_eyedropperActive = false;
+                m_colorPicker.ResumeFromEyedropper();
+                inv |= ui::Invalidate::Ime;
+            }
+            FlushInvalidation(inv);
             return 0;
         }
 
@@ -1441,72 +2332,89 @@ namespace agshot
             ApplyCursor();
             return TRUE;
 
-        case WM_KEYDOWN:
-            if (wparam == VK_ESCAPE)
+        case WM_IME_SETCONTEXT:
+            lparam &= ~static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW);
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+
+        case WM_IME_STARTCOMPOSITION:
+            if (m_layerStack.FocusedImeLayer() == &m_textEditorLayer
+                && m_annotController.OnImeStartComposition(m_window, m_device.dwriteFactory(), m_device.dpi()))
             {
-                Cancel();
+                RequestRender();
                 return 0;
             }
-            if (m_mode == OperationMode::TextRecognition)
+            break;
+
+        case WM_IME_COMPOSITION:
+            if (m_layerStack.FocusedImeLayer() == &m_textEditorLayer
+                && m_annotController.OnImeComposition(m_window, lparam, m_device.dwriteFactory(), m_device.dpi()))
             {
-                bool shouldClose = false;
-                bool needsRender = false;
-                if (m_ocrPanel.OnKeyDown(m_window, m_selection, wparam, m_device.dpi(),
-                                         m_device.dwriteFactory(), m_device.textFormat(),
-                                         shouldClose, needsRender))
+                RequestRender();
+                return 0;
+            }
+            break;
+
+        case WM_IME_ENDCOMPOSITION:
+            if (m_layerStack.FocusedImeLayer() == &m_textEditorLayer
+                && m_annotController.OnImeEndComposition(m_window))
+            {
+                RequestRender();
+                return 0;
+            }
+            break;
+
+        case WM_KEYUP:
+        case WM_SYSKEYUP:
+            if (wparam == VK_SHIFT || wparam == VK_CONTROL || wparam == VK_MENU)
+            {
+                ui::Invalidate inv = ui::Invalidate::None;
+                m_layerStack.DispatchModifiersChanged(m_pointer, QueryCurrentKeyModifiers(), inv);
+                FlushInvalidation(inv);
+                if (message == WM_SYSKEYUP && wparam == VK_MENU)
                 {
-                    if (shouldClose)
-                    {
-                        Cancel();
-                    }
-                    else if (needsRender)
-                    {
-                        RequestRender();
-                    }
                     return 0;
                 }
-                break;
             }
-            if (wparam == VK_RETURN && !m_smart && m_hasSelection)
+            break;
+
+        case WM_SYSKEYDOWN:
+            if (wparam == VK_MENU)
             {
-                Invoke(ToolbarButton::Copy);
-                return 0;
-            }
-            if (wparam == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)
-                && !m_smart && m_hasSelection)
-            {
-                Invoke(ToolbarButton::Copy);
-                return 0;
-            }
-            if (wparam == VK_LEFT || wparam == VK_UP
-                || wparam == VK_RIGHT || wparam == VK_DOWN)
-            {
-                POINT cursor{};
-                if (GetCursorPos(&cursor))
-                {
-                    switch (wparam)
-                    {
-                    case VK_LEFT:  --cursor.x; break;
-                    case VK_UP:    --cursor.y; break;
-                    case VK_RIGHT: ++cursor.x; break;
-                    case VK_DOWN:  ++cursor.y; break;
-                    }
-                    SetCursorPos(cursor.x, cursor.y);
-                }
+                ui::Invalidate inv = ui::Invalidate::None;
+                m_layerStack.DispatchModifiersChanged(m_pointer, QueryCurrentKeyModifiers(), inv);
+                FlushInvalidation(inv);
                 return 0;
             }
             break;
+
+        case WM_KEYDOWN:
+        {
+            if (wparam == VK_SHIFT || wparam == VK_CONTROL || wparam == VK_MENU)
+            {
+                ui::Invalidate inv = ui::Invalidate::None;
+                m_layerStack.DispatchModifiersChanged(m_pointer, QueryCurrentKeyModifiers(), inv);
+                FlushInvalidation(inv);
+                return 0;
+            }
+            ui::Invalidate inv = ui::Invalidate::None;
+            if (m_layerStack.DispatchKeyDown(wparam, QueryCurrentKeyModifiers(), inv))
+            {
+                FlushInvalidation(inv);
+                return 0;
+            }
+            break;
+        }
 
         case WM_CHAR:
-            if (m_mode == OperationMode::TextRecognition)
+        {
+            ui::Invalidate inv = ui::Invalidate::None;
+            if (m_layerStack.DispatchChar(static_cast<wchar_t>(wparam), inv))
             {
+                FlushInvalidation(inv);
                 return 0;
             }
             break;
-
-        case WM_CANCELMODE:
-            m_ocrPanel.StopSelection(m_window);
-            return 0;
+        }
 
         case WM_NCDESTROY:
         {

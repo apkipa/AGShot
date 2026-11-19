@@ -31,6 +31,7 @@ IDI_AGSHOT              ICON                    "AGShot.ico"
 //
 
 IDR_SETTINGS_HTML       RCDATA                  "settings.mszip"
+IDR_HUD_ICONS           RCDATA                  "icons.mszip"
 
 #ifdef APSTUDIO_INVOKED
 /////////////////////////////////////////////////////////////////////////////

@@ -5,8 +5,10 @@
 
 #include "core/app_ipc.h"
 #include "core/config.h"
+#include "core/embedded_resource.h"
 #include "core/error.h"
 #include "core/hotkey.h"
+#include "core/icon_pack.h"
 #include "core/ocr_manifest.h"
 #include "core/text.h"
 
@@ -171,93 +173,6 @@ namespace agshot
                 }
             }
             return out;
-        }
-
-        bool LoadHtmlResource(const void*& data, DWORD& size) noexcept
-        {
-            HMODULE module = GetModuleHandleW(nullptr);
-            HRSRC res = FindResourceW(module, MAKEINTRESOURCEW(IDR_SETTINGS_HTML), RT_RCDATA);
-            if (res == nullptr)
-            {
-                return false;
-            }
-            HGLOBAL loaded = LoadResource(module, res);
-            if (loaded == nullptr)
-            {
-                return false;
-            }
-            const DWORD bytes = SizeofResource(module, res);
-            const void* ptr = LockResource(loaded);
-            if (ptr == nullptr || bytes == 0)
-            {
-                return false;
-            }
-            data = ptr;
-            size = bytes;
-            return true;
-        }
-
-        bool DecompressMszipResource(const void* compressedData, DWORD compressedSize,
-                                     std::vector<std::uint8_t>& out) noexcept
-        {
-            if (compressedData == nullptr || compressedSize == 0)
-            {
-                return false;
-            }
-
-            wil::unique_any<DECOMPRESSOR_HANDLE, decltype(&::CloseDecompressor), ::CloseDecompressor> decompressor;
-            if (!CreateDecompressor(COMPRESS_ALGORITHM_MSZIP, nullptr, decompressor.put()))
-            {
-                return false;
-            }
-
-            SIZE_T required = 0;
-            if (!Decompress(decompressor.get(), compressedData, compressedSize, nullptr, 0, &required)
-                && GetLastError() != ERROR_INSUFFICIENT_BUFFER)
-            {
-                return false;
-            }
-
-            constexpr SIZE_T kMaxHtmlBytes = 16 * 1024 * 1024;
-            if (required == 0 || required > kMaxHtmlBytes)
-            {
-                return false;
-            }
-
-            out.resize(required);
-            SIZE_T written = 0;
-            if (!Decompress(decompressor.get(), compressedData, compressedSize,
-                            out.data(), out.size(), &written))
-            {
-                out.clear();
-                return false;
-            }
-            out.resize(written);
-            return !out.empty();
-        }
-
-        HRESULT CreateUtf8Stream(const void* data, DWORD size, winrt::com_ptr<IStream>& stream) noexcept
-        {
-            winrt::com_ptr<IStream> mem;
-            const HRESULT hr = CreateStreamOnHGlobal(nullptr, TRUE, mem.put());
-            if (FAILED(hr))
-            {
-                return hr;
-            }
-            ULONG written = 0;
-            const HRESULT writeHr = mem->Write(data, size, &written);
-            if (FAILED(writeHr) || written != size)
-            {
-                return FAILED(writeHr) ? writeHr : E_FAIL;
-            }
-            const LARGE_INTEGER zero{};
-            const HRESULT seekHr = mem->Seek(zero, STREAM_SEEK_SET, nullptr);
-            if (FAILED(seekHr))
-            {
-                return seekHr;
-            }
-            stream = std::move(mem);
-            return S_OK;
         }
 
         RECT ClampBoundsToMonitor(const RECT& candidate, int minWidthPx, int minHeightPx) noexcept
@@ -764,6 +679,59 @@ namespace agshot
             }
 
             const std::wstring_view target{ uri.get() };
+            constexpr std::wstring_view kIconsPrefix = L"https://app.local/icons/";
+            constexpr std::wstring_view kSvgSuffix = L".svg";
+            if (target.size() > kIconsPrefix.size() + kSvgSuffix.size()
+                && target.compare(0, kIconsPrefix.size(), kIconsPrefix) == 0
+                && target.compare(target.size() - kSvgSuffix.size(), kSvgSuffix.size(), kSvgSuffix) == 0)
+            {
+                const std::wstring_view wname = target.substr(
+                    kIconsPrefix.size(),
+                    target.size() - kIconsPrefix.size() - kSvgSuffix.size());
+                std::string name;
+                name.reserve(wname.size());
+                bool safeName = !wname.empty();
+                for (wchar_t ch : wname)
+                {
+                    if ((ch >= L'a' && ch <= L'z') || (ch >= L'0' && ch <= L'9')
+                        || ch == L'_' || ch == L'-')
+                    {
+                        name.push_back(static_cast<char>(ch));
+                    }
+                    else
+                    {
+                        safeName = false;
+                        break;
+                    }
+                }
+                const std::string_view svg = safeName
+                    ? SharedHudIconPack().SvgByName(name)
+                    : std::string_view{};
+                if (!svg.empty())
+                {
+                    winrt::com_ptr<IStream> iconStream;
+                    if (SUCCEEDED(CreateMemoryStream(svg.data(), static_cast<DWORD>(svg.size()), iconStream)))
+                    {
+                        winrt::com_ptr<ICoreWebView2WebResourceResponse> iconResponse;
+                        if (SUCCEEDED(m_env->CreateWebResourceResponse(
+                                iconStream.get(), 200, L"OK",
+                                L"Content-Type: image/svg+xml; charset=utf-8\r\nCache-Control: immutable, max-age=3600",
+                                iconResponse.put()))
+                            && iconResponse)
+                        {
+                            args->put_Response(iconResponse.get());
+                            return;
+                        }
+                    }
+                }
+                winrt::com_ptr<ICoreWebView2WebResourceResponse> notFound;
+                if (SUCCEEDED(m_env->CreateWebResourceResponse(nullptr, 404, L"Not Found", L"", notFound.put())))
+                {
+                    args->put_Response(notFound.get());
+                }
+                return;
+            }
+
             if (target != kSettingsUrl)
             {
                 winrt::com_ptr<ICoreWebView2WebResourceResponse> emptyResponse;
@@ -774,21 +742,14 @@ namespace agshot
                 return;
             }
 
-            const void* data = nullptr;
-            DWORD size = 0;
-            if (!LoadHtmlResource(data, size))
-            {
-                return;
-            }
-
             std::vector<std::uint8_t> htmlBytes;
-            if (!DecompressMszipResource(data, size, htmlBytes))
+            if (!LoadMszipResource(GetModuleHandleW(nullptr), IDR_SETTINGS_HTML, htmlBytes))
             {
                 return;
             }
 
             winrt::com_ptr<IStream> stream;
-            if (FAILED(CreateUtf8Stream(htmlBytes.data(), static_cast<DWORD>(htmlBytes.size()), stream)))
+            if (FAILED(CreateMemoryStream(htmlBytes.data(), static_cast<DWORD>(htmlBytes.size()), stream)))
             {
                 return;
             }

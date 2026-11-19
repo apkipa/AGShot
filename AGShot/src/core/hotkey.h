@@ -40,4 +40,15 @@ namespace agshot
 
     // The canonical spelling, which is what gets written back to the file.
     std::wstring FormatHotkey(const Hotkey& hotkey);
+
+    // TODO(app-hotkeys): Design a scoped multi-binding application hotkey system
+    // separate from OS-wide RegisterHotKey global hotkeys:
+    //   1. Partition actions by active scope (Capture, Annotation, Ocr, etc.).
+    //   2. Store 0..N AppKeyBinding entries per action (add/delete bindings per
+    //      action, per-category reset-to-default, transactional Cancel/Confirm UI
+    //      modal editing, and config.toml persistence).
+    //   3. Support single keys (W/A/S/D, Up/Down/Left/Right, Tab, Q, R, ',', '.'),
+    //      modifier chords (Ctrl+Tab, Ctrl+Shift+Tab), and pure modifier hold
+    //      bindings (Shift lock ratio/angle, Alt from-center, Ctrl edge snap),
+    //      driving both HUD shortcut hints and runtime input dispatch.
 }

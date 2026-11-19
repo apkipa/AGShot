@@ -84,7 +84,7 @@
       <GenerateWindowsMetadata>false</GenerateWindowsMetadata>
       <!-- windowscodecs and psapi come from OcrEngine: it decodes images through
            WIC and reports process memory through PSAPI. -->
-      <AdditionalDependencies>d2d1.lib;d3d11.lib;dcomp.lib;dwrite.lib;dxgi.lib;shell32.lib;comctl32.lib;ole32.lib;gdi32.lib;dwmapi.lib;uiautomationcore.lib;windowscodecs.lib;psapi.lib;cabinet.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d2d1.lib;d3d11.lib;dcomp.lib;dwrite.lib;dxgi.lib;dxguid.lib;imm32.lib;shell32.lib;comctl32.lib;ole32.lib;gdi32.lib;dwmapi.lib;uiautomationcore.lib;windowscodecs.lib;psapi.lib;cabinet.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <AdditionalIncludeDirectories>$(IntDir)frontend;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -103,7 +103,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
-      <Optimization>MaxSpeed</Optimization>
+      <Optimization>MinSpace</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>NDEBUG;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -122,41 +122,68 @@
     <ClInclude Include="src\core\memory_watch.h" />
     <ClInclude Include="src\core\ocr_manifest.h" />
     <ClInclude Include="src\core\ocr_runtime.h" />
+    <ClInclude Include="src\core\embedded_resource.h" />
     <ClInclude Include="src\core\error.h" />
     <ClInclude Include="src\core\hotkey.h" />
+    <ClInclude Include="src\core\icon_pack.h" />
     <ClInclude Include="src\core\text.h" />
     <ClInclude Include="src\core\tray_icon.h" />
     <ClInclude Include="src\core\screen_capture.h" />
     <ClInclude Include="src\core\ui_element.h" />
+    <ClInclude Include="src\hud\annotation_controller.h" />
+    <ClInclude Include="src\hud\annotations.h" />
+    <ClInclude Include="src\hud\color_model.h" />
+    <ClInclude Include="src\hud\color_picker.h" />
     <ClInclude Include="src\hud\compositor_clock.h" />
     <ClInclude Include="src\hud\hud_renderer.h" />
     <ClInclude Include="src\hud\hud_theme.h" />
+    <ClInclude Include="src\hud\inline_text_editor.h" />
     <ClInclude Include="src\hud\ocr_text_panel.h" />
     <ClInclude Include="src\hud\overlay.h" />
     <ClInclude Include="src\hud\render_device.h" />
     <ClInclude Include="src\hud\selection.h" />
     <ClInclude Include="src\hud\spinner_effect.h" />
+    <ClInclude Include="src\hud\text_edit_utils.h" />
     <ClInclude Include="src\hud\toolbar.h" />
+    <ClInclude Include="src\hud\toolbar_controller.h" />
+    <ClInclude Include="src\hud\ui\ui_dropdown.h" />
+    <ClInclude Include="src\hud\ui\ui_layer_stack.h" />
+    <ClInclude Include="src\hud\ui\ui_layout.h" />
+    <ClInclude Include="src\hud\ui\ui_slider.h" />
+    <ClInclude Include="src\hud\ui\ui_text_field.h" />
+    <ClInclude Include="src\hud\ui\ui_types.h" />
     <ClInclude Include="src\settings\settings_window.h" />
     <ClCompile Include="src\core\config.cpp" />
     <ClCompile Include="src\core\config_watcher.cpp" />
     <ClCompile Include="src\core\memory_watch.cpp" />
     <ClCompile Include="src\core\ocr_manifest.cpp" />
     <ClCompile Include="src\core\ocr_runtime.cpp" />
+    <ClCompile Include="src\core\embedded_resource.cpp" />
     <ClCompile Include="src\core\error.cpp" />
     <ClCompile Include="src\core\hotkey.cpp" />
+    <ClCompile Include="src\core\icon_pack.cpp" />
     <ClCompile Include="src\core\text.cpp" />
     <ClCompile Include="src\core\tray_icon.cpp" />
     <ClCompile Include="src\core\screen_capture.cpp" />
     <ClCompile Include="src\core\ui_element.cpp" />
+    <ClCompile Include="src\hud\annotation_controller.cpp" />
+    <ClCompile Include="src\hud\annotations.cpp" />
+    <ClCompile Include="src\hud\color_model.cpp" />
+    <ClCompile Include="src\hud\color_picker.cpp" />
     <ClCompile Include="src\hud\compositor_clock.cpp" />
     <ClCompile Include="src\hud\hud_renderer.cpp" />
+    <ClCompile Include="src\hud\inline_text_editor.cpp" />
     <ClCompile Include="src\hud\ocr_text_panel.cpp" />
     <ClCompile Include="src\hud\overlay.cpp" />
     <ClCompile Include="src\hud\render_device.cpp" />
     <ClCompile Include="src\hud\selection.cpp" />
     <ClCompile Include="src\hud\spinner_effect.cpp" />
+    <ClCompile Include="src\hud\text_edit_utils.cpp" />
     <ClCompile Include="src\hud\toolbar.cpp" />
+    <ClCompile Include="src\hud\toolbar_controller.cpp" />
+    <ClCompile Include="src\hud\ui\ui_dropdown.cpp" />
+    <ClCompile Include="src\hud\ui\ui_layer_stack.cpp" />
+    <ClCompile Include="src\hud\ui\ui_text_field.cpp" />
     <ClCompile Include="src\settings\settings_window.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\pch.cpp">
@@ -167,8 +194,11 @@
     <Manifest Include="AGShot.exe.manifest" />
     <None Include="packages.config" />
     <None Include="PropertySheet.props" />
+    <None Include="scripts\bake_icons.mjs" />
     <None Include="scripts\compress_mszip.ps1" />
     <None Include="scripts\gen_build_info.ps1" />
+    <None Include="assets\icons\manifest.json" />
+    <None Include="assets\icons\*.svg" />
     <None Include="frontend\index.html" />
     <None Include="frontend\package.json" />
     <None Include="frontend\pnpm-lock.yaml" />
@@ -194,7 +224,24 @@
   </ImportGroup>
   <ItemGroup>
     <SettingsUiInput Include="frontend\index.html;frontend\package.json;frontend\pnpm-lock.yaml;frontend\tsconfig.json;frontend\vite.config.ts;frontend\src\**\*;scripts\compress_mszip.ps1" />
+    <HudIconInput Include="assets\icons\*.svg;assets\icons\manifest.json;scripts\bake_icons.mjs;scripts\compress_mszip.ps1" />
   </ItemGroup>
+  <Target Name="GenerateHudIconHeader"
+          BeforeTargets="ClCompile"
+          Inputs="assets\icons\manifest.json;scripts\bake_icons.mjs"
+          Outputs="$(IntDir)generated\hud_icon_ids.h">
+    <MakeDir Directories="$(IntDir)generated" />
+    <Exec Command="node &quot;$(ProjectDir)scripts\bake_icons.mjs&quot; --header-only --icons-dir &quot;$(ProjectDir)assets\icons&quot; --header-out &quot;$([System.IO.Path]::GetFullPath('$(IntDir)generated\hud_icon_ids.h'))&quot;" />
+  </Target>
+  <Target Name="BakeHudIcons"
+          BeforeTargets="ResourceCompile"
+          Inputs="@(HudIconInput)"
+          Outputs="$(IntDir)generated\icons.pack;$(IntDir)frontend\icons.mszip">
+    <MakeDir Directories="$(IntDir)generated;$(IntDir)frontend" />
+    <Exec Command="if not exist &quot;$(ProjectDir)frontend\node_modules\pathkit-wasm\bin\pathkit.wasm&quot; pnpm --dir &quot;$(ProjectDir)frontend&quot; install --frozen-lockfile" />
+    <Exec Command="node &quot;$(ProjectDir)scripts\bake_icons.mjs&quot; --icons-dir &quot;$(ProjectDir)assets\icons&quot; --pack-out &quot;$([System.IO.Path]::GetFullPath('$(IntDir)generated\icons.pack'))&quot; --pathkit-dir &quot;$(ProjectDir)frontend\node_modules\pathkit-wasm\bin&quot;" />
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\compress_mszip.ps1&quot; -InputPath &quot;$([System.IO.Path]::GetFullPath('$(IntDir)generated\icons.pack'))&quot; -OutputPath &quot;$([System.IO.Path]::GetFullPath('$(IntDir)frontend\icons.mszip'))&quot;" />
+  </Target>
   <Target Name="GenerateBuildInfo" BeforeTargets="ClCompile">
     <MakeDir Directories="$(IntDir)generated" />
     <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)scripts\gen_build_info.ps1&quot; -RepoRoot &quot;$([System.IO.Path]::GetFullPath('$(SolutionDir).'))&quot; -OutputPath &quot;$([System.IO.Path]::GetFullPath('$(IntDir)generated\build_info.h'))&quot;"

@@ -9,19 +9,12 @@ namespace agshot
 {
     namespace
     {
-        // The text-recognition scrollbar. At 3 DIP its track was barely three
-        // pixels wide at 1x and read as a hairline rather than something you
-        // could grab, so it is laid out as a pill of this width instead.
         constexpr int kOcrScrollWidth = 6;
         constexpr int kOcrScrollInset = 5;
-        // Room the text leaves free on the right so it cannot run under the bar.
         constexpr int kOcrScrollGutter = 10;
 
         constexpr UINT kOcrSelectionTimerMs = 30;
 
-        // The mark shown while a capture is being recognized: an arc that turns
-        // once per period, drawn as short segments so the head is opaque and the
-        // tail fades. The segments abut exactly, so the arc reads as one stroke.
         constexpr float kDegreesToRadians = 3.14159265358979f / 180.0f;
         constexpr float kOcrSpinnerSweepDeg = 270.0f;
         constexpr float kOcrSpinnerRadius = 9.0f;
@@ -37,8 +30,21 @@ namespace agshot
         m_cacheValid = false;
         m_caret = 0;
         m_anchor = 0;
+        m_granularSelect.Reset();
+        m_clickTracker.Reset();
         m_selecting = false;
         m_scrollDragging = false;
+        m_scrollY = 0.0f;
+    }
+
+    void OcrTextPanel::SetRecognizedText(std::wstring text) noexcept
+    {
+        InvalidateLayout();
+        m_pending = false;
+        m_text = std::move(text);
+        m_caret = 0;
+        m_anchor = 0;
+        m_granularSelect.Reset();
         m_scrollY = 0.0f;
     }
 
@@ -86,8 +92,6 @@ namespace agshot
 
     void OcrTextPanel::InvalidateLayout() noexcept
     {
-        // Layouts retain the format used to create them. Invalidate them before
-        // replacing any format; object addresses are not a valid cache key.
         m_layout = nullptr;
         m_layoutText.clear();
         m_layoutWidth = -1.0f;
@@ -111,11 +115,9 @@ namespace agshot
             m_cacheValid = true;
             m_caret = 0;
             m_anchor = 0;
+            m_granularSelect.Reset();
             m_scrollY = 0.0f;
 
-            // The box stays empty until there is something to put in it: while a
-            // capture is being recognized it shows the spinner instead, and a
-            // missing model payload is the one case that has text of its own.
             const bool canRecognize = runtime != nullptr && runtime->available();
             m_pending = false;
             m_text = canRecognize ? std::wstring{} : L"OCR models are unavailable.";
@@ -172,6 +174,7 @@ namespace agshot
         }
         m_caret = 0;
         m_anchor = 0;
+        m_granularSelect.Reset();
         m_scrollY = 0.0f;
         return true;
     }
@@ -218,14 +221,14 @@ namespace agshot
     winrt::com_ptr<IDWriteTextLayout> OcrTextPanel::TextLayout(
         const RECT& box, int dpi, IDWriteFactory* dwrite, IDWriteTextFormat* format) const
     {
+        if (dwrite == nullptr || format == nullptr)
+        {
+            return nullptr;
+        }
         const float padding = ScaleByDpi(9, dpi);
         const float width = std::max(1.0f, static_cast<float>(box.right - box.left)
             - padding * 2.0f - ScaleByDpi(kOcrScrollGutter, dpi));
 
-        // Shaping and line-breaking a whole recognition result is far too
-        // expensive to repeat for every frame. The text format is handled by
-        // explicit invalidation when its settings change, so the remaining
-        // cache key is the text and its wrap width.
         if (!m_layout || m_layoutText != m_text || m_layoutWidth != width)
         {
             m_layout = nullptr;
@@ -249,6 +252,11 @@ namespace agshot
         {
             return 0;
         }
+        auto layout = TextLayout(box, dpi, dwrite, format);
+        if (!layout)
+        {
+            return m_text.size();
+        }
 
         const float padding = ScaleByDpi(9, dpi);
         const LONG textLeft = box.left + static_cast<LONG>(padding);
@@ -260,7 +268,6 @@ namespace agshot
         const float y = std::max(0.0f, static_cast<float>(
             std::clamp(point.y, textTop, std::max(textTop, textBottom - 1)) - box.top)
             - padding + m_scrollY);
-        auto layout = TextLayout(box, dpi, dwrite, format);
         BOOL trailing = FALSE;
         BOOL inside = FALSE;
         DWRITE_HIT_TEST_METRICS metrics{};
@@ -280,6 +287,10 @@ namespace agshot
             return 0.0f;
         }
         auto layout = TextLayout(box, dpi, dwrite, format);
+        if (!layout)
+        {
+            return 0.0f;
+        }
         DWRITE_TEXT_METRICS metrics{};
         AGSHOT_CHECK_HR(layout->GetMetrics(&metrics));
         const float viewportHeight = std::max(1.0f,
@@ -291,6 +302,10 @@ namespace agshot
                                           IDWriteFactory* dwrite, IDWriteTextFormat* format)
     {
         auto layout = TextLayout(box, dpi, dwrite, format);
+        if (!layout)
+        {
+            return;
+        }
         FLOAT x = 0.0f;
         FLOAT y = 0.0f;
         DWRITE_HIT_TEST_METRICS caret{};
@@ -314,54 +329,66 @@ namespace agshot
     }
 
     bool OcrTextPanel::MoveCaret(const RECT& box, WPARAM key, int dpi,
-                                 IDWriteFactory* dwrite, IDWriteTextFormat* format)
+                                 IDWriteFactory* dwrite, IDWriteTextFormat* format,
+                                 KeyModifiers mods)
     {
         const std::size_t length = m_text.size();
-        const bool extend = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        const bool extend = mods.shift;
         std::size_t next = m_caret;
         if (key == VK_LEFT || key == VK_RIGHT)
         {
-            if (!extend && m_anchor != m_caret)
+            if (mods.ctrl)
             {
-                next = key == VK_LEFT ? std::min(m_anchor, m_caret)
-                                      : std::max(m_anchor, m_caret);
+                next = (key == VK_LEFT)
+                    ? PrevWordOffset(m_text, next)
+                    : NextWordOffset(m_text, next);
             }
-            else if (key == VK_LEFT && next > 0)
+            else if (!extend && m_anchor != m_caret)
             {
-                --next;
+                next = (key == VK_LEFT)
+                    ? std::min(m_anchor, m_caret)
+                    : std::max(m_anchor, m_caret);
             }
-            else if (key == VK_RIGHT && next < length)
+            else
             {
-                ++next;
+                next = (key == VK_LEFT)
+                    ? PrevCodeUnitOffset(m_text, next)
+                    : NextCodeUnitOffset(m_text, next);
             }
         }
         else if (key == VK_HOME || key == VK_END)
         {
-            const std::size_t lineStart = m_text.rfind(L'\n', next == 0 ? 0 : next - 1);
-            const std::size_t lineEnd = m_text.find(L'\n', next);
-            next = key == VK_HOME
-                ? (lineStart == std::wstring::npos ? 0 : lineStart + 1)
-                : (lineEnd == std::wstring::npos ? length : lineEnd);
+            if (mods.ctrl)
+            {
+                next = (key == VK_HOME) ? 0 : length;
+            }
+            else
+            {
+                const auto [lineStart, lineEnd] = LineRangeAt(m_text, next);
+                next = (key == VK_HOME) ? lineStart : lineEnd;
+            }
         }
         else if (key == VK_UP || key == VK_DOWN)
         {
-            auto layout = TextLayout(box, dpi, dwrite, format);
-            FLOAT x = 0.0f;
-            FLOAT y = 0.0f;
-            DWRITE_HIT_TEST_METRICS caret{};
-            if (SUCCEEDED(layout->HitTestTextPosition(static_cast<UINT32>(m_caret), FALSE,
-                                                       &x, &y, &caret)))
+            if (auto layout = TextLayout(box, dpi, dwrite, format))
             {
-                const float targetY = y + (key == VK_UP ? -caret.height : caret.height);
-                if (targetY >= 0.0f)
+                FLOAT x = 0.0f;
+                FLOAT y = 0.0f;
+                DWRITE_HIT_TEST_METRICS caret{};
+                if (SUCCEEDED(layout->HitTestTextPosition(static_cast<UINT32>(m_caret), FALSE,
+                                                           &x, &y, &caret)))
                 {
-                    BOOL trailing = FALSE;
-                    BOOL inside = FALSE;
-                    DWRITE_HIT_TEST_METRICS target{};
-                    if (SUCCEEDED(layout->HitTestPoint(x, targetY, &trailing, &inside, &target)))
+                    const float targetY = y + (key == VK_UP ? -caret.height : caret.height);
+                    if (targetY >= 0.0f)
                     {
-                        next = std::min<std::size_t>(
-                            target.textPosition + (trailing ? target.length : 0), length);
+                        BOOL trailing = FALSE;
+                        BOOL inside = FALSE;
+                        DWRITE_HIT_TEST_METRICS target{};
+                        if (SUCCEEDED(layout->HitTestPoint(x, targetY, &trailing, &inside, &target)))
+                        {
+                            next = std::min<std::size_t>(
+                                target.textPosition + (trailing ? target.length : 0), length);
+                        }
                     }
                 }
             }
@@ -382,6 +409,7 @@ namespace agshot
         m_selectionPoint = point;
         const float oldScrollY = m_scrollY;
         const std::size_t oldCaret = m_caret;
+        const std::size_t oldAnchor = m_anchor;
         const LONG inset = static_cast<LONG>(ScaleByDpi(9, dpi));
         const LONG top = box.top + inset;
         const LONG bottom = box.bottom - inset;
@@ -398,15 +426,20 @@ namespace agshot
                 m_scrollY + (point.y < top ? -step : step),
                 0.0f, ScrollMaximum(box, dpi, dwrite, format));
         }
-        m_caret = PositionFromPoint(box, POINT{ clampedX, clampedY }, dpi, dwrite, format);
-        return m_caret != oldCaret || m_scrollY != oldScrollY;
+        const std::size_t pos = PositionFromPoint(box, POINT{ clampedX, clampedY }, dpi, dwrite, format);
+        m_granularSelect.ExtendTo(m_text, pos, m_anchor, m_caret);
+        return m_caret != oldCaret || m_anchor != oldAnchor || m_scrollY != oldScrollY;
     }
 
     bool OcrTextPanel::OnLeftButtonDown(
         HWND window, const RECT& box, POINT point, int dpi,
-        IDWriteFactory* dwrite, IDWriteTextFormat* format, bool& needsRender)
+        IDWriteFactory* dwrite, IDWriteTextFormat* format, bool& needsRender,
+        KeyModifiers mods)
     {
-        SetFocus(window);
+        if (window != nullptr)
+        {
+            SetFocus(window);
+        }
         const float scrollMaximum = ScrollMaximum(box, dpi, dwrite, format);
         const RECT scrollTrack = ScrollTrack(box, dpi);
         if (scrollMaximum > 0.0f && PtInRect(&scrollTrack, point))
@@ -430,12 +463,16 @@ namespace agshot
             return true;
         }
 
-        m_caret = PositionFromPoint(box, point, dpi, dwrite, format);
-        m_anchor = m_caret;
+        const int clicks = m_clickTracker.RegisterClick(point);
+        const std::size_t pos = PositionFromPoint(box, point, dpi, dwrite, format);
+        m_granularSelect.BeginClick(m_text, pos, clicks, mods.shift, m_anchor, m_caret);
         EnsureCaretVisible(box, dpi, dwrite, format);
         m_selecting = true;
         m_selectionPoint = point;
-        SetTimer(window, kOcrSelectionTimer, kOcrSelectionTimerMs, nullptr);
+        if (window != nullptr)
+        {
+            SetTimer(window, kOcrSelectionTimer, kOcrSelectionTimerMs, nullptr);
+        }
         needsRender = true;
         return true;
     }
@@ -510,26 +547,13 @@ namespace agshot
     void OcrTextPanel::ShowContextMenu(HWND window, const RECT& box, POINT point, int dpi,
                                        IDWriteFactory* dwrite, IDWriteTextFormat* format)
     {
-        HMENU menu = CreatePopupMenu();
-        if (menu == nullptr)
-        {
-            return;
-        }
-        AppendMenuW(menu, MF_STRING, 1, L"Copy");
-        AppendMenuW(menu, MF_STRING, 2, L"Select all");
-        SetForegroundWindow(window);
-        POINT screen = point;
-        ClientToScreen(window, &screen);
-        const int command = TrackPopupMenu(
-            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-            screen.x, screen.y, 0, window, nullptr);
-        PostMessageW(window, WM_NULL, 0, 0);
-        DestroyMenu(menu);
-        if (command == 1)
+        const TextContextCommand cmd = ShowTextContextMenu(
+            window, point, /*editable=*/false, m_anchor != m_caret, !m_text.empty());
+        if (cmd == TextContextCommand::Copy)
         {
             CopyText(window);
         }
-        else if (command == 2)
+        else if (cmd == TextContextCommand::SelectAll)
         {
             m_anchor = 0;
             m_caret = m_text.size();
@@ -539,19 +563,20 @@ namespace agshot
 
     bool OcrTextPanel::OnKeyDown(HWND window, const RECT& box, WPARAM key, int dpi,
                                  IDWriteFactory* dwrite, IDWriteTextFormat* format,
-                                 bool& shouldClose, bool& needsRender)
+                                 bool& shouldClose, bool& needsRender,
+                                 KeyModifiers mods)
     {
         shouldClose = false;
         needsRender = false;
-        if (key == 'C' && (GetKeyState(VK_CONTROL) & 0x8000))
+        if (key == 'C' && mods.ctrl)
         {
-            // Ctrl+C is a done-with-this gesture: it takes the text and
-            // closes, the same as pressing the copy button.
-            CopyText(window);
-            shouldClose = true;
+            // Only close once the text actually lands on the clipboard (or if
+            // there is no text to copy), so a locked clipboard never discards
+            // the recognized result.
+            shouldClose = m_text.empty() ? true : CopyText(window);
             return true;
         }
-        if (key == 'A' && (GetKeyState(VK_CONTROL) & 0x8000))
+        if (key == 'A' && mods.ctrl)
         {
             m_anchor = 0;
             m_caret = m_text.size();
@@ -563,7 +588,7 @@ namespace agshot
             || key == VK_RIGHT || key == VK_DOWN
             || key == VK_HOME || key == VK_END)
         {
-            MoveCaret(box, key, dpi, dwrite, format);
+            MoveCaret(box, key, dpi, dwrite, format, mods);
             needsRender = true;
             return true;
         }
@@ -588,34 +613,10 @@ namespace agshot
     {
         const std::size_t first = std::min(m_anchor, m_caret);
         const std::size_t last = std::max(m_anchor, m_caret);
-        const std::wstring text = first == last
-            ? m_text
-            : m_text.substr(first, last - first);
-
-        if (text.empty() || !OpenClipboard(window))
-        {
-            return false;
-        }
-        auto closeClipboard = wil::scope_exit([] { CloseClipboard(); });
-
-        if (EmptyClipboard())
-        {
-            const SIZE_T bytes = (text.size() + 1) * sizeof(wchar_t);
-            wil::unique_hglobal memory{ GlobalAlloc(GMEM_MOVEABLE, bytes) };
-            if (memory)
-            {
-                if (void* destination = GlobalLock(memory.get()))
-                {
-                    std::memcpy(destination, text.c_str(), bytes);
-                    GlobalUnlock(memory.get());
-                    if (SetClipboardData(CF_UNICODETEXT, memory.get()) != nullptr)
-                    {
-                        memory.release();
-                    }
-                }
-            }
-        }
-        return true;
+        const std::wstring_view slice = (first == last)
+            ? std::wstring_view(m_text)
+            : std::wstring_view(m_text).substr(first, last - first);
+        return CopyTextToClipboard(window, slice);
     }
 
     bool OcrTextPanel::EnsureSpinnerBitmap(ID2D1DeviceContext* context, int dpi)
@@ -696,6 +697,12 @@ namespace agshot
             return;
         }
 
+        auto layout = TextLayout(box, dpi, dwrite, format);
+        if (!layout)
+        {
+            return;
+        }
+
         const float padding = ScaleByDpi(9, dpi);
         const D2D1_POINT_2F origin{
             std::round(box.left + padding),
@@ -705,25 +712,29 @@ namespace agshot
             static_cast<float>(box.right), static_cast<float>(box.bottom));
         context->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
         auto popClip = wil::scope_exit([&] { context->PopAxisAlignedClip(); });
-        auto layout = TextLayout(box, dpi, dwrite, format);
 
         const std::size_t first = std::min(m_anchor, m_caret);
         const std::size_t last = std::max(m_anchor, m_caret);
         if (last > first)
         {
-            m_hitMetrics.resize(m_text.size() + 1);
             UINT32 count = 0;
-            if (SUCCEEDED(layout->HitTestTextRange(
-                    static_cast<UINT32>(first), static_cast<UINT32>(last - first),
-                    origin.x, origin.y, m_hitMetrics.data(),
-                    static_cast<UINT32>(m_hitMetrics.size()), &count)))
+            layout->HitTestTextRange(
+                static_cast<UINT32>(first), static_cast<UINT32>(last - first),
+                origin.x, origin.y, nullptr, 0, &count);
+            if (count > 0)
             {
-                for (UINT32 i = 0; i < count; ++i)
+                m_hitMetrics.resize(count);
+                if (SUCCEEDED(layout->HitTestTextRange(
+                        static_cast<UINT32>(first), static_cast<UINT32>(last - first),
+                        origin.x, origin.y, m_hitMetrics.data(), count, &count)))
                 {
-                    const auto& item = m_hitMetrics[i];
-                    context->FillRectangle(
-                        D2D1::RectF(item.left, item.top, item.left + item.width, item.top + item.height),
-                        brushes.accent.get());
+                    for (UINT32 i = 0; i < count; ++i)
+                    {
+                        const auto& item = m_hitMetrics[i];
+                        context->FillRectangle(
+                            D2D1::RectF(item.left, item.top, item.left + item.width, item.top + item.height),
+                            brushes.accent.get());
+                    }
                 }
             }
         }

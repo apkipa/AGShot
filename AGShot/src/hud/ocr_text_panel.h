@@ -3,6 +3,7 @@
 #include "core/ocr_runtime.h"
 #include "core/screen_capture.h"
 #include "hud/hud_theme.h"
+#include "hud/text_edit_utils.h"
 
 #include <windows.h>
 
@@ -42,6 +43,10 @@ namespace agshot
 
         bool pending() const noexcept { return m_pending; }
         bool capturingInput() const noexcept { return m_scrollDragging || m_selecting; }
+        const std::wstring& text() const noexcept { return m_text; }
+        std::size_t caret() const noexcept { return m_caret; }
+        std::size_t anchor() const noexcept { return m_anchor; }
+        void SetRecognizedText(std::wstring text) noexcept;
 
         void Enter(HWND window, OcrRuntime* runtime, const ScreenImage& image,
                    const RECT& bounds, const RECT& selection);
@@ -53,7 +58,8 @@ namespace agshot
 
         bool OnLeftButtonDown(HWND window, const RECT& box, POINT point, int dpi,
                               IDWriteFactory* dwrite, IDWriteTextFormat* format,
-                              bool& needsRender);
+                              bool& needsRender,
+                              KeyModifiers mods = QueryCurrentKeyModifiers());
         bool OnMouseMove(const RECT& box, POINT point, int dpi,
                          IDWriteFactory* dwrite, IDWriteTextFormat* format);
         bool OnLeftButtonUp(HWND window, const RECT& box, POINT point, int dpi,
@@ -66,7 +72,8 @@ namespace agshot
                              IDWriteFactory* dwrite, IDWriteTextFormat* format);
         bool OnKeyDown(HWND window, const RECT& box, WPARAM key, int dpi,
                        IDWriteFactory* dwrite, IDWriteTextFormat* format,
-                       bool& shouldClose, bool& needsRender);
+                       bool& shouldClose, bool& needsRender,
+                       KeyModifiers mods = QueryCurrentKeyModifiers());
         bool CopyText(HWND window) const;
 
         void Draw(ID2D1DeviceContext* context, IDWriteFactory* dwrite,
@@ -92,25 +99,23 @@ namespace agshot
         void EnsureCaretVisible(const RECT& box, int dpi, IDWriteFactory* dwrite,
                                 IDWriteTextFormat* format);
         bool MoveCaret(const RECT& box, WPARAM key, int dpi,
-                       IDWriteFactory* dwrite, IDWriteTextFormat* format);
+                       IDWriteFactory* dwrite, IDWriteTextFormat* format,
+                       KeyModifiers mods);
         bool UpdateSelection(const RECT& box, POINT point, int dpi,
                              IDWriteFactory* dwrite, IDWriteTextFormat* format);
         bool EnsureSpinnerBitmap(ID2D1DeviceContext* context, int dpi);
         void DrawSpinner(ID2D1DeviceContext* context, const RECT& box, int dpi);
 
         std::wstring m_text;
-        // The panel's observation of the current OCR job. Releasing this
-        // pointer abandons the result for the UI; it never stops the worker.
         std::shared_ptr<OcrCompletion> m_completion;
-        // Set while the current UI observes a completion that has not arrived.
-        // The box stays empty while it is set and draws the spinner instead, so
-        // a slow first recognition cannot be mistaken for an empty one.
         bool m_pending{};
         LONGLONG m_pendingStart{};
         RECT m_cacheSelection{};
         bool m_cacheValid{};
         std::size_t m_caret{};
         std::size_t m_anchor{};
+        TextGranularSelection m_granularSelect{};
+        MultiClickTracker m_clickTracker{};
         bool m_selecting{};
         bool m_scrollDragging{};
         POINT m_scrollDragOrigin{};
@@ -121,16 +126,10 @@ namespace agshot
         mutable winrt::com_ptr<IDWriteTextLayout> m_layout;
         mutable std::wstring m_layoutText;
         mutable float m_layoutWidth{ -1.0f };
-        // The range the selection's drawing effect is currently set on, so it
-        // can be moved or cleared without throwing the layout away.
         mutable std::size_t m_layoutHighlightFirst{};
         mutable std::size_t m_layoutHighlightLast{};
-        // Reused by the per-frame hit tests, so they stop allocating a vector
-        // the size of the text on every frame.
         mutable std::vector<DWRITE_HIT_TEST_METRICS> m_hitMetrics;
 
-        // The spinner bitmap is rasterized on demand for the current DPI from
-        // its vector parameters and rotated under a transform.
         winrt::com_ptr<ID2D1Bitmap1> m_spinnerBitmap;
         int m_spinnerDpi{};
     };

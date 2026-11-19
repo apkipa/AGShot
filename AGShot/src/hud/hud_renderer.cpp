@@ -2,8 +2,11 @@
 
 #include "hud/hud_renderer.h"
 
+#include "core/embedded_resource.h"
 #include "core/error.h"
+#include "core/icon_pack.h"
 #include "hud/ocr_text_panel.h"
+#include "hud/ui/ui_slider.h"
 
 namespace agshot
 {
@@ -14,41 +17,245 @@ namespace agshot
         constexpr int kLabelPadding = 7;
         constexpr int kTooltipPadding = 8;
         constexpr int kTooltipGap = 6;
-        constexpr int kIconInset = 7;
+        constexpr int kIconInset = 6;
+        constexpr int kSubIconInset = 5;
         constexpr int kButtonRadius = 4;
         constexpr float kIconInk = 16.0f;
-
-        constexpr std::array<std::string_view, 4> kToolbarIconSvgs{
-            // EditSelection
-            R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M0.9 5.9V1.57A0.67 0.67 0 0 1 1.57 0.9H5.9M10.1 0.9H14.43A0.67 0.67 0 0 1 15.1 1.57V5.9M0.9 10.1V14.43A0.67 0.67 0 0 0 1.57 15.1H5.9M15.1 10.1V14.43A0.67 0.67 0 0 1 14.43 15.1H10.1"/></svg>)",
-            // TextRecognition
-            R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="butt" stroke-linejoin="miter"><path d="M4.89 0.9H1.57A0.67 0.67 0 0 0 0.9 1.57V4.89M11.11 0.9H14.43A0.67 0.67 0 0 1 15.1 1.57V4.89M0.9 11.11V14.43A0.67 0.67 0 0 0 1.57 15.1H4.89M15.1 11.11V14.43A0.67 0.67 0 0 1 14.43 15.1H11.11M3.14 5.21H12.88M3.14 8H10.96M3.14 10.79H11.87"/></svg>)",
-            // Copy
-            R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="butt" stroke-linejoin="round"><path d="M5.16 11.12H2.48A1.58 1.58 0 0 1 0.9 9.54V2.48A1.58 1.58 0 0 1 2.48 0.9H8.12A1.58 1.58 0 0 1 9.70 2.48V4.88M6.74 4.88H13.52A1.58 1.58 0 0 1 15.1 6.46V13.52A1.58 1.58 0 0 1 13.52 15.1H6.74A1.58 1.58 0 0 1 5.16 13.52V6.46A1.58 1.58 0 0 1 6.74 4.88Z"/></svg>)",
-            // Cancel
-            R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M0.9 0.9L15.1 15.1M15.1 0.9L0.9 15.1"/></svg>)",
-        };
-
-        winrt::com_ptr<IStream> CreateUtf8MemoryStream(std::string_view text)
-        {
-            wil::unique_hglobal memory{ GlobalAlloc(GMEM_MOVEABLE, text.size()) };
-            AGSHOT_CHECK_WIN32(memory != nullptr);
-            {
-                void* locked = GlobalLock(memory.get());
-                AGSHOT_CHECK_WIN32(locked != nullptr);
-                std::memcpy(locked, text.data(), text.size());
-                GlobalUnlock(memory.get());
-            }
-
-            winrt::com_ptr<IStream> stream;
-            AGSHOT_CHECK_HR(CreateStreamOnHGlobal(memory.get(), TRUE, stream.put()));
-            memory.release();
-            return stream;
-        }
 
         RECT InsetRectBy(const RECT& rect, int by) noexcept
         {
             return RECT{ rect.left + by, rect.top + by, rect.right - by, rect.bottom - by };
+        }
+
+        void DrawRoundedColorTile(ID2D1DeviceContext* context,
+                                  const D2D1_RECT_F& rect, float radius,
+                                  const D2D1_COLOR_F& color, const HudBrushes& brushes, int dpi)
+        {
+            const D2D1_ROUNDED_RECT rrect = D2D1::RoundedRect(rect, radius, radius);
+            if (color.a < 0.98f)
+            {
+                FillTiledCheckerboard(context, brushes, rect, ScaleByDpi(3.0f, dpi), radius);
+            }
+            if (HasVisibleColor(color))
+            {
+                context->FillRoundedRectangle(rrect, brushes.WithColor(color));
+            }
+        }
+
+        void DrawFilledTriangle(ID2D1Factory1* factory, ID2D1DeviceContext* context,
+                                D2D1_POINT_2F p0, D2D1_POINT_2F p1, D2D1_POINT_2F p2,
+                                ID2D1Brush* brush)
+        {
+            if (factory == nullptr || brush == nullptr)
+            {
+                return;
+            }
+            winrt::com_ptr<ID2D1PathGeometry> tri;
+            AGSHOT_CHECK_HR(factory->CreatePathGeometry(tri.put()));
+            winrt::com_ptr<ID2D1GeometrySink> sink;
+            AGSHOT_CHECK_HR(tri->Open(sink.put()));
+            sink->BeginFigure(p0, D2D1_FIGURE_BEGIN_FILLED);
+            sink->AddLine(p1);
+            sink->AddLine(p2);
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            AGSHOT_CHECK_HR(sink->Close());
+            context->FillGeometry(tri.get(), brush);
+        }
+
+        void DrawWellCornerCaret(ID2D1Factory1* factory, ID2D1DeviceContext* context,
+                                 const RECT& itemRect, bool active,
+                                 const HudBrushes& brushes, int dpi)
+        {
+            const float rx = static_cast<float>(itemRect.right) - ScaleByDpi(3.2f, dpi);
+            const float ry = static_cast<float>(itemRect.bottom) - ScaleByDpi(3.2f, dpi);
+            const float triS = ScaleByDpi(4.5f, dpi);
+            DrawFilledTriangle(
+                factory, context,
+                D2D1::Point2F(rx - triS, ry),
+                D2D1::Point2F(rx, ry - triS),
+                D2D1::Point2F(rx, ry),
+                active ? brushes.accent.get() : brushes.handleFill.get());
+        }
+
+        winrt::com_ptr<ID2D1PathGeometry> CreateWellCutoutMask(
+            ID2D1Factory1* factory, const RECT& itemRect, int dpi)
+        {
+            const float rx = static_cast<float>(itemRect.right) - ScaleByDpi(3.2f, dpi);
+            const float ry = static_cast<float>(itemRect.bottom) - ScaleByDpi(3.2f, dpi);
+            const float cutS = ScaleByDpi(7.6f, dpi);
+            const float pad = ScaleByDpi(1.0f, dpi);
+
+            winrt::com_ptr<ID2D1PathGeometry> corner;
+            AGSHOT_CHECK_HR(factory->CreatePathGeometry(corner.put()));
+            winrt::com_ptr<ID2D1GeometrySink> sink;
+            AGSHOT_CHECK_HR(corner->Open(sink.put()));
+            sink->BeginFigure(D2D1::Point2F(rx - cutS, ry + pad), D2D1_FIGURE_BEGIN_FILLED);
+            sink->AddLine(D2D1::Point2F(rx + pad, ry - cutS));
+            sink->AddLine(D2D1::Point2F(rx + pad, ry + pad));
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            AGSHOT_CHECK_HR(sink->Close());
+            return corner;
+        }
+
+        winrt::com_ptr<ID2D1PathGeometry> SubtractGeometry(
+            ID2D1Factory1* factory, ID2D1Geometry* baseGeom, ID2D1Geometry* cutGeom)
+        {
+            winrt::com_ptr<ID2D1PathGeometry> out;
+            AGSHOT_CHECK_HR(factory->CreatePathGeometry(out.put()));
+            winrt::com_ptr<ID2D1GeometrySink> sink;
+            AGSHOT_CHECK_HR(out->Open(sink.put()));
+            AGSHOT_CHECK_HR(baseGeom->CombineWithGeometry(
+                cutGeom, D2D1_COMBINE_MODE_EXCLUDE, nullptr, sink.get()));
+            AGSHOT_CHECK_HR(sink->Close());
+            return out;
+        }
+
+        void DrawStrokeWellOuterFrame(
+            ID2D1Factory1* factory, ID2D1DeviceContext* context,
+            const RECT& itemRect, AnnotationStrokeStyle strokeStyle,
+            bool active, bool strokeVisible, int dpi)
+        {
+            const float cx = static_cast<float>(itemRect.left + itemRect.right) * 0.5f;
+            const float cy = static_cast<float>(itemRect.top + itemRect.bottom) * 0.5f;
+            const float halfF = ScaleByDpi(8.5f, dpi);
+            const float L = cx - halfF;
+            const float T = cy - halfF;
+            const float R = cx + halfF;
+            const float B = cy + halfF;
+            const float sw = ScaleByDpi(1.4f, dpi);
+
+            winrt::com_ptr<ID2D1SolidColorBrush> frameBrush;
+            AGSHOT_CHECK_HR(context->CreateSolidColorBrush(
+                D2D1::ColorF(0.96f, 0.97f, 0.99f, active ? 1.0f : (strokeVisible ? 0.88f : 0.55f)),
+                frameBrush.put()));
+
+            if (strokeStyle == AnnotationStrokeStyle::Dotted)
+            {
+                const float dotR = ScaleByDpi(0.95f, dpi);
+                const float cIn = ScaleByDpi(0.35f, dpi);
+                const float q = ScaleByDpi(4.25f, dpi);
+                const float endOff = ScaleByDpi(3.8f, dpi);
+                const D2D1_POINT_2F dots[15] = {
+                    D2D1::Point2F(L + cIn, T + cIn),
+                    D2D1::Point2F(cx - q, T),
+                    D2D1::Point2F(cx, T),
+                    D2D1::Point2F(cx + q, T),
+                    D2D1::Point2F(R - cIn, T + cIn),
+                    D2D1::Point2F(L, cy - q),
+                    D2D1::Point2F(L, cy),
+                    D2D1::Point2F(L, cy + q),
+                    D2D1::Point2F(L + cIn, B - cIn),
+                    D2D1::Point2F(R, cy - q),
+                    D2D1::Point2F(R, cy),
+                    D2D1::Point2F(R, cy + endOff),
+                    D2D1::Point2F(cx - q, B),
+                    D2D1::Point2F(cx, B),
+                    D2D1::Point2F(cx + endOff, B),
+                };
+                for (const D2D1_POINT_2F& pt : dots)
+                {
+                    context->FillEllipse(D2D1::Ellipse(pt, dotR, dotR), frameBrush.get());
+                }
+                return;
+            }
+
+            if (factory != nullptr)
+            {
+                winrt::com_ptr<ID2D1StrokeStyle> capStyle;
+                AGSHOT_CHECK_HR(factory->CreateStrokeStyle(
+                    D2D1::StrokeStyleProperties(
+                        D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                        D2D1_LINE_JOIN_ROUND, 2.0f, D2D1_DASH_STYLE_SOLID, 0.0f),
+                    nullptr, 0, capStyle.put()));
+
+                winrt::com_ptr<ID2D1PathGeometry> path;
+                AGSHOT_CHECK_HR(factory->CreatePathGeometry(path.put()));
+                winrt::com_ptr<ID2D1GeometrySink> sink;
+                AGSHOT_CHECK_HR(path->Open(sink.put()));
+
+                if (strokeStyle == AnnotationStrokeStyle::Dashed)
+                {
+                    const float leg = ScaleByDpi(3.5f, dpi);
+                    const float cr = ScaleByDpi(2.5f, dpi);
+                    const float dHalf = ScaleByDpi(2.0f, dpi);
+                    const float dEnd = ScaleByDpi(2.2f, dpi);
+
+                    // Top-left corner
+                    sink->BeginFigure(D2D1::Point2F(L, T + leg), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddLine(D2D1::Point2F(L, T + cr));
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(L + cr, T), D2D1::SizeF(cr, cr), 0.0f,
+                        D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    sink->AddLine(D2D1::Point2F(L + leg, T));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+
+                    // Top mid-dash
+                    sink->BeginFigure(D2D1::Point2F(cx - dHalf, T), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddLine(D2D1::Point2F(cx + dHalf, T));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+
+                    // Top-right corner
+                    sink->BeginFigure(D2D1::Point2F(R - leg, T), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddLine(D2D1::Point2F(R - cr, T));
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(R, T + cr), D2D1::SizeF(cr, cr), 0.0f,
+                        D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    sink->AddLine(D2D1::Point2F(R, T + leg));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+
+                    // Right mid-dash (stops before corner caret)
+                    sink->BeginFigure(D2D1::Point2F(R, cy - dHalf), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddLine(D2D1::Point2F(R, cy + dEnd));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+
+                    // Left mid-dash
+                    sink->BeginFigure(D2D1::Point2F(L, cy - dHalf), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddLine(D2D1::Point2F(L, cy + dHalf));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+
+                    // Bottom-left corner
+                    sink->BeginFigure(D2D1::Point2F(L, B - leg), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddLine(D2D1::Point2F(L, B - cr));
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(L + cr, B), D2D1::SizeF(cr, cr), 0.0f,
+                        D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    sink->AddLine(D2D1::Point2F(L + leg, B));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+
+                    // Bottom mid-dash (stops before corner caret)
+                    sink->BeginFigure(D2D1::Point2F(cx - dHalf, B), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddLine(D2D1::Point2F(cx + dEnd, B));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                }
+                else
+                {
+                    const float cr = ScaleByDpi(2.7f, dpi);
+                    const float endOff = ScaleByDpi(3.6f, dpi);
+                    sink->BeginFigure(D2D1::Point2F(cx + endOff, B), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddLine(D2D1::Point2F(L + cr, B));
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(L, B - cr), D2D1::SizeF(cr, cr), 0.0f,
+                        D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    sink->AddLine(D2D1::Point2F(L, T + cr));
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(L + cr, T), D2D1::SizeF(cr, cr), 0.0f,
+                        D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    sink->AddLine(D2D1::Point2F(R - cr, T));
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(R, T + cr), D2D1::SizeF(cr, cr), 0.0f,
+                        D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    sink->AddLine(D2D1::Point2F(R, cy + endOff));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                }
+
+                AGSHOT_CHECK_HR(sink->Close());
+                context->DrawGeometry(path.get(), frameBrush.get(), sw, capStyle.get());
+                return;
+            }
+
+            context->DrawRoundedRectangle(
+                D2D1::RoundedRect(D2D1::RectF(L, T, R, B), ScaleByDpi(2.7f, dpi), ScaleByDpi(2.7f, dpi)),
+                frameBrush.get(), sw);
         }
     }
 
@@ -207,12 +414,80 @@ namespace agshot
 
     void HudRenderer::InvalidateLayouts() noexcept
     {
+        m_subTextLayouts.clear();
+
         m_sizeLabelLayout = nullptr;
         m_sizeLabelSelection = RECT{};
         m_sizeLabelValid = false;
 
         m_tooltipLayout = nullptr;
         m_tooltipLayoutButton = ToolbarButton::None;
+        m_tooltipLayoutSub = SubToolbarAction::None;
+    }
+
+    IDWriteTextLayout* HudRenderer::GetOrCreateSubTextLayout(
+        IDWriteFactory* dwrite, IDWriteTextFormat* textFormat,
+        std::wstring_view text, float widthPx, float heightPx, int dpi, int styleKind)
+    {
+        if (dwrite == nullptr || textFormat == nullptr || text.empty())
+        {
+            return nullptr;
+        }
+        const int wKey = static_cast<int>(std::lround(widthPx));
+        const int hKey = static_cast<int>(std::lround(heightPx));
+        for (const CachedSubTextLayout& entry : m_subTextLayouts)
+        {
+            if (entry.factory == dwrite
+                && entry.format == textFormat
+                && entry.widthPx == wKey
+                && entry.heightPx == hKey
+                && entry.dpi == dpi
+                && entry.styleKind == styleKind
+                && entry.text == text
+                && entry.layout)
+            {
+                return entry.layout.get();
+            }
+        }
+
+        if (m_subTextLayouts.size() >= 64)
+        {
+            m_subTextLayouts.clear();
+        }
+
+        winrt::com_ptr<IDWriteTextLayout> layout;
+        if (FAILED(dwrite->CreateTextLayout(
+                text.data(), static_cast<UINT32>(text.size()),
+                textFormat, std::max(1.0f, widthPx), std::max(1.0f, heightPx),
+                layout.put())))
+        {
+            return nullptr;
+        }
+        if (styleKind == 2)
+        {
+            const DWRITE_TEXT_RANGE full{ 0, static_cast<UINT32>(text.size()) };
+            layout->SetFontSize(ScaleByDpi(9.8f, dpi), full);
+            layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, full);
+            layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        else if (styleKind == 1)
+        {
+            layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+        else
+        {
+            layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+
+        IDWriteTextLayout* result = layout.get();
+        m_subTextLayouts.push_back(CachedSubTextLayout{
+            dwrite, textFormat, std::wstring(text), wKey, hKey, dpi, styleKind, std::move(layout)
+        });
+        return result;
     }
 
     void HudRenderer::DiscardIndependentResources() noexcept
@@ -241,9 +516,16 @@ namespace agshot
         winrt::com_ptr<ID2D1DeviceContext5> context5;
         AGSHOT_CHECK_HR(context->QueryInterface(__uuidof(ID2D1DeviceContext5), context5.put_void()));
 
+        const IconPack& pack = SharedHudIconPack();
         for (std::size_t i = 0; i < m_iconSvgs.size(); ++i)
         {
-            const winrt::com_ptr<IStream> stream = CreateUtf8MemoryStream(kToolbarIconSvgs[i]);
+            const std::string_view svg = pack.SvgByIndex(i);
+            if (svg.empty())
+            {
+                continue;
+            }
+            winrt::com_ptr<IStream> stream;
+            AGSHOT_CHECK_HR(CreateMemoryStream(svg.data(), static_cast<DWORD>(svg.size()), stream));
             AGSHOT_CHECK_HR(context5->CreateSvgDocument(
                 stream.get(), D2D1::SizeF(kIconInk, kIconInk), m_iconSvgs[i].put()));
         }
@@ -275,7 +557,8 @@ namespace agshot
     }
 
     void HudRenderer::DrawSelection(const RenderDevice& device, UINT width, UINT height,
-                                    const RECT& selection, bool smart, int handleSize)
+                                    const RECT& selection, bool smart, int handleSize,
+                                    bool showHandles)
     {
         const int dpi = device.dpi();
         ID2D1DeviceContext* context = device.d2dContext();
@@ -288,7 +571,7 @@ namespace agshot
 
         context->DrawRectangle(ToRectF(border), brushes.accent.get(), stroke);
 
-        if (!smart)
+        if (!smart && showHandles)
         {
             for (const RECT& handle : HandleRects(selection, handleSize))
             {
@@ -458,7 +741,8 @@ namespace agshot
         const BYTE blue = color[0];
         const BYTE green = color[1];
         const BYTE red = color[2];
-        const float luminance = (red * 0.299f + green * 0.587f + blue * 0.114f) / 255.0f;
+        const float luminance = RelativeLuminance(
+            red / 255.0f, green / 255.0f, blue / 255.0f);
 
         float x = static_cast<float>(pointer.x) + gap;
         float y = static_cast<float>(pointer.y) + gap;
@@ -574,17 +858,17 @@ namespace agshot
     }
 
     void HudRenderer::DrawToolbar(const RenderDevice& device, const Toolbar& toolbar,
-                                  bool textRecognitionMode)
+                                  ToolbarButton activeMode)
     {
         DrawToolbar(device.d2dFactory(), device.d2dContext(),
-                    device.roundStroke(), device.flatStroke(),
-                    device.brushes(), device.dpi(), toolbar, textRecognitionMode);
+                    device.dwriteFactory(), device.textFormat(),
+                    device.brushes(), device.dpi(), toolbar, activeMode);
     }
 
     void HudRenderer::DrawToolbar(ID2D1Factory1* factory, ID2D1DeviceContext* context,
-                                  ID2D1StrokeStyle* roundStroke, ID2D1StrokeStyle* flatStroke,
+                                  IDWriteFactory* dwrite, IDWriteTextFormat* textFormat,
                                   const HudBrushes& brushes, int dpi,
-                                  const Toolbar& toolbar, bool textRecognitionMode)
+                                  const Toolbar& toolbar, ToolbarButton activeMode)
     {
         const float radius = ScaleByDpi(kCornerRadius, dpi);
 
@@ -606,11 +890,20 @@ namespace agshot
             }
         }
 
-        const bool editActive = !textRecognitionMode;
-        const bool textActive = textRecognitionMode;
         const float btnRadius = ScaleByDpi(kButtonRadius, dpi);
-        const auto modeButton = [&](const RECT& rect, bool active, bool hovered)
+        const int inset = MulDiv(kIconInset, dpi, 96);
+        for (std::size_t i = 0; i < toolbar.buttons.size(); ++i)
         {
+            const auto button = static_cast<ToolbarButton>(i);
+            const RECT& rect = toolbar.buttons[i];
+            const bool enabled = toolbar.isEnabled(button);
+            const bool active = (activeMode == button)
+                && button != ToolbarButton::Undo
+                && button != ToolbarButton::Redo
+                && button != ToolbarButton::Cancel
+                && button != ToolbarButton::Copy;
+            const bool hovered = enabled && (toolbar.hovered == button);
+
             if (active)
             {
                 context->FillRoundedRectangle(ToRoundedRect(rect, btnRadius), brushes.accent.get());
@@ -619,41 +912,479 @@ namespace agshot
             {
                 context->FillRoundedRectangle(ToRoundedRect(rect, btnRadius), brushes.hover.get());
             }
+
+            ID2D1SolidColorBrush* iconBrush = brushes.icon.get();
+            if (!enabled)
+            {
+                iconBrush = brushes.disabledIcon.get();
+            }
+            else if (button == ToolbarButton::Cancel)
+            {
+                iconBrush = brushes.cancel.get();
+            }
+            else if (active)
+            {
+                iconBrush = brushes.handleFill.get();
+            }
+
+            DrawToolbarSvg(context, static_cast<ToolbarIconKind>(i),
+                           InsetRectBy(rect, inset), dpi, iconBrush);
+        }
+
+        for (const RECT& div : toolbar.dividers)
+        {
+            context->FillRectangle(ToRectF(div), brushes.panelEdge.get());
+        }
+
+        if (toolbar.subVisible)
+        {
+            DrawSubToolbar(factory, context, dwrite, textFormat, brushes, dpi, toolbar);
+        }
+    }
+
+    void HudRenderer::DrawSubToolbar(ID2D1Factory1* factory, ID2D1DeviceContext* context,
+                                     IDWriteFactory* dwrite, IDWriteTextFormat* textFormat,
+                                     const HudBrushes& brushes, int dpi, const Toolbar& toolbar)
+    {
+        const float radius = ScaleByDpi(kCornerRadius, dpi);
+        const float btnRadius = ScaleByDpi(kButtonRadius, dpi);
+        const int iconInset = MulDiv(kSubIconInset, dpi, 96);
+
+        const auto iconForSub = [](SubToolbarAction action) noexcept -> std::optional<ToolbarIconKind>
+        {
+            switch (action)
+            {
+            case SubToolbarAction::ShapeRect:
+                return ToolbarIconKind::SubShapeRect;
+            case SubToolbarAction::ShapeEllipse:
+                return ToolbarIconKind::SubShapeEllipse;
+            case SubToolbarAction::ShapeDiamond:
+                return ToolbarIconKind::SubShapeDiamond;
+            case SubToolbarAction::LineArrow:
+                return ToolbarIconKind::SubLineArrow;
+            case SubToolbarAction::LineStraight:
+                return ToolbarIconKind::SubLineStraight;
+            case SubToolbarAction::MosaicBrush:
+                return ToolbarIconKind::SubMosaicBrush;
+            case SubToolbarAction::MosaicRect:
+                return ToolbarIconKind::SubMosaicRect;
+            case SubToolbarAction::BrushHighlighterToggle:
+                return ToolbarIconKind::SubBrushHighlighter;
+            case SubToolbarAction::FillModeNone:
+                return ToolbarIconKind::SubFillNone;
+            case SubToolbarAction::FillModeSolid:
+                return ToolbarIconKind::SubFillSolid;
+            case SubToolbarAction::FillPatternCrossHatch:
+                return ToolbarIconKind::SubFillCrossHatch;
+            case SubToolbarAction::FillPatternDiagHatch:
+                return ToolbarIconKind::SubFillDiagHatch;
+            case SubToolbarAction::OrderSendToBack:
+                return ToolbarIconKind::SubOrderSendToBack;
+            case SubToolbarAction::OrderSendBackward:
+                return ToolbarIconKind::SubOrderSendBackward;
+            case SubToolbarAction::OrderBringForward:
+                return ToolbarIconKind::SubOrderBringForward;
+            case SubToolbarAction::OrderBringToFront:
+                return ToolbarIconKind::SubOrderBringToFront;
+            case SubToolbarAction::AlignLeft:
+                return ToolbarIconKind::SubAlignLeft;
+            case SubToolbarAction::AlignCenterH:
+                return ToolbarIconKind::SubAlignCenterH;
+            case SubToolbarAction::AlignRight:
+                return ToolbarIconKind::SubAlignRight;
+            case SubToolbarAction::DistributeH:
+                return ToolbarIconKind::SubDistributeH;
+            case SubToolbarAction::AlignTop:
+                return ToolbarIconKind::SubAlignTop;
+            case SubToolbarAction::AlignCenterV:
+                return ToolbarIconKind::SubAlignCenterV;
+            case SubToolbarAction::AlignBottom:
+                return ToolbarIconKind::SubAlignBottom;
+            case SubToolbarAction::DistributeV:
+                return ToolbarIconKind::SubDistributeV;
+            case SubToolbarAction::DuplicateSelected:
+                return ToolbarIconKind::SubDuplicate;
+            case SubToolbarAction::DeleteSelected:
+                return ToolbarIconKind::SubDelete;
+            default:
+                return std::nullopt;
+            }
         };
-        modeButton(toolbar.editSelection, editActive,
-                   toolbar.hovered == ToolbarButton::EditSelection);
-        modeButton(toolbar.textRecognition, textActive,
-                   toolbar.hovered == ToolbarButton::TextRecognition);
-        context->FillRectangle(ToRectF(toolbar.divider), brushes.panelEdge.get());
 
-        if (toolbar.hovered == ToolbarButton::Copy)
+        const auto drawRow = [&](const RECT& panelRect, const std::vector<SubToolbarItem>& items)
         {
-            context->FillRoundedRectangle(ToRoundedRect(toolbar.copy, btnRadius), brushes.hover.get());
-        }
-        if (toolbar.hovered == ToolbarButton::Cancel)
-        {
-            context->FillRoundedRectangle(ToRoundedRect(toolbar.cancel, btnRadius), brushes.hover.get());
-        }
+            context->FillRoundedRectangle(ToRoundedRect(panelRect, radius), brushes.panel.get());
+            context->DrawRoundedRectangle(ToRoundedRect(panelRect, radius), brushes.panelEdge.get(), 1.0f);
 
-        (void)factory;
-        (void)roundStroke;
-        (void)flatStroke;
-        const int inset = MulDiv(kIconInset, dpi, 96);
-        DrawToolbarSvg(context, ToolbarIconKind::EditSelection,
-                       InsetRectBy(toolbar.editSelection, inset), dpi,
-                       editActive ? brushes.handleFill.get() : brushes.icon.get());
-        DrawToolbarSvg(context, ToolbarIconKind::TextRecognition,
-                       InsetRectBy(toolbar.textRecognition, inset), dpi,
-                       textActive ? brushes.handleFill.get() : brushes.icon.get());
-        DrawToolbarSvg(context, ToolbarIconKind::Copy,
-                       InsetRectBy(toolbar.copy, inset), dpi, brushes.icon.get());
-        DrawToolbarSvg(context, ToolbarIconKind::Cancel,
-                       InsetRectBy(toolbar.cancel, inset), dpi, brushes.cancel.get());
+            for (const SubToolbarItem& item : items)
+        {
+            if (item.kind == SubItemKind::Divider)
+            {
+                context->FillRectangle(ToRectF(item.rect), brushes.panelEdge.get());
+                continue;
+            }
+
+            const bool hovered = item.enabled && (toolbar.hoveredSub == item.action);
+            if (item.action == SubToolbarAction::BadgeNumberValue)
+            {
+                continue;
+            }
+            const bool wellLike = (item.kind == SubItemKind::ColorSwatch
+                || item.kind == SubItemKind::StrokeWell
+                || item.kind == SubItemKind::FillWell
+                || item.kind == SubItemKind::DropdownPill);
+            if (item.kind != SubItemKind::Slider && item.kind != SubItemKind::StaticIcon)
+            {
+                if (item.enabled && item.active && !wellLike)
+                {
+                    context->FillRoundedRectangle(ToRoundedRect(item.rect, btnRadius), brushes.accent.get());
+                }
+                else if (hovered || (item.enabled && item.active && wellLike && item.kind != SubItemKind::ColorSwatch))
+                {
+                    context->FillRoundedRectangle(ToRoundedRect(item.rect, btnRadius), brushes.hover.get());
+                }
+            }
+
+            switch (item.kind)
+            {
+            case SubItemKind::IconToggle:
+                if (const auto iconKind = iconForSub(item.action))
+                {
+                    ID2D1SolidColorBrush* iconBrush = !item.enabled
+                        ? brushes.disabledIcon.get()
+                        : (item.destructive
+                            ? brushes.cancel.get()
+                            : (item.active ? brushes.handleFill.get() : brushes.icon.get()));
+                    DrawToolbarSvg(context, *iconKind, InsetRectBy(item.rect, iconInset), dpi, iconBrush);
+                }
+                break;
+
+            case SubItemKind::StrokeWell:
+            {
+                const float cx = static_cast<float>(item.rect.left + item.rect.right) * 0.5f;
+                const float cy = static_cast<float>(item.rect.top + item.rect.bottom) * 0.5f;
+
+                DrawStrokeWellOuterFrame(
+                    factory, context, item.rect, item.strokeStyle,
+                    item.active, HasVisibleColor(item.swatchColor), dpi);
+
+                const float halfCore = ScaleByDpi(6.0f, dpi);
+                const D2D1_RECT_F coreRect{ cx - halfCore, cy - halfCore, cx + halfCore, cy + halfCore };
+                const D2D1_ROUNDED_RECT coreRR = D2D1::RoundedRect(
+                    coreRect, ScaleByDpi(1.6f, dpi), ScaleByDpi(1.6f, dpi));
+
+                if (factory != nullptr)
+                {
+                    winrt::com_ptr<ID2D1RoundedRectangleGeometry> coreGeom;
+                    AGSHOT_CHECK_HR(factory->CreateRoundedRectangleGeometry(coreRR, coreGeom.put()));
+                    winrt::com_ptr<ID2D1PathGeometry> cutMask = CreateWellCutoutMask(
+                        factory, item.rect, dpi);
+                    winrt::com_ptr<ID2D1PathGeometry> finalCore = SubtractGeometry(
+                        factory, coreGeom.get(), cutMask.get());
+
+                    if (item.swatchColor.a < 0.98f)
+                    {
+                        FillTiledCheckerboardGeometry(
+                            context, brushes, finalCore.get(), coreRect, ScaleByDpi(3.0f, dpi));
+                    }
+                    if (HasVisibleColor(item.swatchColor))
+                    {
+                        context->FillGeometry(finalCore.get(), brushes.WithColor(item.swatchColor));
+                    }
+                    context->DrawGeometry(finalCore.get(), brushes.panelEdge.get(), 1.0f);
+                    DrawWellCornerCaret(factory, context, item.rect, item.active, brushes, dpi);
+                }
+                else
+                {
+                    DrawRoundedColorTile(
+                        context, coreRect, ScaleByDpi(1.6f, dpi),
+                        item.swatchColor, brushes, dpi);
+                    context->DrawRoundedRectangle(coreRR, brushes.panelEdge.get(), 1.0f);
+                }
+                if (item.active)
+                {
+                    context->DrawRoundedRectangle(
+                        ToRoundedRect(item.rect, btnRadius),
+                        brushes.accent.get(), ScaleByDpi(1.5f, dpi));
+                }
+                break;
+            }
+
+            case SubItemKind::FillWell:
+            {
+                const float inset = ScaleByDpi(4.0f, dpi);
+                const D2D1_RECT_F swatch{
+                    static_cast<float>(item.rect.left) + inset,
+                    static_cast<float>(item.rect.top) + inset,
+                    static_cast<float>(item.rect.right) - inset,
+                    static_cast<float>(item.rect.bottom) - inset,
+                };
+                const float swatchRadius = ScaleByDpi(3.4f, dpi);
+                const D2D1_ROUNDED_RECT rrect = D2D1::RoundedRect(swatch, swatchRadius, swatchRadius);
+
+                if (factory != nullptr)
+                {
+                    winrt::com_ptr<ID2D1RoundedRectangleGeometry> boxGeom;
+                    AGSHOT_CHECK_HR(factory->CreateRoundedRectangleGeometry(rrect, boxGeom.put()));
+                    winrt::com_ptr<ID2D1PathGeometry> cutMask = CreateWellCutoutMask(
+                        factory, item.rect, dpi);
+                    winrt::com_ptr<ID2D1PathGeometry> finalFill = SubtractGeometry(
+                        factory, boxGeom.get(), cutMask.get());
+
+                    if (item.swatchColor.a < 0.98f)
+                    {
+                        FillTiledCheckerboardGeometry(
+                            context, brushes, finalFill.get(), swatch, ScaleByDpi(3.0f, dpi));
+                    }
+                    if (HasVisibleColor(item.swatchColor))
+                    {
+                        context->FillGeometry(finalFill.get(), brushes.WithColor(item.swatchColor));
+                    }
+                    context->DrawGeometry(finalFill.get(), brushes.panelEdge.get(), 1.0f);
+                    DrawWellCornerCaret(factory, context, item.rect, item.active, brushes, dpi);
+                }
+                else
+                {
+                    DrawRoundedColorTile(context, swatch, swatchRadius, item.swatchColor, brushes, dpi);
+                    context->DrawRoundedRectangle(rrect, brushes.panelEdge.get(), 1.0f);
+                }
+                if (item.active)
+                {
+                    context->DrawRoundedRectangle(
+                        ToRoundedRect(item.rect, btnRadius),
+                        brushes.accent.get(), ScaleByDpi(1.5f, dpi));
+                }
+                break;
+            }
+
+            case SubItemKind::ColorSwatch:
+            {
+                const float inset = ScaleByDpi(5.0f, dpi);
+                const D2D1_RECT_F swatch{
+                    static_cast<float>(item.rect.left) + inset,
+                    static_cast<float>(item.rect.top) + inset,
+                    static_cast<float>(item.rect.right) - inset,
+                    static_cast<float>(item.rect.bottom) - inset,
+                };
+                const float swatchRadius = ScaleByDpi(2.8f, dpi);
+                const D2D1_ROUNDED_RECT rrect = D2D1::RoundedRect(swatch, swatchRadius, swatchRadius);
+                DrawRoundedColorTile(context, swatch, swatchRadius, item.swatchColor, brushes, dpi);
+
+                const bool ring = item.active;
+                if (ring)
+                {
+                    context->DrawRoundedRectangle(rrect, brushes.handleEdge.get(), ScaleByDpi(1.0f, dpi));
+                }
+                context->DrawRoundedRectangle(
+                    rrect,
+                    ring ? brushes.handleFill.get() : brushes.panelEdge.get(),
+                    ring ? ScaleByDpi(1.8f, dpi) : 1.0f);
+                break;
+            }
+
+            case SubItemKind::StrokeWidth:
+            {
+                constexpr float kBarHeightsDip[4] = { 2.0f, 3.5f, 5.5f, 8.0f };
+                const int idx = std::clamp(item.variant, 0, 3);
+                const float barH = ScaleByDpi(kBarHeightsDip[idx], dpi);
+                const float hPad = ScaleByDpi(5.0f, dpi);
+                const float cy = static_cast<float>(item.rect.top + item.rect.bottom) * 0.5f;
+                const D2D1_RECT_F bar{
+                    static_cast<float>(item.rect.left) + hPad,
+                    cy - barH * 0.5f,
+                    static_cast<float>(item.rect.right) - hPad,
+                    cy + barH * 0.5f,
+                };
+                context->FillRoundedRectangle(
+                    D2D1::RoundedRect(bar, barH * 0.5f, barH * 0.5f),
+                    !item.enabled
+                        ? brushes.disabledIcon.get()
+                        : (item.active ? brushes.handleFill.get() : brushes.icon.get()));
+                break;
+            }
+
+            case SubItemKind::BadgeShape:
+            {
+                const int variant = std::clamp(item.variant, 0, 3);
+                const bool isSquare = (variant == 2 || variant == 3);
+                const bool isFilled = (variant == 1 || variant == 3);
+                const float cx = static_cast<float>(item.rect.left + item.rect.right) * 0.5f;
+                const float cy = static_cast<float>(item.rect.top + item.rect.bottom) * 0.5f;
+                const float r = ScaleByDpi(7.0f, dpi);
+                const D2D1_RECT_F box{ cx - r, cy - r, cx + r, cy + r };
+                ID2D1SolidColorBrush* fg = item.active ? brushes.handleFill.get() : brushes.icon.get();
+                ID2D1SolidColorBrush* invFg = item.active
+                    ? brushes.accent.get()
+                    : (hovered ? brushes.hover.get() : brushes.panel.get());
+                const float strokeW = ScaleByDpi(1.65f, dpi);
+
+                if (isSquare)
+                {
+                    const float cr = ScaleByDpi(2.4f, dpi);
+                    const D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(box, cr, cr);
+                    if (isFilled)
+                    {
+                        context->FillRoundedRectangle(rr, fg);
+                    }
+                    else
+                    {
+                        context->DrawRoundedRectangle(rr, fg, strokeW);
+                    }
+                }
+                else
+                {
+                    const D2D1_ELLIPSE circle = D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r);
+                    if (isFilled)
+                    {
+                        context->FillEllipse(circle, fg);
+                    }
+                    else
+                    {
+                        context->DrawEllipse(circle, fg, strokeW);
+                    }
+                }
+
+                if (IDWriteTextLayout* layout = GetOrCreateSubTextLayout(
+                        dwrite, textFormat, L"1", r * 2.0f, r * 2.0f, dpi, 2))
+                {
+                    context->DrawTextLayout(
+                        D2D1::Point2F(box.left, box.top),
+                        layout,
+                        isFilled ? invFg : fg);
+                }
+                break;
+            }
+
+            case SubItemKind::TextPill:
+            case SubItemKind::ValuePill:
+                if (item.kind == SubItemKind::ValuePill && !item.active)
+                {
+                    context->DrawRoundedRectangle(
+                        ToRoundedRect(item.rect, btnRadius), brushes.panelEdge.get(), 1.0f);
+                }
+                if (item.label[0] != L'\0')
+                {
+                    const float w = static_cast<float>(item.rect.right - item.rect.left);
+                    const float h = static_cast<float>(item.rect.bottom - item.rect.top);
+                    if (IDWriteTextLayout* layout = GetOrCreateSubTextLayout(
+                            dwrite, textFormat, item.label, w, h, dpi, 0))
+                    {
+                        context->DrawTextLayout(
+                            D2D1::Point2F(static_cast<float>(item.rect.left), static_cast<float>(item.rect.top)),
+                            layout,
+                            !item.enabled
+                                ? brushes.disabledIcon.get()
+                                : (item.active ? brushes.handleFill.get() : brushes.icon.get()));
+                    }
+                }
+                break;
+
+            case SubItemKind::DropdownPill:
+            {
+                context->DrawRoundedRectangle(
+                    ToRoundedRect(item.rect, btnRadius),
+                    item.active ? brushes.accent.get() : brushes.panelEdge.get(),
+                    item.active ? ScaleByDpi(1.4f, dpi) : 1.0f);
+                const float padL = ScaleByDpi(8.0f, dpi);
+                const float chevronSpace = ScaleByDpi(18.0f, dpi);
+                if (item.label[0] != L'\0')
+                {
+                    const float w = std::max(1.0f, static_cast<float>(item.rect.right - item.rect.left) - padL - chevronSpace);
+                    const float h = static_cast<float>(item.rect.bottom - item.rect.top);
+                    if (IDWriteTextLayout* layout = GetOrCreateSubTextLayout(
+                            dwrite, textFormat, item.label, w, h, dpi, 1))
+                    {
+                        context->DrawTextLayout(
+                            D2D1::Point2F(static_cast<float>(item.rect.left) + padL, static_cast<float>(item.rect.top)),
+                            layout,
+                            item.enabled ? brushes.icon.get() : brushes.disabledIcon.get());
+                    }
+                }
+                const float cx = static_cast<float>(item.rect.right) - ScaleByDpi(9.5f, dpi);
+                const float cy = static_cast<float>(item.rect.top + item.rect.bottom) * 0.5f;
+                const float dx = ScaleByDpi(3.2f, dpi);
+                const float dy = ScaleByDpi(1.7f, dpi);
+                const float sw = ScaleByDpi(1.35f, dpi);
+                ID2D1SolidColorBrush* chBrush = item.enabled ? brushes.icon.get() : brushes.disabledIcon.get();
+                context->DrawLine(D2D1::Point2F(cx - dx, cy - dy), D2D1::Point2F(cx, cy + dy), chBrush, sw);
+                context->DrawLine(D2D1::Point2F(cx, cy + dy), D2D1::Point2F(cx + dx, cy - dy), chBrush, sw);
+                break;
+            }
+
+            case SubItemKind::StaticIcon:
+            {
+                if (item.variant >= 0 && item.variant < static_cast<int>(ToolbarIconKind::Count))
+                {
+                    const int iconSize = MulDiv(16, dpi, 96);
+                    const int iconLeft = item.rect.left + ((item.rect.right - item.rect.left) - iconSize) / 2;
+                    const int iconTop = item.rect.top + ((item.rect.bottom - item.rect.top) - iconSize) / 2;
+                    const RECT iconBox{ iconLeft, iconTop, iconLeft + iconSize, iconTop + iconSize };
+                    DrawToolbarSvg(
+                        context, static_cast<ToolbarIconKind>(item.variant), iconBox, dpi,
+                        item.enabled ? brushes.icon.get() : brushes.disabledIcon.get());
+                }
+                break;
+            }
+
+            case SubItemKind::Slider:
+            {
+                const RECT trackHit = MosaicSliderTrackRect(item.rect, dpi);
+                const float trackH = ScaleByDpi(4.0f, dpi);
+                const float trackR = trackH * 0.5f;
+                const float cy = static_cast<float>(trackHit.top + trackHit.bottom) * 0.5f;
+                const float tLeft = static_cast<float>(trackHit.left);
+                const float tRight = static_cast<float>(trackHit.right);
+                const float norm = std::clamp(item.sliderValue, 0.0f, 1.0f);
+                const float fillX = tLeft + norm * (tRight - tLeft);
+
+                const D2D1_RECT_F fullBar{ tLeft, cy - trackR, tRight, cy + trackR };
+                context->FillRoundedRectangle(
+                    D2D1::RoundedRect(fullBar, trackR, trackR),
+                    brushes.panelEdge.get());
+                if (fillX > tLeft + 0.5f)
+                {
+                    const D2D1_RECT_F activeBar{ tLeft, cy - trackR, fillX, cy + trackR };
+                    context->FillRoundedRectangle(
+                        D2D1::RoundedRect(activeBar, trackR, trackR),
+                        brushes.accent.get());
+                }
+
+                ui::Slider1D slider;
+                slider.Arrange(trackHit);
+                slider.DrawThumb(context, brushes, norm, brushes.accent->GetColor(), dpi);
+                break;
+            }
+
+            case SubItemKind::Divider:
+                break;
+            }
+            }
+        };
+
+        if (toolbar.subVisible)
+        {
+            drawRow(toolbar.subPanel, toolbar.subItems);
+        }
+        if (toolbar.subVisible2)
+        {
+            drawRow(toolbar.subPanel2, toolbar.subItems2);
+        }
+    }
+
+    ID2D1SvgDocument* HudRenderer::EyedropperSvg(ID2D1DeviceContext* context)
+    {
+        if (context == nullptr)
+        {
+            return nullptr;
+        }
+        EnsureToolbarSvgs(context);
+        return m_iconSvgs[static_cast<std::size_t>(ToolbarIconKind::Eyedropper)].get();
     }
 
     void HudRenderer::DrawToolbarSvg(ID2D1DeviceContext* context, ToolbarIconKind kind,
                                      const RECT& box, int dpi, ID2D1SolidColorBrush* brush)
     {
+        (void)dpi;
         EnsureToolbarSvgs(context);
         ID2D1SvgDocument* svg = m_iconSvgs[static_cast<std::size_t>(kind)].get();
         if (svg == nullptr)
@@ -668,15 +1399,15 @@ namespace agshot
         svg->GetRoot(root.put());
         if (root && brush != nullptr)
         {
-            AGSHOT_CHECK_HR(root->SetAttributeValue(L"stroke", brush->GetColor()));
+            AGSHOT_CHECK_HR(root->SetAttributeValue(L"fill", brush->GetColor()));
         }
 
-        const float scale = ScaleByDpi(1.0f, dpi);
-        const float inkSpan = kIconInk * scale;
-        const float left = static_cast<float>(box.left)
-            + (static_cast<float>(box.right - box.left) - inkSpan) * 0.5f;
-        const float top = static_cast<float>(box.top)
-            + (static_cast<float>(box.bottom - box.top) - inkSpan) * 0.5f;
+        const float boxW = static_cast<float>(box.right - box.left);
+        const float boxH = static_cast<float>(box.bottom - box.top);
+        const float inkSpan = std::max(1.0f, std::min(boxW, boxH));
+        const float scale = inkSpan / kIconInk;
+        const float left = static_cast<float>(box.left) + (boxW - inkSpan) * 0.5f;
+        const float top = static_cast<float>(box.top) + (boxH - inkSpan) * 0.5f;
 
         D2D1_MATRIX_3X2_F original{};
         context->GetTransform(&original);
@@ -692,18 +1423,30 @@ namespace agshot
     void HudRenderer::DrawTooltip(const RenderDevice& device, UINT surfaceWidth, UINT surfaceHeight,
                                   const Toolbar& toolbar)
     {
-        if (toolbar.hovered == ToolbarButton::None)
+        LPCWSTR text = nullptr;
+        RECT anchor{};
+        if (toolbar.hovered != ToolbarButton::None)
+        {
+            text = ToolbarLabel(toolbar.hovered);
+            anchor = toolbar.buttonRect(toolbar.hovered);
+        }
+        else if (toolbar.hoveredSub != SubToolbarAction::None)
+        {
+            text = SubToolbarLabel(toolbar.hoveredSub);
+            if (const SubToolbarItem* sub = toolbar.findSubItem(toolbar.hoveredSub))
+            {
+                anchor = sub->rect;
+            }
+        }
+
+        if (text == nullptr || text[0] == L'\0' || IsRectEmpty(&anchor))
         {
             return;
         }
 
-        const LPCWSTR text = ToolbarLabel(toolbar.hovered);
-        if (text == nullptr || text[0] == L'\0')
-        {
-            return;
-        }
-
-        if (!m_tooltipLayout || m_tooltipLayoutButton != toolbar.hovered)
+        if (!m_tooltipLayout
+            || m_tooltipLayoutButton != toolbar.hovered
+            || m_tooltipLayoutSub != toolbar.hoveredSub)
         {
             m_tooltipLayout = nullptr;
             AGSHOT_CHECK_HR(device.dwriteFactory()->CreateTextLayout(
@@ -711,6 +1454,7 @@ namespace agshot
                 static_cast<float>(surfaceWidth), static_cast<float>(surfaceHeight),
                 m_tooltipLayout.put()));
             m_tooltipLayoutButton = toolbar.hovered;
+            m_tooltipLayoutSub = toolbar.hoveredSub;
         }
         const auto& layout = m_tooltipLayout;
 
@@ -723,20 +1467,14 @@ namespace agshot
         const float height = metrics.height + padding;
         const float gap = ScaleByDpi(kTooltipGap, dpi);
 
-        const RECT& button = toolbar.hovered == ToolbarButton::Copy
-            ? toolbar.copy
-            : toolbar.hovered == ToolbarButton::Cancel
-                ? toolbar.cancel
-                : toolbar.hovered == ToolbarButton::EditSelection
-                    ? toolbar.editSelection
-                    : toolbar.textRecognition;
-
-        float x = static_cast<float>(button.left + button.right) / 2.0f - width / 2.0f;
-        float y = static_cast<float>(button.bottom) + gap;
-
-        if (y + height > static_cast<float>(surfaceHeight))
+        float x = static_cast<float>(anchor.left + anchor.right) / 2.0f - width / 2.0f;
+        float y = static_cast<float>(anchor.bottom) + gap;
+        if (y + height > static_cast<float>(surfaceHeight)
+            || (toolbar.subVisible && toolbar.hovered != ToolbarButton::None
+                && toolbar.subPanel.top > toolbar.panel.bottom
+                && y + height > static_cast<float>(toolbar.subPanel.top)))
         {
-            y = static_cast<float>(button.top) - gap - height;
+            y = static_cast<float>(anchor.top) - gap - height;
         }
         x = std::clamp(x, 0.0f, std::max(0.0f, static_cast<float>(surfaceWidth) - width));
         y = std::clamp(y, 0.0f, std::max(0.0f, static_cast<float>(surfaceHeight) - height));
@@ -763,8 +1501,12 @@ namespace agshot
         const RECT selection = textRecognitionActive ? RECT{ 0, 0, 360, 240 }
                                                      : RECT{ 0, 0, 600, 400 };
         const RECT bounds{ 0, 0, 1920, 1080 };
+        ToolbarState proofState{};
+        proofState.activeMode = textRecognitionActive
+            ? ToolbarButton::TextRecognition
+            : ToolbarButton::EditSelection;
         Toolbar toolbar{};
-        if (!LayoutToolbar(toolbar, selection, bounds, dpi))
+        if (!LayoutToolbar(toolbar, proofState, selection, bounds, dpi))
         {
             return false;
         }
@@ -817,8 +1559,8 @@ namespace agshot
                           selection, dpi, proofBrushes);
         }
         DrawToolbar(device.d2dFactory(), target.get(),
-                    device.roundStroke(), device.flatStroke(),
-                    proofBrushes, dpi, toolbar, textRecognitionActive);
+                    device.dwriteFactory(), device.textFormat(),
+                    proofBrushes, dpi, toolbar, proofState.activeMode);
         target->SetTransform(D2D1::Matrix3x2F::Identity());
         AGSHOT_CHECK_HR(target->EndDraw());
 

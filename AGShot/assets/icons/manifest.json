@@ -1,0 +1,239 @@
+[
+  {
+    "name": "edit_selection",
+    "enumName": "EditSelection",
+    "file": "edit_selection.svg"
+  },
+  {
+    "name": "select_object",
+    "enumName": "SelectObject",
+    "file": "select_object.svg"
+  },
+  {
+    "name": "shape",
+    "enumName": "Shape",
+    "file": "shape.svg"
+  },
+  {
+    "name": "arrow",
+    "enumName": "Arrow",
+    "file": "arrow.svg"
+  },
+  {
+    "name": "brush",
+    "enumName": "Brush",
+    "file": "brush.svg"
+  },
+  {
+    "name": "text",
+    "enumName": "Text",
+    "file": "text.svg"
+  },
+  {
+    "name": "step_badge",
+    "enumName": "StepBadge",
+    "file": "step_badge.svg"
+  },
+  {
+    "name": "mosaic",
+    "enumName": "Mosaic",
+    "file": "mosaic.svg"
+  },
+  {
+    "name": "undo",
+    "enumName": "Undo",
+    "file": "undo.svg"
+  },
+  {
+    "name": "redo",
+    "enumName": "Redo",
+    "file": "redo.svg"
+  },
+  {
+    "name": "text_recognition",
+    "enumName": "TextRecognition",
+    "file": "text_recognition.svg"
+  },
+  {
+    "name": "cancel",
+    "enumName": "Cancel",
+    "file": "cancel.svg"
+  },
+  {
+    "name": "copy",
+    "enumName": "Copy",
+    "file": "copy.svg"
+  },
+  {
+    "name": "sub_shape_rect",
+    "enumName": "SubShapeRect",
+    "file": "sub_shape_rect.svg"
+  },
+  {
+    "name": "sub_shape_ellipse",
+    "enumName": "SubShapeEllipse",
+    "file": "sub_shape_ellipse.svg"
+  },
+  {
+    "name": "sub_shape_diamond",
+    "enumName": "SubShapeDiamond",
+    "file": "sub_shape_diamond.svg"
+  },
+  {
+    "name": "sub_line_arrow",
+    "enumName": "SubLineArrow",
+    "file": "sub_line_arrow.svg"
+  },
+  {
+    "name": "sub_line_straight",
+    "enumName": "SubLineStraight",
+    "file": "sub_line_straight.svg"
+  },
+  {
+    "name": "sub_mosaic_brush",
+    "enumName": "SubMosaicBrush",
+    "file": "sub_mosaic_brush.svg"
+  },
+  {
+    "name": "sub_mosaic_rect",
+    "enumName": "SubMosaicRect",
+    "file": "sub_mosaic_rect.svg"
+  },
+  {
+    "name": "sub_brush_highlighter",
+    "enumName": "SubBrushHighlighter",
+    "file": "sub_brush_highlighter.svg"
+  },
+  {
+    "name": "sub_fill_none",
+    "enumName": "SubFillNone",
+    "file": "sub_fill_none.svg"
+  },
+  {
+    "name": "sub_fill_solid",
+    "enumName": "SubFillSolid",
+    "file": "sub_fill_solid.svg"
+  },
+  {
+    "name": "sub_fill_cross_hatch",
+    "enumName": "SubFillCrossHatch",
+    "file": "sub_fill_cross_hatch.svg"
+  },
+  {
+    "name": "sub_fill_diag_hatch",
+    "enumName": "SubFillDiagHatch",
+    "file": "sub_fill_diag_hatch.svg"
+  },
+  {
+    "name": "sub_order_send_to_back",
+    "enumName": "SubOrderSendToBack",
+    "file": "sub_order_send_to_back.svg"
+  },
+  {
+    "name": "sub_order_send_backward",
+    "enumName": "SubOrderSendBackward",
+    "file": "sub_order_send_backward.svg"
+  },
+  {
+    "name": "sub_order_bring_forward",
+    "enumName": "SubOrderBringForward",
+    "file": "sub_order_bring_forward.svg"
+  },
+  {
+    "name": "sub_order_bring_to_front",
+    "enumName": "SubOrderBringToFront",
+    "file": "sub_order_bring_to_front.svg"
+  },
+  {
+    "name": "sub_align_left",
+    "enumName": "SubAlignLeft",
+    "file": "sub_align_left.svg"
+  },
+  {
+    "name": "sub_align_center_h",
+    "enumName": "SubAlignCenterH",
+    "file": "sub_align_center_h.svg"
+  },
+  {
+    "name": "sub_align_right",
+    "enumName": "SubAlignRight",
+    "file": "sub_align_right.svg"
+  },
+  {
+    "name": "sub_distribute_h",
+    "enumName": "SubDistributeH",
+    "file": "sub_distribute_h.svg"
+  },
+  {
+    "name": "sub_align_top",
+    "enumName": "SubAlignTop",
+    "file": "sub_align_top.svg"
+  },
+  {
+    "name": "sub_align_center_v",
+    "enumName": "SubAlignCenterV",
+    "file": "sub_align_center_v.svg"
+  },
+  {
+    "name": "sub_align_bottom",
+    "enumName": "SubAlignBottom",
+    "file": "sub_align_bottom.svg"
+  },
+  {
+    "name": "sub_distribute_v",
+    "enumName": "SubDistributeV",
+    "file": "sub_distribute_v.svg"
+  },
+  {
+    "name": "sub_duplicate",
+    "enumName": "SubDuplicate",
+    "file": "sub_duplicate.svg"
+  },
+  {
+    "name": "sub_delete",
+    "enumName": "SubDelete",
+    "file": "sub_delete.svg"
+  },
+  {
+    "name": "eyedropper",
+    "enumName": "Eyedropper",
+    "file": "eyedropper.svg"
+  },
+  {
+    "name": "sub_mosaic_intensity",
+    "enumName": "SubMosaicIntensity",
+    "file": "sub_mosaic_intensity.svg"
+  },
+  {
+    "name": "brand_mark",
+    "file": "brand_mark.svg"
+  },
+  {
+    "name": "nav_general",
+    "file": "nav_general.svg"
+  },
+  {
+    "name": "nav_ocr",
+    "file": "nav_ocr.svg"
+  },
+  {
+    "name": "nav_storage",
+    "file": "nav_storage.svg"
+  },
+  {
+    "name": "nav_about",
+    "file": "nav_about.svg"
+  },
+  {
+    "name": "toast_ok",
+    "file": "toast_ok.svg"
+  },
+  {
+    "name": "toast_warn",
+    "file": "toast_warn.svg"
+  },
+  {
+    "name": "toast_err",
+    "file": "toast_err.svg"
+  }
+]

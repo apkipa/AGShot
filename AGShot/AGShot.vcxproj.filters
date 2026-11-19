@@ -13,12 +13,19 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="Icon Assets">
+      <UniqueIdentifier>{A6C1E2B4-5D7F-4E91-9A3B-8C2D4E6F1024}</UniqueIdentifier>
+      <Extensions>svg;json</Extensions>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="resource.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\pch.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\app_ipc.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\core\config.h">
@@ -33,10 +40,19 @@
     <ClInclude Include="src\core\ocr_manifest.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\core\ocr_runtime.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\embedded_resource.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\core\error.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\core\hotkey.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\icon_pack.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\core\text.h">
@@ -51,6 +67,18 @@
     <ClInclude Include="src\core\ui_element.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\hud\annotation_controller.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\annotations.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\color_model.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\color_picker.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\hud\compositor_clock.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -58,6 +86,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\hud\hud_theme.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\inline_text_editor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\hud\ocr_text_panel.h">
@@ -72,7 +103,37 @@
     <ClInclude Include="src\hud\selection.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\hud\spinner_effect.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\text_edit_utils.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\hud\toolbar.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\toolbar_controller.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\settings\settings_window.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\ui\ui_dropdown.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\ui\ui_layer_stack.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\ui\ui_layout.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\ui\ui_slider.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\ui\ui_text_field.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\hud\ui\ui_types.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -86,10 +147,25 @@
     <ClCompile Include="src\core\ui_element.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\hud\annotation_controller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\annotations.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\color_model.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\color_picker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\hud\compositor_clock.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\hud\hud_renderer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\inline_text_editor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\hud\ocr_text_panel.cpp">
@@ -104,7 +180,28 @@
     <ClCompile Include="src\hud\selection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\hud\spinner_effect.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\text_edit_utils.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\hud\toolbar.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\toolbar_controller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\settings\settings_window.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\ui\ui_dropdown.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\ui\ui_layer_stack.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\hud\ui\ui_text_field.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\main.cpp">
@@ -122,10 +219,19 @@
     <ClCompile Include="src\core\ocr_manifest.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\core\ocr_runtime.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\embedded_resource.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\core\error.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\core\hotkey.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\icon_pack.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\core\text.cpp">
@@ -138,6 +244,12 @@
   <ItemGroup>
     <None Include="PropertySheet.props" />
     <None Include="packages.config" />
+    <None Include="assets\icons\manifest.json">
+      <Filter>Icon Assets</Filter>
+    </None>
+    <None Include="assets\icons\*.svg">
+      <Filter>Icon Assets</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <Text Include="readme.txt" />
