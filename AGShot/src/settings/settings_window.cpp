@@ -1171,7 +1171,7 @@ namespace agshot
             winrt::com_ptr<ICoreWebView2Settings> settings;
             if (SUCCEEDED(m_webview->get_Settings(settings.put())) && settings)
             {
-                settings->put_AreDefaultContextMenusEnabled(FALSE);
+                settings->put_AreDefaultContextMenusEnabled(TRUE);
                 settings->put_AreDevToolsEnabled(FALSE);
                 settings->put_IsStatusBarEnabled(FALSE);
                 settings->put_IsZoomControlEnabled(FALSE);

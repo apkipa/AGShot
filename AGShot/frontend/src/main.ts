@@ -339,6 +339,17 @@ $<HTMLAnchorElement>('repo-link').addEventListener('click', (e) => {
   send({ type: 'openRepo' });
 });
 
+// Suppress browser context menus on blank chrome/buttons; let native WebView2
+// menus through on text inputs, links, and active selections.
+window.addEventListener('contextmenu', (e) => {
+  const el = e.target as Element | null;
+  const inControl = !!el?.closest('input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]), textarea, a[href], [contenteditable="true"]');
+  const hasSelection = (window.getSelection()?.toString().length ?? 0) > 0;
+  if (!inControl && !hasSelection) {
+    e.preventDefault();
+  }
+});
+
 host?.addEventListener('message', (event) => {
   const msg = event.data;
   if (!msg || typeof msg !== 'object') return;
